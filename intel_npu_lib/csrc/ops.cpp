@@ -66,8 +66,13 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
     auto compiled_model = get_or_compile_model(key, model);
     auto infer_request = compiled_model.create_infer_request();
 
+    // Keep tensors alive during inference
+    std::vector<torch::Tensor> held_tensors; 
+
     for (size_t i = 0; i < inputs.size(); ++i) {
         auto t = inputs[i].contiguous();
+        held_tensors.push_back(t); // extend lifetime
+        
         ov::Shape shape;
         for(auto d : t.sizes()) shape.push_back(d);
         
@@ -82,6 +87,11 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
     
     std::vector<int64_t> torch_shape;
     for(auto d : output_shape) torch_shape.push_back(d);
+
+    // Debug Print
+    // std::cout << "[EXECUTE_OP] Key: " << key << " Output Shape: ";
+    // for(auto s : torch_shape) std::cout << s << " ";
+    // std::cout << std::endl;
     
     auto options = torch::TensorOptions().dtype(torch::kFloat32);
     torch::Tensor result = torch::empty(torch_shape, options);
@@ -336,4 +346,56 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
     auto model = std::make_shared<ov::Model>(ov::NodeVector{add}, ov::ParameterVector{arg_in, arg_w, arg_b});
     
     return execute_op(key, model, {input, weight, bias});
+}
+
+torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation) {
+    std::stringstream ss;
+    ss << "transpose_";
+    for (auto p : permutation) ss << p << ",";
+    std::string extra = ss.str();
+    std::string key = get_key("transpose", {input}, extra);
+
+    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
+        return execute_op(key, nullptr, {input});
+    }
+
+    ov::Shape input_shape;
+    for(auto d : input.sizes()) input_shape.push_back(d);
+
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
+    
+    // Create Constant for permutation
+    auto perm_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{permutation.size()}, permutation);
+    
+    auto op = std::make_shared<ov::opset1::Transpose>(arg_input, perm_const);
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+
+    return execute_op(key, model, {input});
+}
+
+torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
+    std::stringstream ss;
+    ss << "reshape_";
+    for (auto s : shape) ss << s << ",";
+    std::string extra = ss.str();
+    std::string key = get_key("reshape", {input}, extra);
+
+    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
+        return execute_op(key, nullptr, {input});
+    }
+
+    ov::Shape input_shape;
+    for(auto d : input.sizes()) input_shape.push_back(d);
+
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
+
+    // Create Constant for shape
+    // Note: In PyTorch, -1 means infer. OpenVINO Reshape supports 0 (copy from input) and -1 (infer).
+    // However, usually shape passed here is explicit.
+    auto shape_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{shape.size()}, shape);
+
+    auto op = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false); // false = special_zero (0 means 0, not copy dim)
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+
+    return execute_op(key, model, {input});
 }

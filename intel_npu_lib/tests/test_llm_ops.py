@@ -69,6 +69,42 @@ class TestIntelNPULibLLM(unittest.TestCase):
         cpu_res3 = _torch_rmsnorm(input3, weight3, eps3)
         self.assertTrue(torch.allclose(npu_res3, cpu_res3, rtol=1e-2, atol=1e-2))
 
+    def test_transpose_op(self):
+        # Deterministic input
+        x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        # Swap dim 1 and 2 -> (2, 4, 3)
+        res = intel_npu_acceleration.transpose(x, 1, 2)
+        expected = torch.transpose(x, 1, 2)
+        
+        if not torch.allclose(res, expected):
+            print(f"\n[Test Failure Transpose] Input:\n{x}")
+            print(f"[Test Failure Transpose] Result:\n{res}")
+            print(f"[Test Failure Transpose] Expected:\n{expected}")
+            
+        self.assertTrue(torch.allclose(res, expected))
+        self.assertEqual(res.shape, expected.shape)
+
+    def test_reshape_op(self):
+        # Deterministic input
+        x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        # Flatten to (2, 12)
+        res = intel_npu_acceleration.reshape(x, 2, 12)
+        expected = x.reshape(2, 12)
+        
+        if not torch.allclose(res, expected):
+            print(f"\n[Test Failure Reshape] Input:\n{x}")
+            print(f"[Test Failure Reshape] Result:\n{res}")
+            print(f"[Test Failure Reshape] Expected:\n{expected}")
+
+        self.assertTrue(torch.allclose(res, expected))
+        self.assertEqual(res.shape, expected.shape)
+        
+        # Infer dimension (-1)
+        res2 = intel_npu_acceleration.reshape(x, 8, -1) # Should be (8, 3)
+        expected2 = x.reshape(8, -1)
+        self.assertTrue(torch.allclose(res2, expected2))
+        self.assertEqual(res2.shape, expected2.shape)
+
     def test_transformer_block(self):
         class TinyTransformerBlock(nn.Module):
             def __init__(self, d_model):

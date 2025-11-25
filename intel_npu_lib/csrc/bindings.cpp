@@ -15,4 +15,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_rmsnorm", &npu_rmsnorm, "NPU RMSNorm");
   m.def("npu_softmax", &npu_softmax, "NPU accelerated Softmax");
   m.def("npu_linear", &npu_linear, "NPU accelerated Linear (MatMul + Bias)");
+  m.def("npu_transpose", &npu_transpose, "NPU accelerated Transpose");
+  m.def("npu_reshape", &npu_reshape, "NPU accelerated Reshape");
 }
