@@ -75,6 +75,9 @@ def _torch_rmsnorm(input, weight, eps):
     input = input * torch.rsqrt(variance + eps)
     return input * weight
 
+# Register custom op for FX tracing
+torch.fx.wrap('rmsnorm')
+
 # --- Integration Layer ---
 
 import torch.fx
@@ -197,7 +200,7 @@ class NPURMSNorm(torch.nn.Module):
     def __init__(self, original_rmsnorm_module):
         super().__init__()
         self.weight = original_rmsnorm_module.weight
-        self.eps = original_rmsnorm_module.eps
+        self.eps = original_rmsnorm_module.eps if original_rmsnorm_module.eps is not None else 1e-5
     
     def forward(self, input):
         return rmsnorm(input, self.weight, self.eps)
