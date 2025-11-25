@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.fx
 import openvino as ov
-import openvino.runtime.opset14 as ops
+import openvino.runtime.opset13 as ops
 import numpy as np
 from typing import Dict, Any, List
 import operator
@@ -15,6 +15,7 @@ class OVGraphBuilder:
     def __init__(self):
         self.node_map: Dict[str, Any] = {} # Maps fx node name to OV node output
         self.parameters: List[Any] = []
+        self.result_nodes: List[Any] = [] # List of OV nodes that are outputs
         
     def get_input(self, node_name: str):
         if node_name not in self.node_map:
@@ -60,26 +61,23 @@ class NPUGraphModule(torch.nn.Module):
             # If tensor is on GPU, this will copy. 
             # If on CPU and contiguous, it shares.
             np_view = val.detach().cpu().numpy()
-            # Set tensor
-            # ov.Tensor(np_view, shared_memory=True) might fail if strides don't match, 
-            # so we rely on simple set_tensor which handles it (maybe with copy if needed)
-            # To force zero-copy, we used shared_memory=True in test.
             
-            ov_tensor = ov.Tensor(np_view, shared_memory=True)
-            self.infer_request.set_input_tensor(i, ov_tensor)
+            # set_input_tensor can take index or name
+            self.infer_request.set_input_tensor(i, ov.Tensor(np_view, shared_memory=True))
         
         self.infer_request.infer()
         
         # Retrieve outputs
-        # For now assume single output
-        # TODO: Handle multiple outputs
-        out_tensor = self.infer_request.get_output_tensor(0)
-        # Copy back to torch
-        # torch.from_numpy shares memory with the numpy array, 
-        # but out_tensor.data returns a numpy view.
-        return torch.from_numpy(out_tensor.data).clone() # Clone to be safe? Or share?
+        outputs = []
+        for j in range(len(self.compiled_model.outputs)):
+            out_tensor = self.infer_request.get_output_tensor(j)
+            outputs.append(torch.from_numpy(out_tensor.data).clone())
+        
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
 
-def compile_to_npu(model: torch.nn.Module, example_input: torch.Tensor) -> torch.nn.Module:
+def compile_to_npu(model: torch.nn.Module, example_input: Any) -> torch.nn.Module:
     # 1. Trace
     traced = torch.fx.symbolic_trace(model)
     
@@ -87,9 +85,12 @@ def compile_to_npu(model: torch.nn.Module, example_input: torch.Tensor) -> torch
     builder = OVGraphBuilder()
     
     # Propagate shapes (we need them for Parameters)
-    # Simple shape propagation using example input
+    # Ensure example_input is a tuple
+    if isinstance(example_input, torch.Tensor):
+        example_input = (example_input,)
+        
     from torch.fx.passes.shape_prop import ShapeProp
-    ShapeProp(traced).propagate(example_input)
+    ShapeProp(traced).propagate(*example_input) 
     
     for node in traced.graph.nodes:
         if node.op == 'placeholder':
@@ -130,6 +131,33 @@ def compile_to_npu(model: torch.nn.Module, example_input: torch.Tensor) -> torch
                 res = ops.swish(inp)
                 builder.register_output(node.name, res)
             
+            elif target == torch.cat:
+                # args: ([tensors],), kwargs: {'dim': dim}
+                tensors_list_node = node.args[0] # This is a list of node names
+                dim = node.kwargs['dim']
+                
+                # Iterate through the tuple of nodes to get OV nodes
+                ov_inputs = [builder.get_input(n.name) for n in tensors_list_node]
+                
+                res = ops.concat(ov_inputs, axis=dim)
+                builder.register_output(node.name, res)
+
+            elif target == torch.stack:
+                # args: ([tensors],), kwargs: {'dim': dim}
+                tensors_list_node = node.args[0]
+                dim = node.kwargs['dim']
+                
+                ov_inputs = [builder.get_input(n.name) for n in tensors_list_node]
+                
+                # Implement stack using unsqueeze and concat
+                unsqueezed_inputs = []
+                for ov_input in ov_inputs:
+                    # Unsqueeze adds a new dimension at 'dim'
+                    unsqueezed_inputs.append(ops.unsqueeze(ov_input, ops.constant(np.array([dim]), dtype=np.int64)))
+                
+                res = ops.concat(unsqueezed_inputs, axis=dim)
+                builder.register_output(node.name, res)
+
             elif target == torch.softmax or target == torch.nn.functional.softmax:
                 inp = builder.get_input(args[0].name)
                 dim = node.kwargs.get('dim', args[1] if len(args) > 1 else -1)
@@ -292,15 +320,18 @@ def compile_to_npu(model: torch.nn.Module, example_input: torch.Tensor) -> torch
             # Result
             # args[0] is the return value (could be tuple)
             args = node.args
-            ret_node = args[0]
-            # We need to return this node's output
-            # OV Model needs Output nodes.
-            # Usually we just define the model with the result node
-            builder.result_node_name = ret_node.name
+            ret_vals = args[0]
+
+            if isinstance(ret_vals, tuple):
+                for ret_val in ret_vals:
+                    builder.result_nodes.append(builder.get_input(ret_val.name))
+            else:
+                builder.result_nodes.append(builder.get_input(ret_vals.name))
 
     # 3. Create OV Model
-    res_node = builder.get_input(builder.result_node_name)
-    ov_model = ov.Model(res_node, builder.parameters, "NPU_Model")
+    # OpenVINO model constructor: ov.Model(OutputVector, ParameterVector, model_name)
+    # OutputVector can be a single Output or a list of Outputs
+    ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
     
     # 4. Compile
     core = ov.Core()
