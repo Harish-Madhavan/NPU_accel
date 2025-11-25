@@ -9,4 +9,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("npu_mul", &npu_mul, "NPU accelerated multiply");
   m.def("npu_div", &npu_div, "NPU accelerated divide");
   m.def("npu_matmul", &npu_matmul, "NPU accelerated matrix multiplication");
+  m.def("npu_relu", &npu_relu, "NPU accelerated ReLU");
+    m.def("npu_gelu", &npu_gelu, "NPU GELU");
+    m.def("npu_silu", &npu_silu, "NPU SiLU");
+    m.def("npu_rmsnorm", &npu_rmsnorm, "NPU RMSNorm");
+  m.def("npu_softmax", &npu_softmax, "NPU accelerated Softmax");
+  m.def("npu_linear", &npu_linear, "NPU accelerated Linear (MatMul + Bias)");
 }
