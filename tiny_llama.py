@@ -184,16 +184,16 @@ class Llama(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         
-        self.freqs_cos = self.freqs_cos.to(h.device)
-        self.freqs_sin = self.freqs_sin.to(h.device)
+        freqs_cos = self.freqs_cos.to(h.device)
+        freqs_sin = self.freqs_sin.to(h.device)
         
-        freqs_cos = self.freqs_cos[start_pos : start_pos + seqlen]
-        freqs_sin = self.freqs_sin[start_pos : start_pos + seqlen]
+        # Use arange for slicing with dynamic shapes (FX proxies)
+        idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
+        freqs_cos = freqs_cos[idx]
+        freqs_sin = freqs_sin[idx]
 
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+        mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
+        mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cos, freqs_sin, mask)
@@ -208,9 +208,51 @@ def test_llama_impl():
     
     # Test Input
     x = torch.randint(0, conf.vocab_size, (1, 10))
+    start_pos = 0
+    
+    print("Running on CPU...")
     with torch.no_grad():
-        logits = model(x, 0)
-    print(f"Logits shape: {logits.shape}") # Should be (1, 10, vocab_size)
+        logits_cpu = model(x, start_pos)
+    print(f"CPU Logits shape: {logits_cpu.shape}") # Should be (1, 10, vocab_size)
+
+    # Compile to NPU
+    try:
+        import intel_npu_acceleration.compiler as npu_compiler
+        import time
+        
+        print("\nCompiling to NPU...")
+        t0 = time.time()
+        # We need to pass example inputs exactly as the forward method expects
+        # forward(tokens, start_pos)
+        # Note: start_pos is an int. The compiler handles scalar inputs.
+        npu_model = npu_compiler.compile_to_npu(model, (x, start_pos))
+        print(f"Compilation finished in {time.time() - t0:.2f}s")
+        
+        print("Running on NPU...")
+        t0 = time.time()
+        # NPU model expects inputs in the same order/type as example_inputs
+        logits_npu = npu_model(x, start_pos)
+        print(f"NPU Inference time: {(time.time() - t0)*1000:.2f} ms")
+        print(f"NPU Logits shape: {logits_npu.shape}")
+        
+        # Verify
+        # Note: Precision differences are expected (FP32 vs FP16 potentially)
+        # But shapes should match.
+        if logits_cpu.shape == logits_npu.shape:
+            print("Shape check PASSED")
+        else:
+            print(f"Shape check FAILED: {logits_cpu.shape} vs {logits_npu.shape}")
+            
+        # Optional: MSE check
+        # mse = torch.nn.functional.mse_loss(logits_cpu, logits_npu)
+        # print(f"MSE Loss: {mse.item()}")
+
+    except ImportError:
+        print("Intel NPU library not found. Skipping NPU test.")
+    except Exception as e:
+        print(f"NPU Test Failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     test_llama_impl()

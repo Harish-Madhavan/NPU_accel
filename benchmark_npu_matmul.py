@@ -7,17 +7,26 @@ class MatMulModel(torch.nn.Module):
     def forward(self, x, y):
         return torch.matmul(x, y)
 
-def run_benchmark(size=1024, iterations=50, warmup=10):
-    print(f"Benchmarking NPU MatMul with size {size}x{size}...")
+def run_benchmark(size=4096, iterations=50, warmup=10, dtype_str="float32"):
+    print(f"Benchmarking NPU MatMul with size {size}x{size} using {dtype_str}...")
     
     model = MatMulModel()
     model.eval()
     
     # Inputs
-    # Using float32 as default for stress testing
-    dtype = torch.float32
-    a = torch.randn(size, size, dtype=dtype)
-    b = torch.randn(size, size, dtype=dtype)
+    if dtype_str == "float16":
+        dtype = torch.float16
+        a = torch.randn(size, size, dtype=dtype)
+        b = torch.randn(size, size, dtype=dtype)
+    elif dtype_str == "int8":
+        dtype = torch.int8
+        a = torch.randint(-128, 127, (size, size), dtype=dtype)
+        b = torch.randint(-128, 127, (size, size), dtype=dtype)
+    else:
+        dtype = torch.float32
+        a = torch.randn(size, size, dtype=dtype)
+        b = torch.randn(size, size, dtype=dtype)
+        
     
     # Compile
     print("Compiling to NPU...")
@@ -55,13 +64,13 @@ def run_benchmark(size=1024, iterations=50, warmup=10):
     tflops = flops / 1e12
     
     print(f"\nResults:")
-    print(f"Matrix Size: {size}x{size}")
+    print(f"Matrix Size: {size}x{size} ({dtype_str})")
     print(f"Total Time: {total_time:.4f}s")
     print(f"Avg Latency: {avg_time*1000:.2f} ms")
-    print(f"Throughput: {gflops:.2f} GFLOPS ({tflops:.4f} TFLOPS)")
+    print(f"Throughput: {gflops:.2f} GOPS ({tflops:.4f} TOPS)")
     
     # CPU Comparison (Optional, for small sizes)
-    if size <= 1024:
+    if dtype_str != "int8":
         print("\nComparing with CPU (PyTorch)...")
         start_cpu = time.time()
         for _ in range(5): # Run fewer iters for CPU
@@ -69,12 +78,15 @@ def run_benchmark(size=1024, iterations=50, warmup=10):
         avg_cpu = (time.time() - start_cpu) / 5
         print(f"CPU Avg Latency: {avg_cpu*1000:.2f} ms")
         print(f"Speedup vs CPU: {avg_cpu / avg_time:.2f}x")
+    elif dtype_str == "int8":
+        print("\nSkipping CPU comparison for int8.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Intel NPU MatMul Stress Test")
-    parser.add_argument("--size", type=int, default=1024, help="Matrix size (NxN). Default: 1024")
+    parser.add_argument("--size", type=int, default=2048, help="Matrix size (NxN). Default: 1024")
     parser.add_argument("--iters", type=int, default=50, help="Number of benchmark iterations. Default: 50")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float32", "float16", "int8"], help="Data type. Default: float32")
     
     args = parser.parse_args()
     
-    run_benchmark(size=args.size, iterations=args.iters)
+    run_benchmark(size=args.size, iterations=args.iters, dtype_str=args.dtype)

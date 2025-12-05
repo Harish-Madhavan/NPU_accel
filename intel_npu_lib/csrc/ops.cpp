@@ -146,6 +146,23 @@ torch::Tensor npu_sub(torch::Tensor a, torch::Tensor b) {
     return execute_op(key, model, {a, b});
 }
 
+torch::Tensor npu_neg(torch::Tensor a) {
+    std::string key = get_key("neg", {a});
+
+    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
+        return execute_op(key, nullptr, {a});
+    }
+
+    ov::Shape shape;
+    for(auto d : a.sizes()) shape.push_back(d);
+    
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto op = std::make_shared<ov::opset1::Negative>(arg_a);
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
+    
+    return execute_op(key, model, {a});
+}
+
 torch::Tensor npu_mul(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.sizes() == b.sizes(), "Tensor sizes must match for mul");
     std::string key = get_key("mul", {a, b});

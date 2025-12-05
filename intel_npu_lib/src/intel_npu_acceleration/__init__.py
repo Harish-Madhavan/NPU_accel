@@ -28,6 +28,7 @@ def is_available():
 
 def add(a, b): return _C.npu_add(a, b) if _C else a + b
 def sub(a, b): return _C.npu_sub(a, b) if _C else a - b
+def neg(a): return _C.npu_neg(a) if _C else torch.neg(a)
 def mul(a, b): return _C.npu_mul(a, b) if _C else a * b
 def div(a, b): return _C.npu_div(a, b) if _C else a / b
 def matmul(a, b): return _C.npu_matmul(a, b) if _C else torch.matmul(a, b)
@@ -99,6 +100,8 @@ class NPUCompiler:
             operator.add: add,
             torch.sub: sub,
             operator.sub: sub,
+            torch.neg: neg,
+            operator.neg: neg,
             torch.mul: mul,
             operator.mul: mul,
             torch.div: div,
