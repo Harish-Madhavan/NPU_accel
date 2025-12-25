@@ -17,6 +17,8 @@ class LlamaConfig:
     max_seq_len: int = 128
     rope_theta: float = 10000.0
 
+from intel_npu_acceleration.functional import update_kv_cache
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -85,11 +87,8 @@ class Attention(nn.Module):
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
-        
-        self.cache_k = torch.zeros((1, args.max_seq_len, self.n_local_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((1, args.max_seq_len, self.n_local_kv_heads, self.head_dim))
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor], cache_k: Optional[torch.Tensor]=None, cache_v: Optional[torch.Tensor]=None):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -101,18 +100,16 @@ class Attention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cos, freqs_sin)
         xk = apply_rotary_emb(xk, freqs_cos, freqs_sin)
 
-        # Cache update - DISABLED for compilation test (FX doesn't like in-place update on proxies)
-        # In a real NPU deployment, we'd pass past_k/v as inputs and return new_k/v
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
-        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-        # keys = self.cache_k[:bsz, : start_pos + seqlen]
-        # values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # For this test, we assume we are processing the full sequence 'x'
+        # Functional Cache Update
         keys = xk
         values = xv
+        
+        if cache_k is not None and cache_v is not None:
+            cache_k = update_kv_cache(cache_k, xk, start_pos, seqlen)
+            cache_v = update_kv_cache(cache_v, xv, start_pos, seqlen)
+            
+            keys = cache_k[:, : start_pos + seqlen]
+            values = cache_v[:, : start_pos + seqlen]
 
         # Transpose for attention: (B, H, S, D)
         xq = xq.transpose(1, 2)
@@ -125,7 +122,7 @@ class Attention(nn.Module):
         scores = nn.functional.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bsz, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        return self.wo(output), cache_k, cache_v
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int):
@@ -156,10 +153,11 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor]):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask)
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor], cache_k=None, cache_v=None):
+        att_out, new_k, new_v = self.attention(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask, cache_k, cache_v)
+        h = x + att_out
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return out, new_k, new_v
 
 class Llama(nn.Module):
     def __init__(self, params: LlamaConfig):
@@ -180,7 +178,7 @@ class Llama(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, kv_cache: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         
@@ -195,11 +193,28 @@ class Llama(nn.Module):
         mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
         mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cos, freqs_sin, mask)
+        new_kvs_flat = []
+        for i, layer in enumerate(self.layers):
+            ck, cv = None, None
+            if kv_cache is not None:
+                # kv_cache shape: (N_Layers * 2, B, MaxSeqLen, H, D)
+                ck = kv_cache[2 * i]
+                cv = kv_cache[2 * i + 1]
+            
+            h, nk, nv = layer(h, start_pos, freqs_cos, freqs_sin, mask, ck, cv)
+            
+            if nk is not None and nv is not None:
+                new_kvs_flat.append(nk)
+                new_kvs_flat.append(nv)
+
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        
+        new_kv_cache = None
+        if len(new_kvs_flat) > 0:
+            new_kv_cache = torch.stack(new_kvs_flat, dim=0)
+            
+        return output, new_kv_cache
 
 def test_llama_impl():
     conf = LlamaConfig()
@@ -210,10 +225,14 @@ def test_llama_impl():
     x = torch.randint(0, conf.vocab_size, (1, 10))
     start_pos = 0
     
+    # Initialize Cache (N_Layers * 2, B, MaxSeqLen, H, D)
+    kv_cache = torch.zeros(conf.n_layers * 2, 1, conf.max_seq_len, conf.n_kv_heads, conf.dim // conf.n_heads)
+    
     print("Running on CPU...")
     with torch.no_grad():
-        logits_cpu = model(x, start_pos)
-    print(f"CPU Logits shape: {logits_cpu.shape}") # Should be (1, 10, vocab_size)
+        logits_cpu, cache_cpu = model(x, start_pos, kv_cache)
+    print(f"CPU Logits shape: {logits_cpu.shape}") 
+    print(f"CPU Cache shape: {cache_cpu.shape}")
 
     # Compile to NPU
     try:
@@ -222,30 +241,25 @@ def test_llama_impl():
         
         print("\nCompiling to NPU...")
         t0 = time.time()
-        # We need to pass example inputs exactly as the forward method expects
-        # forward(tokens, start_pos)
-        # Note: start_pos is an int. The compiler handles scalar inputs.
-        npu_model = npu_compiler.compile_to_npu(model, (x, start_pos))
+        # Input signature: (tokens, start_pos, kv_cache)
+        npu_model = npu_compiler.compile_to_npu(model, (x, start_pos, kv_cache))
         print(f"Compilation finished in {time.time() - t0:.2f}s")
         
         print("Running on NPU...")
         t0 = time.time()
-        # NPU model expects inputs in the same order/type as example_inputs
-        logits_npu = npu_model(x, start_pos)
+        logits_npu, cache_npu = npu_model(x, start_pos, kv_cache)
         print(f"NPU Inference time: {(time.time() - t0)*1000:.2f} ms")
         print(f"NPU Logits shape: {logits_npu.shape}")
         
-        # Verify
-        # Note: Precision differences are expected (FP32 vs FP16 potentially)
-        # But shapes should match.
         if logits_cpu.shape == logits_npu.shape:
-            print("Shape check PASSED")
+            print("Logits Shape check PASSED")
         else:
-            print(f"Shape check FAILED: {logits_cpu.shape} vs {logits_npu.shape}")
-            
-        # Optional: MSE check
-        # mse = torch.nn.functional.mse_loss(logits_cpu, logits_npu)
-        # print(f"MSE Loss: {mse.item()}")
+            print(f"Logits Shape check FAILED: {logits_cpu.shape} vs {logits_npu.shape}")
+
+        if cache_cpu.shape == cache_npu.shape:
+            print("Cache Shape check PASSED")
+        else:
+             print(f"Cache Shape check FAILED: {cache_cpu.shape} vs {cache_npu.shape}")
 
     except ImportError:
         print("Intel NPU library not found. Skipping NPU test.")

@@ -11,10 +11,6 @@
 #include <openvino/opsets/opset4.hpp> // For Swish (SiLU)
 #include <openvino/opsets/opset8.hpp> // For GELU
 
-// Global state
-static std::map<std::string, ov::CompiledModel>* g_model_cache = nullptr;
-static ov::Core* g_core = nullptr;
-
 // --- Helper Functions for Key Generation ---
 
 std::string get_shape_str(const torch::Tensor& t) {
@@ -35,92 +31,58 @@ std::string get_key(const std::string& op_name, const std::vector<torch::Tensor>
 
 // --- Core Compilation & Execution Logic ---
 
-ov::CompiledModel get_or_compile_model(const std::string& key, std::shared_ptr<ov::Model> model) {
-    if (g_model_cache == nullptr) {
-        g_model_cache = new std::map<std::string, ov::CompiledModel>();
-    }
-
-    if (g_model_cache->find(key) != g_model_cache->end()) {
-        return (*g_model_cache)[key];
-    }
-
-    // Cache Cleanup
-    if (g_model_cache->size() > 100) {
-        g_model_cache->clear();
-    }
-
-    initialize_npu();
-    
-    if (g_core == nullptr) {
-        g_core = new ov::Core();
-    }
-
-    std::string device = "NPU";
-    // std::cout << "[Intel NPU Lib] Compiling " << key << "..." << std::endl;
-    auto compiled_model = g_core->compile_model(model, device);
-    (*g_model_cache)[key] = compiled_model;
-    return compiled_model;
-}
-
 torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> model, const std::vector<torch::Tensor>& inputs) {
-    auto compiled_model = get_or_compile_model(key, model);
-    auto infer_request = compiled_model.create_infer_request();
+    try {
+        auto compiled_model = NPUBackend::getInstance().getOrCompileModel(key, model);
+        auto infer_request = compiled_model.create_infer_request();
 
-    // Keep tensors alive during inference
-    std::vector<torch::Tensor> held_tensors; 
+        // Keep tensors alive during inference
+        std::vector<torch::Tensor> held_tensors; 
 
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        auto t = inputs[i].contiguous();
-        held_tensors.push_back(t); // extend lifetime
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            auto t = inputs[i].contiguous();
+            held_tensors.push_back(t); // extend lifetime
+            
+            ov::Shape shape;
+            for(auto d : t.sizes()) shape.push_back(d);
+            
+            ov::Tensor input_tensor(ov::element::f32, shape, t.data_ptr<float>());
+            infer_request.set_input_tensor(i, input_tensor);
+        }
         
-        ov::Shape shape;
-        for(auto d : t.sizes()) shape.push_back(d);
+        infer_request.infer();
         
-        ov::Tensor input_tensor(ov::element::f32, shape, t.data_ptr<float>());
-        infer_request.set_input_tensor(i, input_tensor);
+        auto output_tensor = infer_request.get_output_tensor();
+        auto output_shape = output_tensor.get_shape();
+        
+        std::vector<int64_t> torch_shape;
+        for(auto d : output_shape) torch_shape.push_back(d);
+        
+        auto options = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::Tensor result = torch::empty(torch_shape, options);
+        
+        std::memcpy(result.data_ptr<float>(), output_tensor.data<float>(), output_tensor.get_byte_size());
+
+        return result;
+
+    } catch (const std::exception& e) {
+        // Fallback or rethrow
+        // For now, rethrow as a torch error
+        TORCH_CHECK(false, "NPU Execution Failed: " + std::string(e.what()));
     }
-    
-    infer_request.infer();
-    
-    auto output_tensor = infer_request.get_output_tensor();
-    auto output_shape = output_tensor.get_shape();
-    
-    std::vector<int64_t> torch_shape;
-    for(auto d : output_shape) torch_shape.push_back(d);
-
-    // Debug Print
-    // std::cout << "[EXECUTE_OP] Key: " << key << " Output Shape: ";
-    // for(auto s : torch_shape) std::cout << s << " ";
-    // std::cout << std::endl;
-    
-    auto options = torch::TensorOptions().dtype(torch::kFloat32);
-    torch::Tensor result = torch::empty(torch_shape, options);
-    
-    std::memcpy(result.data_ptr<float>(), output_tensor.data<float>(), output_tensor.get_byte_size());
-
-    return result;
 }
 
 // --- Op Implementations ---
 
 torch::Tensor npu_add(torch::Tensor a, torch::Tensor b) {
-    TORCH_CHECK(a.sizes() == b.sizes(), "Tensor sizes must match for add");
     std::string key = get_key("add", {a, b});
     
-    // Define Graph (Lazy construction, strictly only if not cached? 
-    // Actually, we construct it to pass to compiler, but compiler function checks cache first. 
-    // Optimally we check cache before constructing model, but for simplicity we construct model here or check cache here.
-    // To avoid constructing model every time, we should check cache first.)
+    ov::Shape shape_a, shape_b;
+    for(auto d : a.sizes()) shape_a.push_back(d);
+    for(auto d : b.sizes()) shape_b.push_back(d);
     
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a, b}); // Model not needed if cached
-    }
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
     auto op = std::make_shared<ov::opset1::Add>(arg_a, arg_b);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
     
@@ -128,18 +90,14 @@ torch::Tensor npu_add(torch::Tensor a, torch::Tensor b) {
 }
 
 torch::Tensor npu_sub(torch::Tensor a, torch::Tensor b) {
-    TORCH_CHECK(a.sizes() == b.sizes(), "Tensor sizes must match for sub");
     std::string key = get_key("sub", {a, b});
 
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a, b});
-    }
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
+    ov::Shape shape_a, shape_b;
+    for(auto d : a.sizes()) shape_a.push_back(d);
+    for(auto d : b.sizes()) shape_b.push_back(d);
     
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
     auto op = std::make_shared<ov::opset1::Subtract>(arg_a, arg_b);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
     
@@ -148,10 +106,6 @@ torch::Tensor npu_sub(torch::Tensor a, torch::Tensor b) {
 
 torch::Tensor npu_neg(torch::Tensor a) {
     std::string key = get_key("neg", {a});
-
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a});
-    }
 
     ov::Shape shape;
     for(auto d : a.sizes()) shape.push_back(d);
@@ -164,18 +118,14 @@ torch::Tensor npu_neg(torch::Tensor a) {
 }
 
 torch::Tensor npu_mul(torch::Tensor a, torch::Tensor b) {
-    TORCH_CHECK(a.sizes() == b.sizes(), "Tensor sizes must match for mul");
     std::string key = get_key("mul", {a, b});
 
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a, b});
-    }
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
+    ov::Shape shape_a, shape_b;
+    for(auto d : a.sizes()) shape_a.push_back(d);
+    for(auto d : b.sizes()) shape_b.push_back(d);
     
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
     auto op = std::make_shared<ov::opset1::Multiply>(arg_a, arg_b);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
     
@@ -183,18 +133,14 @@ torch::Tensor npu_mul(torch::Tensor a, torch::Tensor b) {
 }
 
 torch::Tensor npu_div(torch::Tensor a, torch::Tensor b) {
-    TORCH_CHECK(a.sizes() == b.sizes(), "Tensor sizes must match for div");
     std::string key = get_key("div", {a, b});
 
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a, b});
-    }
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
+    ov::Shape shape_a, shape_b;
+    for(auto d : a.sizes()) shape_a.push_back(d);
+    for(auto d : b.sizes()) shape_b.push_back(d);
     
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
     auto op = std::make_shared<ov::opset1::Divide>(arg_a, arg_b);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
     
@@ -204,10 +150,6 @@ torch::Tensor npu_div(torch::Tensor a, torch::Tensor b) {
 torch::Tensor npu_matmul(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.dim() >= 2 && b.dim() >= 2, "Tensors must be at least 2D for matmul");
     std::string key = get_key("matmul", {a, b});
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a, b});
-    }
 
     ov::Shape shape_a, shape_b;
     for(auto d : a.sizes()) shape_a.push_back(d);
@@ -223,10 +165,6 @@ torch::Tensor npu_matmul(torch::Tensor a, torch::Tensor b) {
 
 torch::Tensor npu_relu(torch::Tensor a) {
     std::string key = get_key("relu", {a});
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a});
-    }
 
     ov::Shape shape;
     for(auto d : a.sizes()) shape.push_back(d);
@@ -240,10 +178,6 @@ torch::Tensor npu_relu(torch::Tensor a) {
 
 torch::Tensor npu_gelu(torch::Tensor a) {
     std::string key = get_key("gelu", {a});
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a});
-    }
 
     ov::Shape shape;
     for(auto d : a.sizes()) shape.push_back(d);
@@ -258,10 +192,6 @@ torch::Tensor npu_gelu(torch::Tensor a) {
 
 torch::Tensor npu_silu(torch::Tensor a) {
     std::string key = get_key("silu", {a});
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a});
-    }
 
     ov::Shape shape;
     for(auto d : a.sizes()) shape.push_back(d);
@@ -275,10 +205,6 @@ torch::Tensor npu_silu(torch::Tensor a) {
 
 torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsilon) {
     std::string key = get_key("rmsnorm", {input, weight}, std::to_string(epsilon));
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {input, weight});
-    }
 
     ov::Shape input_shape, weight_shape;
     for(auto d : input.sizes()) input_shape.push_back(d);
@@ -318,10 +244,6 @@ torch::Tensor npu_softmax(torch::Tensor a, int64_t dim) {
     if (dim < 0) dim += a.dim();
     
     std::string key = get_key("softmax", {a}, std::to_string(dim));
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {a});
-    }
 
     ov::Shape shape;
     for(auto d : a.sizes()) shape.push_back(d);
@@ -335,15 +257,7 @@ torch::Tensor npu_softmax(torch::Tensor a, int64_t dim) {
 
 torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
     // Linear: y = x * A^T + b
-    // Input: (..., in_features)
-    // Weight: (out_features, in_features)
-    // Bias: (out_features)
-    
     std::string key = get_key("linear", {input, weight, bias});
-    
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {input, weight, bias});
-    }
 
     ov::Shape shape_in, shape_w, shape_b;
     for(auto d : input.sizes()) shape_in.push_back(d);
@@ -354,9 +268,6 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
     auto arg_w = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_w);
     auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
     
-    // MatMul: Weight needs to be transposed usually for Linear? 
-    // PyTorch Linear: input x weight.T
-    // OpenVINO MatMul can transpose_b=true
     auto matmul = std::make_shared<ov::opset1::MatMul>(arg_in, arg_w, false, true);
     auto add = std::make_shared<ov::opset1::Add>(matmul, arg_b);
     
@@ -372,16 +283,11 @@ torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutatio
     std::string extra = ss.str();
     std::string key = get_key("transpose", {input}, extra);
 
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {input});
-    }
-
     ov::Shape input_shape;
     for(auto d : input.sizes()) input_shape.push_back(d);
 
     auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
     
-    // Create Constant for permutation
     auto perm_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{permutation.size()}, permutation);
     
     auto op = std::make_shared<ov::opset1::Transpose>(arg_input, perm_const);
@@ -397,22 +303,147 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     std::string extra = ss.str();
     std::string key = get_key("reshape", {input}, extra);
 
-    if (g_model_cache && g_model_cache->find(key) != g_model_cache->end()) {
-        return execute_op(key, nullptr, {input});
-    }
-
     ov::Shape input_shape;
     for(auto d : input.sizes()) input_shape.push_back(d);
 
     auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
 
-    // Create Constant for shape
-    // Note: In PyTorch, -1 means infer. OpenVINO Reshape supports 0 (copy from input) and -1 (infer).
-    // However, usually shape passed here is explicit.
     auto shape_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{shape.size()}, shape);
 
-    auto op = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false); // false = special_zero (0 means 0, not copy dim)
+    auto op = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false); 
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
 
+    return execute_op(key, model, {input});
+}
+
+torch::Tensor npu_conv2d(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    std::vector<int64_t> stride, 
+    std::vector<int64_t> padding, 
+    std::vector<int64_t> dilation, 
+    int64_t groups
+) {
+    std::stringstream ss;
+    ss << "conv2d_";
+    for(auto s : stride) ss << s << ",";
+    for(auto p : padding) ss << p << ",";
+    for(auto d : dilation) ss << d << ",";
+    ss << groups;
+    
+    std::string key = get_key("conv2d", {input, weight}, ss.str());
+    if (bias.defined()) key += "_bias";
+
+    ov::Shape input_shape, weight_shape;
+    for(auto d : input.sizes()) input_shape.push_back(d);
+    for(auto d : weight.sizes()) weight_shape.push_back(d);
+
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
+    auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov::element::f32, weight_shape);
+
+    ov::Strides ov_strides(stride.begin(), stride.end());
+    ov::CoordinateDiff ov_pads_begin(padding.begin(), padding.end());
+    ov::CoordinateDiff ov_pads_end(padding.begin(), padding.end());
+    ov::Strides ov_dilations(dilation.begin(), dilation.end());
+
+    std::shared_ptr<ov::Node> conv_op;
+    
+    if (groups == 1) {
+        conv_op = std::make_shared<ov::opset1::Convolution>(
+            arg_input,
+            arg_weight,
+            ov_strides,
+            ov_pads_begin,
+            ov_pads_end,
+            ov_dilations
+        );
+    } else {
+        int64_t out_channels = weight.size(0);
+        int64_t in_channels_per_group = weight.size(1);
+        int64_t kH = weight.size(2);
+        int64_t kW = weight.size(3);
+        
+        auto shape_const = ov::opset1::Constant::create(ov::element::i64, {5}, {groups, out_channels/groups, in_channels_per_group, kH, kW});
+        auto reshaped_w = std::make_shared<ov::opset1::Reshape>(arg_weight, shape_const, false);
+        
+        conv_op = std::make_shared<ov::opset1::GroupConvolution>(
+            arg_input,
+            reshaped_w,
+            ov_strides,
+            ov_pads_begin,
+            ov_pads_end,
+            ov_dilations
+        );
+    }
+
+    std::shared_ptr<ov::Node> result = conv_op;
+
+    std::vector<torch::Tensor> inputs = {input, weight};
+    std::shared_ptr<ov::opset1::Parameter> arg_bias = nullptr;
+
+    if (bias.defined()) {
+        inputs.push_back(bias);
+        ov::Shape bias_shape;
+        for(auto d : bias.sizes()) bias_shape.push_back(d);
+        arg_bias = std::make_shared<ov::opset1::Parameter>(ov::element::f32, bias_shape);
+        
+        auto axes_const = ov::opset1::Constant::create(ov::element::i64, {3}, {0, 2, 3});
+        auto bias_4d = std::make_shared<ov::opset1::Unsqueeze>(arg_bias, axes_const);
+        
+        result = std::make_shared<ov::opset1::Add>(result, bias_4d);
+    }
+
+    ov::ParameterVector params = {arg_input, arg_weight};
+    if (arg_bias) params.push_back(arg_bias);
+
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{result}, params);
+    
+    return execute_op(key, model, inputs);
+}
+
+torch::Tensor npu_max_pool2d(
+    torch::Tensor input, 
+    std::vector<int64_t> kernel_size, 
+    std::vector<int64_t> stride, 
+    std::vector<int64_t> padding, 
+    std::vector<int64_t> dilation,
+    bool ceil_mode
+) {
+    std::stringstream ss;
+    ss << "maxpool2d_";
+    for(auto k : kernel_size) ss << k << ",";
+    for(auto s : stride) ss << s << ",";
+    for(auto p : padding) ss << p << ",";
+    for(auto d : dilation) ss << d << ",";
+    ss << ceil_mode;
+
+    std::string key = get_key("maxpool2d", {input}, ss.str());
+
+    ov::Shape input_shape;
+    for(auto d : input.sizes()) input_shape.push_back(d);
+    
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
+
+    ov::Strides ov_strides(stride.begin(), stride.end());
+    ov::Shape ov_kernel(kernel_size.begin(), kernel_size.end());
+    ov::Shape ov_pads_begin(padding.begin(), padding.end());
+    ov::Shape ov_pads_end(padding.begin(), padding.end());
+    ov::Strides ov_dilations(dilation.begin(), dilation.end());
+    
+    auto rounding_type = ceil_mode ? ov::op::RoundingType::CEIL : ov::op::RoundingType::FLOOR;
+
+    auto op = std::make_shared<ov::opset1::MaxPool>(
+        arg_input,
+        ov_strides,
+        ov_pads_begin,
+        ov_pads_end,
+        ov_kernel,
+        rounding_type,
+        ov::op::PadType::EXPLICIT
+    );
+
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+    
     return execute_op(key, model, {input});
 }

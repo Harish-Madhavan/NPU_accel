@@ -47,18 +47,20 @@ class TestIntelNPULib(unittest.TestCase):
                 return w
 
         model = SimpleModel()
-        compiled_model = intel_npu_acceleration.compile(model)
         
         x = torch.randn(10, 10)
         y = torch.randn(10, 10)
         
-        # Warmup (compilation happens here)
+        # New API requires example_input
+        compiled_model = intel_npu_acceleration.compile(model, (x, y))
+        
+        # Warmup (compilation happens inside compile_to_npu now, not lazy)
         start = time.time()
         out_compiled = compiled_model(x, y)
         end = time.time()
-        print(f"First run (compile + exec): {end - start:.4f}s")
+        print(f"First run (exec): {end - start:.4f}s")
         
-        # Second run (should be faster due to caching in ops.cpp)
+        # Second run
         start = time.time()
         out_compiled_2 = compiled_model(x, y)
         end = time.time()

@@ -16,3 +16,23 @@ torch::Tensor npu_softmax(torch::Tensor a, int64_t dim);
 torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation);
 torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape);
+
+// CV Ops
+torch::Tensor npu_conv2d(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    std::vector<int64_t> stride, 
+    std::vector<int64_t> padding, 
+    std::vector<int64_t> dilation, 
+    int64_t groups
+);
+
+torch::Tensor npu_max_pool2d(
+    torch::Tensor input, 
+    std::vector<int64_t> kernel_size, 
+    std::vector<int64_t> stride, 
+    std::vector<int64_t> padding, 
+    std::vector<int64_t> dilation,
+    bool ceil_mode
+);

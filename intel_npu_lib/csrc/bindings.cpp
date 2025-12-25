@@ -18,4 +18,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("npu_linear", &npu_linear, "NPU accelerated Linear (MatMul + Bias)");
   m.def("npu_transpose", &npu_transpose, "NPU accelerated Transpose");
   m.def("npu_reshape", &npu_reshape, "NPU accelerated Reshape");
+  m.def("npu_conv2d", &npu_conv2d, "NPU accelerated Conv2d");
+  m.def("npu_max_pool2d", &npu_max_pool2d, "NPU accelerated MaxPool2d");
 }
