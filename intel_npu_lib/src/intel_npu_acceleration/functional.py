@@ -91,6 +91,29 @@ def reshape(a: torch.Tensor, shape: Union[List[int], Tuple[int, ...], torch.Size
     res = _safe_call('npu_reshape', a, target_shape)
     return res if res is not None else a.reshape(target_shape)
 
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None
+) -> torch.Tensor:
+    
+    scale_val = scale if scale is not None else -1.0
+    orig_mask = attn_mask
+    if attn_mask is None:
+        attn_mask = torch.Tensor().to(query.device) # Undefined/Empty for C++
+        
+    res = _safe_call(
+        'npu_scaled_dot_product_attention',
+        query, key, value, attn_mask, dropout_p, is_causal, scale_val
+    )
+    return res if res is not None else torch.nn.functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=orig_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+    )
+
 def conv2d(
     input: torch.Tensor,
     weight: torch.Tensor,

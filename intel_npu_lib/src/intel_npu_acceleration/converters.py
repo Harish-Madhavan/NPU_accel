@@ -18,6 +18,34 @@ def _to_list(val, n=2):
 
 # --- Converters ---
 
+@OpRegistry.register_function(torch.nn.functional.scaled_dot_product_attention)
+def convert_sdpa(builder: OVGraphBuilder, node, args, kwargs):
+    query = builder.get_input_or_constant(args[0])
+    key = builder.get_input_or_constant(args[1])
+    value = builder.get_input_or_constant(args[2])
+    
+    attn_mask = kwargs.get('attn_mask', args[3] if len(args) > 3 else None)
+    dropout_p = kwargs.get('dropout_p', args[4] if len(args) > 4 else 0.0)
+    is_causal = kwargs.get('is_causal', args[5] if len(args) > 5 else False)
+    
+    # Scale: default is 1 / sqrt(head_dim)
+    # OpenVINO SDPA might compute this automatically if scale is not provided?
+    # No, usually need to provide it or it defaults.
+    # Torch doc: "If scale is None, it defaults to 1 / sqrt(query.size(-1))"
+    # We might need to construct the scale constant.
+    
+    # Check if we need to provide scale.
+    # OpenVINO ops.scaled_dot_product_attention(query, key, value, attention_mask=None, scale=None, causal=False)
+    
+    ov_mask = None
+    if attn_mask is not None:
+        ov_mask = builder.get_input_or_constant(attn_mask)
+        
+    # is_causal handling
+    # If is_causal is True, OpenVINO handles it.
+    
+    return ops.scaled_dot_product_attention(query, key, value, attention_mask=ov_mask, causal=is_causal)
+
 @OpRegistry.register_function(torch.add, operator.add)
 def convert_add(builder: OVGraphBuilder, node, args, kwargs):
     inp0 = builder.get_input_or_constant(args[0])

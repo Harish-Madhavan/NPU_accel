@@ -17,6 +17,16 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation);
 torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape);
 
+torch::Tensor npu_scaled_dot_product_attention(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor attn_mask,
+    double dropout_p,
+    bool is_causal,
+    double scale
+);
+
 // CV Ops
 torch::Tensor npu_conv2d(
     torch::Tensor input, 

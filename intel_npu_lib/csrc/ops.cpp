@@ -10,6 +10,7 @@
 #include <openvino/opsets/opset1.hpp>
 #include <openvino/opsets/opset4.hpp> // For Swish (SiLU)
 #include <openvino/opsets/opset8.hpp> // For GELU
+#include <openvino/opsets/opset13.hpp> // For ScaledDotProductAttention
 
 // --- Helper Functions for Key Generation ---
 
@@ -314,6 +315,120 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
 
     return execute_op(key, model, {input});
+}
+
+torch::Tensor npu_scaled_dot_product_attention(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor attn_mask,
+    double dropout_p,
+    bool is_causal,
+    double scale
+) {
+    std::stringstream ss;
+    ss << "sdpa_" << is_causal << "_" << scale << "_";
+    if (attn_mask.defined()) ss << "mask_";
+    
+    std::string extra = ss.str();
+    std::vector<torch::Tensor> key_inputs = {query, key, value};
+    if (attn_mask.defined()) key_inputs.push_back(attn_mask);
+    
+    std::string op_key = get_key("sdpa", key_inputs, extra);
+
+    ov::Shape q_shape, k_shape, v_shape;
+    for(auto d : query.sizes()) q_shape.push_back(d);
+    for(auto d : key.sizes()) k_shape.push_back(d);
+    for(auto d : value.sizes()) v_shape.push_back(d);
+    
+    auto arg_q = std::make_shared<ov::opset1::Parameter>(ov::element::f32, q_shape);
+    auto arg_k = std::make_shared<ov::opset1::Parameter>(ov::element::f32, k_shape);
+    auto arg_v = std::make_shared<ov::opset1::Parameter>(ov::element::f32, v_shape);
+    
+    ov::ParameterVector params = {arg_q, arg_k, arg_v};
+    std::vector<torch::Tensor> inputs = {query, key, value};
+    
+    std::shared_ptr<ov::Node> arg_mask = nullptr;
+    if (attn_mask.defined()) {
+        ov::Shape m_shape;
+        for(auto d : attn_mask.sizes()) m_shape.push_back(d);
+        auto p_mask = std::make_shared<ov::opset1::Parameter>(ov::element::f32, m_shape);
+        arg_mask = p_mask;
+        params.push_back(p_mask);
+        inputs.push_back(attn_mask);
+    }
+    
+    std::shared_ptr<ov::Node> arg_scale = nullptr;
+    // Torch SDPA usually defaults scale to 1/sqrt(head_dim) if not provided?
+    // Here we assume the caller passes the correct scale if they want to override, 
+    // or we might pass 0/negative to indicate "default"?
+    // But OpenVINO SDPA doesn't compute default scale internally if input is missing? 
+    // Wait, documentation says "If scale is not provided, it defaults to 1 / sqrt(query.shape[-1])".
+    // So if scale <= 0, we skip providing it?
+    // Let's assume if scale > 0, we provide it.
+    
+    if (scale > 0) {
+         // Scale is scalar? Or tensor?
+         // SDPA expects scale as input 4 (after mask).
+         arg_scale = ov::opset1::Constant::create(ov::element::f32, {}, {scale});
+    }
+
+    // Constructor: ScaledDotProductAttention (const Output< Node > &query, const Output< Node > &key, const Output< Node > &value, const Output< Node > &attention_mask, const Output< Node > &scale, bool causal=false)
+    // Note: If args are null/missing, there are different constructors or we pass empty?
+    // Actually, C++ API usually has overloads.
+    // If we want to skip mask but provide scale: we pass null/dummy?
+    // opset13::SDPA constructor takes optional args?
+    // Let's check constructor signatures.
+    // Explicit constructor: query, key, value, attn_mask, scale, causal.
+    
+    std::shared_ptr<ov::Node> op;
+    if (arg_mask && arg_scale) {
+        op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, arg_scale, is_causal);
+    } else if (arg_mask && !arg_scale) {
+        op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, is_causal);
+    } else if (!arg_mask && arg_scale) {
+         // How to pass scale without mask? Pass empty/null for mask?
+         // Usually undefined/empty constant?
+         // Or overload without mask?
+         // Documentation says: "attention_mask (optional)"
+         // "If not provided, ..."
+         // The C++ API might require passing something.
+         // Let's assume we can pass a dummy empty node or there is an overload.
+         // Actually, if we look at python: query, key, value, attention_mask=None, scale=None...
+         // In C++, often `ov::Output<Node>()` or similar.
+         // But `make_shared` might not like that.
+         // Safe bet: if mask is missing but scale is present, pass an empty constant for mask? or nullptr?
+         // OpenVINO C++ nodes usually don't take nullptr for Input.
+         // They take Output<Node>.
+         // Let's try passing a dummy (empty shape?) or look for overload.
+         // If no overload, usually we construct the node and set inputs.
+         
+         // Let's assume there is a constructor `ScaledDotProductAttention(q, k, v, causal)` 
+         // and we can set inputs later?
+         // Or `ScaledDotProductAttention(q, k, v, mask, scale, causal)`
+         
+         // If I don't know the exact API, this is risky.
+         // However, I can create the node with basic args and then `.set_argument(3, scale)`?
+         
+         // Let's fallback to: if scale is provided, we MUST provide mask? 
+         // Or provide a "dummy" mask (all zeros? or booleans?).
+         // If mask is missing in SDPA, it means "attend to everything".
+         // Passing a tensor of zeros (additive mask) does the same.
+         // So if scale is needed but mask is missing, create a zero mask broadcastable?
+         
+         if (!arg_mask) {
+             // Create zero mask (1,1,1,1) ?
+             arg_mask = ov::opset1::Constant::create(ov::element::f32, {}, {0.0f});
+         }
+         op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, arg_scale, is_causal);
+    } else {
+        // No mask, no scale
+        op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, is_causal);
+    }
+
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, params);
+    
+    return execute_op(op_key, model, inputs);
 }
 
 torch::Tensor npu_conv2d(
