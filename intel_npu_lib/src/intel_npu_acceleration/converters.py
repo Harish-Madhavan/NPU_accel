@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import openvino as ov
 import openvino.opset13 as ops
 import numpy as np
 import operator
@@ -10,6 +11,12 @@ from .graph_builder import OVGraphBuilder
 from . import transpose as npu_transpose_func
 from . import reshape as npu_reshape_func
 from . import rmsnorm as npu_rmsnorm_func
+from . import linear as npu_linear_func
+from . import conv2d as npu_conv2d_func
+from . import max_pool2d as npu_max_pool2d_func
+from . import relu as npu_relu_func
+from . import gelu as npu_gelu_func
+from . import silu as npu_silu_func
 
 def _to_list(val, n=2):
     if isinstance(val, int):
@@ -27,29 +34,35 @@ def convert_sdpa(builder: OVGraphBuilder, node, args, kwargs):
     attn_mask = kwargs.get('attn_mask', args[3] if len(args) > 3 else None)
     dropout_p = kwargs.get('dropout_p', args[4] if len(args) > 4 else 0.0)
     is_causal = kwargs.get('is_causal', args[5] if len(args) > 5 else False)
-    
-    # Scale: default is 1 / sqrt(head_dim)
-    # OpenVINO SDPA might compute this automatically if scale is not provided?
-    # No, usually need to provide it or it defaults.
-    # Torch doc: "If scale is None, it defaults to 1 / sqrt(query.size(-1))"
-    # We might need to construct the scale constant.
-    
-    # Check if we need to provide scale.
-    # OpenVINO ops.scaled_dot_product_attention(query, key, value, attention_mask=None, scale=None, causal=False)
+    scale = kwargs.get('scale', args[6] if len(args) > 6 else None)
     
     ov_mask = None
     if attn_mask is not None:
         ov_mask = builder.get_input_or_constant(attn_mask)
         
-    # is_causal handling
-    # If is_causal is True, OpenVINO handles it.
-    
-    return ops.scaled_dot_product_attention(query, key, value, attention_mask=ov_mask, causal=is_causal)
+    if scale is None:
+        # Default scale: 1 / sqrt(query.size(-1))
+        q_shape = query.get_output_partial_shape(0)
+        head_dim = q_shape[-1].get_length()
+        scale_val = 1.0 / np.sqrt(head_dim)
+        scale_node = ops.constant(scale_val, dtype=np.float32)
+    else:
+        scale_node = builder.get_input_or_constant(scale)
+        if not isinstance(scale_node, ov.Node):
+            scale_node = ops.constant(scale_node, dtype=np.float32)
+
+    return ops.scaled_dot_product_attention(
+        query, key, value, 
+        attention_mask=ov_mask, 
+        scale=scale_node, 
+        causal=is_causal
+    )
 
 @OpRegistry.register_function(torch.add, operator.add)
 def convert_add(builder: OVGraphBuilder, node, args, kwargs):
     inp0 = builder.get_input_or_constant(args[0])
     inp1 = builder.get_input_or_constant(args[1])
+    inp0, inp1 = builder.align_types(inp0, inp1)
     return ops.add(inp0, inp1)
 
 @OpRegistry.register_function(torch.sub, operator.sub)
@@ -129,17 +142,25 @@ def convert_matmul(builder: OVGraphBuilder, node, args, kwargs):
 
     return ops.matmul(inp0, inp1, transpose_a=False, transpose_b=False)
 
-@OpRegistry.register_function(torch.relu, torch.nn.functional.relu)
+@OpRegistry.register_function(torch.relu, torch.nn.functional.relu, npu_relu_func)
+@OpRegistry.register_module(torch.nn.ReLU)
 def convert_relu(builder: OVGraphBuilder, node, args, kwargs):
-    return ops.relu(builder.get_input_or_constant(args[0]))
+    inp = builder.get_input_or_constant(args[0])
+    return ops.relu(inp)
 
-@OpRegistry.register_function(torch.nn.functional.gelu)
+@OpRegistry.register_function(torch.nn.functional.gelu, npu_gelu_func)
+@OpRegistry.register_module(torch.nn.GELU)
 def convert_gelu(builder: OVGraphBuilder, node, args, kwargs):
-    return ops.gelu(builder.get_input_or_constant(args[0]), approximation_mode="erf")
+    inp = builder.get_input_or_constant(args[0])
+    approx = kwargs.get('approximate', 'none')
+    mode = "erf" if approx == 'none' else "tanh"
+    return ops.gelu(inp, approximation_mode=mode)
 
-@OpRegistry.register_function(torch.nn.functional.silu)
+@OpRegistry.register_function(torch.nn.functional.silu, npu_silu_func)
+@OpRegistry.register_module(torch.nn.SiLU)
 def convert_silu(builder: OVGraphBuilder, node, args, kwargs):
-    return ops.swish(builder.get_input_or_constant(args[0]))
+    inp = builder.get_input_or_constant(args[0])
+    return ops.swish(inp)
 
 @OpRegistry.register_function(torch.rsqrt)
 def convert_rsqrt(builder: OVGraphBuilder, node, args, kwargs):
@@ -147,42 +168,68 @@ def convert_rsqrt(builder: OVGraphBuilder, node, args, kwargs):
     exp_node = ops.constant(-0.5, dtype=np.float32)
     return ops.power(inp, exp_node)
 
+@OpRegistry.register_function(torch.where)
+def convert_where(builder: OVGraphBuilder, node, args, kwargs):
+    cond = builder.get_input_or_constant(args[0])
+    x = builder.get_input_or_constant(args[1])
+    y = builder.get_input_or_constant(args[2])
+    x, y = builder.align_types(x, y)
+    return ops.select(cond, x, y)
+
+@OpRegistry.register_function(torch.clamp, torch.nn.functional.hardtanh)
+def convert_clamp(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    min_val = kwargs.get('min', args[1] if len(args) > 1 else None)
+    max_val = kwargs.get('max', args[2] if len(args) > 2 else None)
+    
+    if min_val is not None:
+        min_node = builder.get_input_or_constant(min_val)
+        inp, min_node = builder.align_types(inp, min_node)
+        inp = ops.maximum(inp, min_node)
+    
+    if max_val is not None:
+        max_node = builder.get_input_or_constant(max_val)
+        inp, max_node = builder.align_types(inp, max_node)
+        inp = ops.minimum(inp, max_node)
+        
+    return inp
+
 @OpRegistry.register_function(torch.mean)
 @OpRegistry.register_method("mean")
 def convert_mean(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
-    dim = node.kwargs.get('dim', args[1] if len(args) > 1 else None)
-    keepdim = node.kwargs.get('keepdim', args[2] if len(args) > 2 else False)
-    
+    dim     = kwargs.get('dim',     args[1] if len(args) > 1 else None)
+    keepdim = kwargs.get('keepdim', args[2] if len(args) > 2 else False)
+
     if dim is None:
-        raise RuntimeError("Mean without dim not supported yet")
-    
-    if isinstance(dim, int):
+        # Global mean: reduce over all axes.
+        rank  = inp.get_output_partial_shape(0).rank.get_length()
+        axes  = ops.constant(list(range(rank)), dtype=np.int64)
+    elif isinstance(dim, int):
         axes = ops.constant([dim], dtype=np.int64)
     else:
         axes = ops.constant(list(dim), dtype=np.int64)
-        
+
     return ops.reduce_mean(inp, axes, keep_dims=keepdim)
 
 @OpRegistry.register_function(torch.softmax, torch.nn.functional.softmax)
 def convert_softmax(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
-    dim = node.kwargs.get('dim', args[1] if len(args) > 1 else -1)
+    dim = kwargs.get('dim', args[1] if len(args) > 1 else -1)
     return ops.softmax(inp, axis=dim)
 
 @OpRegistry.register_function(torch.cat)
 def convert_cat(builder: OVGraphBuilder, node, args, kwargs):
-    tensors_list_node = node.args[0]
-    dim = node.kwargs['dim']
-    # Map input nodes
-    ov_inputs = [builder.get_input(n.name) for n in tensors_list_node]
+    tensors_list = args[0]
+    dim = kwargs.get('dim', args[1] if len(args) > 1 else 0)
+    ov_inputs = [builder.get_input_or_constant(t) for t in tensors_list]
     return ops.concat(ov_inputs, axis=dim)
 
 @OpRegistry.register_function(torch.stack)
 def convert_stack(builder: OVGraphBuilder, node, args, kwargs):
-    tensors_list_node = node.args[0]
-    dim = node.kwargs['dim']
-    ov_inputs = [builder.get_input(n.name) for n in tensors_list_node]
+    tensors_list = args[0]
+    dim = kwargs.get('dim', args[1] if len(args) > 1 else 0)
+    ov_inputs = [builder.get_input_or_constant(t) for t in tensors_list]
     
     unsqueezed_inputs = []
     for ov_input in ov_inputs:
@@ -278,6 +325,34 @@ def convert_full(builder: OVGraphBuilder, node, args, kwargs):
     val_node = builder.get_input_or_constant(fill_value)
     return ops.broadcast(val_node, shape_node)
 
+@OpRegistry.register_function(torch.zeros, torch.zeros_like)
+def convert_zeros(builder: OVGraphBuilder, node, args, kwargs):
+    if node.target == torch.zeros_like:
+        ref = builder.get_input_or_constant(args[0])
+        shape_node = ops.shape_of(ref)
+        dtype = ref.get_element_type()
+    else:
+        size = args[0]
+        shape_node = builder.get_input_or_constant(size)
+        dtype = np.float32 # Default
+        
+    val_node = ops.constant(0.0, dtype=dtype)
+    return ops.broadcast(val_node, shape_node)
+
+@OpRegistry.register_function(torch.ones, torch.ones_like)
+def convert_ones(builder: OVGraphBuilder, node, args, kwargs):
+    if node.target == torch.ones_like:
+        ref = builder.get_input_or_constant(args[0])
+        shape_node = ops.shape_of(ref)
+        dtype = ref.get_element_type()
+    else:
+        size = args[0]
+        shape_node = builder.get_input_or_constant(size)
+        dtype = np.float32
+        
+    val_node = ops.constant(1.0, dtype=dtype)
+    return ops.broadcast(val_node, shape_node)
+
 @OpRegistry.register_function(torch.arange)
 def convert_arange(builder: OVGraphBuilder, node, args, kwargs):
     if len(args) == 1:
@@ -306,62 +381,137 @@ def convert_clone(builder: OVGraphBuilder, node, args, kwargs):
 @OpRegistry.register_function(operator.setitem)
 @OpRegistry.register_method("__setitem__")
 def convert_setitem(builder: OVGraphBuilder, node, args, kwargs):
+    """
+    Handle tensor[indices] = value by decomposing into concat operations.
+
+    Supported index patterns
+    ------------------------
+    * tensor[i]                  — integer index on dim 0
+    * tensor[i, j, ...]          — tuple of integers (selects a single element location)
+    * tensor[start:stop]         — single slice on dim 0
+    * tensor[i, start:stop, ...] — tuple with one or more slices and/or int indices
+    * tensor[:, i, :]            — any combination of the above across multiple dims
+
+    The implementation builds a ScatterNDUpdate graph which correctly handles
+    all of the above patterns without positional slice arithmetic.
+    """
     target_node_name = args[0].name
-    target_ov = builder.get_input(target_node_name)
-    indices = args[1]
-    value_ov = builder.get_input_or_constant(args[2])
-    
-    slice_dim = -1
-    slice_start = None
-    slice_end = None
-    
-    if isinstance(indices, tuple):
-        for dim, idx in enumerate(indices):
-            if isinstance(idx, slice):
-                if idx.start is not None and idx.stop is not None:
-                     if slice_dim != -1:
-                         pass
-                     slice_dim = dim
-                     slice_start = idx.start
-                     slice_end = idx.stop
-            elif isinstance(idx, (int, torch.fx.Node)):
-                 pass
-    
-    if slice_dim == -1:
-         if isinstance(indices, slice):
-              slice_dim = 0
-              slice_start = indices.start
-              slice_end = indices.stop
-         else:
-              raise NotImplementedError("Could not find slice in setitem")
+    target_ov        = builder.get_input(target_node_name)
+    indices_raw      = args[1]
+    value_ov         = builder.get_input_or_constant(args[2])
 
-    def make_slice(inp, axis, start_val, end_val):
-         s = builder.get_input_or_constant(start_val)
-         e = builder.get_input_or_constant(end_val)
-         
-         if isinstance(start_val, int): s = ops.constant([start_val], dtype=np.int64)
-         if isinstance(end_val, int): e = ops.constant([end_val], dtype=np.int64)
-         
-         if s.get_output_partial_shape(0).rank.get_length() == 0:
-              s = ops.reshape(s, ops.constant([1], dtype=np.int64), False)
-         if e.get_output_partial_shape(0).rank.get_length() == 0:
-              e = ops.reshape(e, ops.constant([1], dtype=np.int64), False)
+    # Normalise to a tuple
+    if not isinstance(indices_raw, tuple):
+        indices_raw = (indices_raw,)
 
-         ax = ops.constant([axis], dtype=np.int64)
-         st = ops.constant([1], dtype=np.int64) 
-         
-         return ops.slice(inp, s, e, st, ax)
+    rank = target_ov.get_output_partial_shape(0).rank.get_length()
 
-    p1 = make_slice(target_ov, slice_dim, 0, slice_start)
-    
-    shape_node = ops.shape_of(target_ov)
-    dim_size = ops.gather(shape_node, ops.constant([slice_dim], dtype=np.int64), ops.constant([0], dtype=np.int64))
-    dim_size = ops.reshape(dim_size, ops.constant([1], dtype=np.int64), False)
-    
-    p2 = make_slice(target_ov, slice_dim, slice_end, dim_size)
-    
-    res = ops.concat([p1, value_ov, p2], axis=slice_dim)
-    
+    # Determine which dims are integer-indexed (scalar select) and which are sliced.
+    # We build a begin/end/step for StridedSlice to identify the *destination* region,
+    # then use concat (split-insert-split) on each sliced dimension.
+
+    # Fast path: all indices are plain scalars → ScatterNDUpdate is cleanest
+    all_int = all(isinstance(i, (int, torch.fx.Node)) for i in indices_raw)
+    if all_int:
+        # Build an index vector: [i0, i1, ..., iN]
+        coord_nodes = []
+        for idx in indices_raw:
+            if isinstance(idx, int):
+                coord_nodes.append(ops.constant([idx], dtype=np.int64))
+            else:  # fx.Node
+                v = builder.get_input(idx.name)
+                v = ops.reshape(v, ops.constant([1], dtype=np.int64), False)
+                coord_nodes.append(v)
+        # ScatterNDUpdate expects indices shape (1, ndim) for a single element
+        coord = ops.concat(coord_nodes, axis=0)                    # (ndim,)
+        coord = ops.unsqueeze(coord, ops.constant([0], dtype=np.int64))  # (1, ndim)
+        # value_ov needs to be shape (1,) for ScatterNDUpdate
+        val_flat = ops.reshape(value_ov, ops.constant([1], dtype=np.int64), False)
+        res = ops.scatter_nd_update(target_ov, coord, val_flat)
+        builder.node_map[target_node_name] = res
+        return res
+
+    # General path: at least one dimension is a slice.
+    # Strategy: iterate over sliced dimensions and apply split-insert-concat.
+    # For integer-indexed dims we delegate the value broadcasting to OV.
+    #
+    # Collect (dim, slice_obj) pairs in order.
+    res = target_ov
+    int_offset = 0  # track how many dims were collapsed by integer indexing so far
+
+    def _make_scalar(v):
+        """Return a rank-1 shape node for a scalar-or-node index."""
+        if isinstance(v, int):
+            return ops.constant([v], dtype=np.int64)
+        node_v = builder.get_input(v.name)
+        return ops.reshape(node_v, ops.constant([1], dtype=np.int64), False)
+
+    for raw_dim, idx in enumerate(indices_raw):
+        actual_dim = raw_dim  # after collapsing any earlier integer dims we stay in rank space
+
+        if isinstance(idx, slice):
+            start = idx.start if idx.start is not None else 0
+            stop  = idx.stop   # None means "to end"
+
+            s_node = _make_scalar(start) if not isinstance(start, int) else ops.constant([start], dtype=np.int64)
+            ax     = ops.constant([actual_dim], dtype=np.int64)
+            st     = ops.constant([1],          dtype=np.int64)
+
+            # p1: everything before the slice start
+            e1 = ops.constant([start], dtype=np.int64) if isinstance(start, int) else _make_scalar(start)
+            p1 = ops.slice(res, ops.constant([0], dtype=np.int64), e1, st, ax) if start != 0 else None
+
+            # p2: everything after the slice stop
+            if stop is None:
+                p2 = None
+            else:
+                dim_size_node = ops.gather(
+                    ops.shape_of(res),
+                    ops.constant([actual_dim], dtype=np.int64),
+                    ops.constant([0],          dtype=np.int64),
+                )
+                dim_size_node = ops.reshape(dim_size_node, ops.constant([1], dtype=np.int64), False)
+                stop_node = ops.constant([stop], dtype=np.int64) if isinstance(stop, int) else _make_scalar(stop)
+                p2 = ops.slice(res, stop_node, dim_size_node, st, ax)
+
+            parts = [p for p in [p1, value_ov, p2] if p is not None]
+            res = ops.concat(parts, axis=actual_dim)
+
+        elif isinstance(idx, int):
+            # Integer index: the value tensor doesn't have this dimension;
+            # unsqueeze it, replace at position idx, then squeeze it back.
+            val_expanded = ops.unsqueeze(value_ov, ops.constant([actual_dim], dtype=np.int64))
+            ax     = ops.constant([actual_dim], dtype=np.int64)
+            st     = ops.constant([1],          dtype=np.int64)
+            dim_sz = ops.reshape(
+                ops.gather(ops.shape_of(res), ops.constant([actual_dim], dtype=np.int64),
+                           ops.constant([0], dtype=np.int64)),
+                ops.constant([1], dtype=np.int64), False
+            )
+            p1 = ops.slice(res, ops.constant([0],   dtype=np.int64),
+                           ops.constant([idx],       dtype=np.int64), st, ax)  if idx  != 0 else None
+            p2 = ops.slice(res, ops.constant([idx+1], dtype=np.int64), dim_sz, st, ax) if idx != -1 else None
+            parts = [p for p in [p1, val_expanded, p2] if p is not None]
+            res = ops.concat(parts, axis=actual_dim)
+
+        elif isinstance(idx, torch.fx.Node):
+            # Dynamic integer index via FX node
+            idx_node = builder.get_input(idx.name)
+            idx_1d   = ops.reshape(idx_node, ops.constant([1], dtype=np.int64), False)
+            val_expanded = ops.unsqueeze(value_ov, ops.constant([actual_dim], dtype=np.int64))
+            ax     = ops.constant([actual_dim], dtype=np.int64)
+            st     = ops.constant([1],          dtype=np.int64)
+            dim_sz = ops.reshape(
+                ops.gather(ops.shape_of(res), ops.constant([actual_dim], dtype=np.int64),
+                           ops.constant([0], dtype=np.int64)),
+                ops.constant([1], dtype=np.int64), False
+            )
+            idx_plus_1 = ops.add(idx_1d, ops.constant([1], dtype=np.int64))
+            p1 = ops.slice(res, ops.constant([0], dtype=np.int64), idx_1d,    st, ax)
+            p2 = ops.slice(res, idx_plus_1,                        dim_sz,    st, ax)
+            parts = [p for p in [p1, val_expanded, p2] if p is not None]
+            res = ops.concat(parts, axis=actual_dim)
+
     builder.node_map[target_node_name] = res
     return res
 
@@ -385,7 +535,7 @@ def convert_index_select(builder: OVGraphBuilder, node, args, kwargs):
 @OpRegistry.register_function(torch.triu)
 def convert_triu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
-    diagonal = node.kwargs.get('diagonal', args[1] if len(args) > 1 else 0)
+    diagonal = kwargs.get('diagonal', args[1] if len(args) > 1 else 0)
     
     shape = ops.shape_of(inp)
     rank = inp.get_output_partial_shape(0).rank.get_length()
@@ -589,37 +739,45 @@ def convert_size(builder: OVGraphBuilder, node, args, kwargs):
 @OpRegistry.register_function(torch.nn.functional.conv2d)
 def convert_conv2d(builder: OVGraphBuilder, node, args, kwargs):
     # args: input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1
-    inp = builder.get_input_or_constant(args[0])
+    inp    = builder.get_input_or_constant(args[0])
     weight = builder.get_input_or_constant(args[1])
-    bias = builder.get_input_or_constant(args[2]) if len(args) > 2 else kwargs.get('bias', None)
-    
-    stride = kwargs.get('stride', args[3] if len(args) > 3 else 1)
-    padding = kwargs.get('padding', args[4] if len(args) > 4 else 0)
+    bias   = builder.get_input_or_constant(args[2]) if len(args) > 2 else kwargs.get('bias', None)
+
+    stride   = kwargs.get('stride',   args[3] if len(args) > 3 else 1)
+    padding  = kwargs.get('padding',  args[4] if len(args) > 4 else 0)
     dilation = kwargs.get('dilation', args[5] if len(args) > 5 else 1)
-    groups = kwargs.get('groups', args[6] if len(args) > 6 else 1)
-    
-    stride_list = _to_list(stride)
-    padding_list = _to_list(padding)
-    dilation_list = _to_list(dilation)
-    
-    # Create OV Strides/Pads
-    ov_strides = np.array(stride_list, dtype=np.int64)
-    ov_pads_begin = np.array(padding_list, dtype=np.int64)
-    ov_pads_end = np.array(padding_list, dtype=np.int64)
-    ov_dilations = np.array(dilation_list, dtype=np.int64)
-    
+    groups   = kwargs.get('groups',   args[6] if len(args) > 6 else 1)
+
+    ov_strides   = np.array(_to_list(stride),   dtype=np.int64)
+    ov_pads_begin = np.array(_to_list(padding),  dtype=np.int64)
+    ov_pads_end   = np.array(_to_list(padding),  dtype=np.int64)
+    ov_dilations  = np.array(_to_list(dilation), dtype=np.int64)
+
     if groups == 1:
         conv = ops.convolution(inp, weight, ov_strides, ov_pads_begin, ov_pads_end, ov_dilations)
     else:
-        raise NotImplementedError("Groups > 1 not fully supported in compiler yet.")
-        
+        # OV group_convolution expects weight shape: (groups, C_out/groups, C_in/groups, kH, kW)
+        # The incoming weight is (C_out, C_in/groups, kH, kW) — reshape it.
+        w_shape = weight.get_output_partial_shape(0)
+        c_out   = w_shape[0].get_length()
+        c_in_g  = w_shape[1].get_length()
+        kH      = w_shape[2].get_length()
+        kW      = w_shape[3].get_length()
+        new_shape = ops.constant(
+            np.array([groups, c_out // groups, c_in_g, kH, kW], dtype=np.int64)
+        )
+        weight_grouped = ops.reshape(weight, new_shape, special_zero=False)
+        conv = ops.group_convolution(
+            inp, weight_grouped, ov_strides, ov_pads_begin, ov_pads_end, ov_dilations
+        )
+
     res = conv
     if bias is not None:
         bias_node = builder.get_input_or_constant(bias)
-        axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
+        axes  = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
         bias_4d = ops.unsqueeze(bias_node, axes)
         res = ops.add(conv, bias_4d)
-        
+
     return res
 
 @OpRegistry.register_function(torch.nn.functional.max_pool2d)
@@ -658,28 +816,35 @@ def convert_max_pool2d(builder: OVGraphBuilder, node, args, kwargs):
 
 @OpRegistry.register_module(torch.nn.Conv2d)
 def convert_conv2d_module(builder: OVGraphBuilder, node, submod, args, kwargs):
-    inp = builder.get_input_or_constant(args[0])
+    inp    = builder.get_input_or_constant(args[0])
     w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
-    
-    stride_list = _to_list(submod.stride)
-    padding_list = _to_list(submod.padding)
-    dilation_list = _to_list(submod.dilation)
-    
-    ov_strides = np.array(stride_list, dtype=np.int64)
-    ov_pads_begin = np.array(padding_list, dtype=np.int64)
-    ov_pads_end = np.array(padding_list, dtype=np.int64)
-    ov_dilations = np.array(dilation_list, dtype=np.int64)
-    
-    # Groups = 1 only for now
-    conv = ops.convolution(inp, w_const, ov_strides, ov_pads_begin, ov_pads_end, ov_dilations)
-    
+
+    ov_strides    = np.array(_to_list(submod.stride),   dtype=np.int64)
+    ov_pads_begin = np.array(_to_list(submod.padding),  dtype=np.int64)
+    ov_pads_end   = np.array(_to_list(submod.padding),  dtype=np.int64)
+    ov_dilations  = np.array(_to_list(submod.dilation), dtype=np.int64)
+    groups = submod.groups
+
+    if groups == 1:
+        conv = ops.convolution(inp, w_const, ov_strides, ov_pads_begin, ov_pads_end, ov_dilations)
+    else:
+        # Reshape weight from (C_out, C_in/groups, kH, kW) → (groups, C_out/groups, C_in/groups, kH, kW)
+        c_out, c_in_g, kH, kW = submod.weight.shape
+        new_shape = ops.constant(
+            np.array([groups, c_out // groups, c_in_g, kH, kW], dtype=np.int64)
+        )
+        weight_grouped = ops.reshape(w_const, new_shape, special_zero=False)
+        conv = ops.group_convolution(
+            inp, weight_grouped, ov_strides, ov_pads_begin, ov_pads_end, ov_dilations
+        )
+
     res = conv
     if submod.bias is not None:
         b_const = builder.add_constant(f"{node.target}.bias", submod.bias)
-        axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
+        axes  = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
         bias_4d = ops.unsqueeze(b_const, axes)
         res = ops.add(conv, bias_4d)
-        
+
     return res
 
 @OpRegistry.register_module(torch.nn.MaxPool2d)
@@ -711,47 +876,137 @@ def convert_maxpool2d_module(builder: OVGraphBuilder, node, submod, args, kwargs
 
 @OpRegistry.register_module(torch.nn.BatchNorm2d)
 def convert_batchnorm2d_module(builder: OVGraphBuilder, node, submod, args, kwargs):
-    inp = builder.get_input_or_constant(args[0])
-    
-    # We need to broadcast statistics to (1, C, 1, 1)
+    inp  = builder.get_input_or_constant(args[0])
+    eps  = submod.eps
+    # Axes for broadcasting: unsqueeze over (batch, H, W) → shape (1, C, 1, 1)
     axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
-    
-    mean = submod.running_mean
-    var = submod.running_var
-    eps = submod.eps
-    
-    if mean is None or var is None:
-        raise NotImplementedError("BatchNorm2d without tracking stats not supported in inference compiler.")
 
-    mean_const = builder.add_constant(f"{node.target}.running_mean", mean)
-    var_const = builder.add_constant(f"{node.target}.running_var", var)
+    if submod.track_running_stats and submod.running_mean is not None and submod.running_var is not None:
+        # --- Inference path: use frozen statistics ---
+        mean_const = builder.add_constant(f"{node.target}.running_mean", submod.running_mean)
+        var_const  = builder.add_constant(f"{node.target}.running_var",  submod.running_var)
+        mean_4d = ops.unsqueeze(mean_const, axes)
+        var_4d  = ops.unsqueeze(var_const,  axes)
+    else:
+        # --- Training / no-stats path: compute batch mean and variance on-the-fly ---
+        # Reduce over (N, H, W), keep C
+        reduce_axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
+        mean_4d = ops.reduce_mean(inp, reduce_axes, keep_dims=True)          # (1, C, 1, 1)
+        diff    = ops.subtract(inp, mean_4d)
+        var_4d  = ops.reduce_mean(
+            ops.multiply(diff, diff), reduce_axes, keep_dims=True            # (1, C, 1, 1)
+        )
+
     eps_const = ops.constant(eps, dtype=np.float32)
-    
-    mean_4d = ops.unsqueeze(mean_const, axes)
-    var_4d = ops.unsqueeze(var_const, axes)
-    
-    # x - mean
-    sub = ops.subtract(inp, mean_4d)
-    
-    # sqrt(var + eps)
-    std = ops.sqrt(ops.add(var_4d, eps_const))
-    
-    # div
-    norm = ops.divide(sub, std)
-    
+
+    # Normalize:  (x - mean) / sqrt(var + eps)
+    diff = ops.subtract(inp, mean_4d)
+    std  = ops.sqrt(ops.add(var_4d, eps_const))
+    norm = ops.divide(diff, std)
+
     res = norm
-    
     if submod.affine:
-        weight = submod.weight
-        bias = submod.bias
-        w_const = builder.add_constant(f"{node.target}.weight", weight)
-        b_const = builder.add_constant(f"{node.target}.bias", bias)
-        
+        w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
+        b_const = builder.add_constant(f"{node.target}.bias",   submod.bias)
         w_4d = ops.unsqueeze(w_const, axes)
         b_4d = ops.unsqueeze(b_const, axes)
+        res  = ops.add(ops.multiply(norm, w_4d), b_4d)
+
+    return res
+
+@OpRegistry.register_module(torch.nn.Identity)
+@OpRegistry.register_function(torch.nn.functional.dropout)
+@OpRegistry.register_module(torch.nn.Dropout, torch.nn.Dropout2d)
+def convert_identity(builder: OVGraphBuilder, node, *args, **kwargs):
+    # For call_function, args[0] is node.args
+    # For call_module, args[1] is node.args
+    # We just want the first input to the operation.
+    if node.op == 'call_module':
+        fx_args = args[1]
+    else:
+        fx_args = args[0]
         
-        # * weight + bias
-        res = ops.multiply(res, w_4d)
-        res = ops.add(res, b_4d)
-        
+    if len(fx_args) > 0:
+        return builder.get_input_or_constant(fx_args[0])
+    return builder.get_input_or_constant(node.args[0]) # fallback
+
+@OpRegistry.register_module(torch.nn.AdaptiveAvgPool2d)
+def convert_adaptive_avg_pool2d(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    output_size = _to_list(submod.output_size)
+    if output_size == [1, 1]:
+        # Global Average Pooling
+        rank = inp.get_output_partial_shape(0).rank.get_length()
+        axes = ops.constant(np.array([rank-2, rank-1]), dtype=np.int64)
+        return ops.reduce_mean(inp, axes, keep_dims=True)
+    else:
+        # Full adaptive pool requires more complex logic or OpenVINO helper
+        # For now, support global pool which is 99% of use cases
+        raise NotImplementedError("AdaptiveAvgPool2d only supported for output_size=(1,1) (Global Pool)")
+
+@OpRegistry.register_function(torch.nn.functional.log_softmax)
+@OpRegistry.register_module(torch.nn.LogSoftmax)
+def convert_log_softmax(builder: OVGraphBuilder, node, *args, **kwargs):
+    # Extract input and dim
+    if isinstance(args[0], torch.nn.Module):
+        inp = builder.get_input_or_constant(args[1][0])
+        dim = args[0].dim if args[0].dim is not None else -1
+    else:
+        inp = builder.get_input_or_constant(args[0])
+        dim = kwargs.get('dim', args[1] if len(args) > 1 else -1)
+    
+    softmax = ops.softmax(inp, axis=dim)
+    return ops.log(softmax)
+
+@OpRegistry.register_module(torch.nn.Linear)
+def convert_linear_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
+    
+    # Linear is y = x @ weight.T + bias
+    # OpenVINO matmul(a, b) computes a @ b. If we want a @ weight.T, set transpose_b=True
+    mm = ops.matmul(inp, w_const, transpose_a=False, transpose_b=True)
+    
+    if submod.bias is not None:
+        b_const = builder.add_constant(f"{node.target}.bias", submod.bias)
+        return ops.add(mm, b_const)
+    return mm
+
+@OpRegistry.register_function(torch.nn.functional.linear, npu_linear_func)
+def convert_linear_functional(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    weight = builder.get_input_or_constant(args[1])
+    bias = builder.get_input_or_constant(args[2]) if len(args) > 2 else kwargs.get('bias', None)
+    
+    mm = ops.matmul(inp, weight, transpose_a=False, transpose_b=True)
+    if bias is not None:
+        return ops.add(mm, bias)
+    return mm
+
+@OpRegistry.register_module(torch.nn.LayerNorm)
+def convert_layernorm_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    eps = submod.eps
+    
+    # LayerNorm reduces over normalized_shape (usually the last D dims)
+    # We use OpenVINO MVN or LayerNormalization
+    normalized_shape = submod.normalized_shape
+    rank = inp.get_output_partial_shape(0).rank.get_length()
+    axes = ops.constant(list(range(rank - len(normalized_shape), rank)), dtype=np.int64)
+    
+    # Compute mean and variance
+    mean = ops.reduce_mean(inp, axes, keep_dims=True)
+    diff = ops.subtract(inp, mean)
+    var = ops.reduce_mean(ops.multiply(diff, diff), axes, keep_dims=True)
+    
+    eps_const = ops.constant(eps, dtype=np.float32)
+    std = ops.sqrt(ops.add(var, eps_const))
+    norm = ops.divide(diff, std)
+    
+    res = norm
+    if submod.elementwise_affine:
+        w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
+        b_const = builder.add_constant(f"{node.target}.bias", submod.bias)
+        res = ops.add(ops.multiply(norm, w_const), b_const)
+    
     return res

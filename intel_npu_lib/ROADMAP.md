@@ -37,9 +37,9 @@ This roadmap outlines the strategic direction for transforming the prototype int
         - Input shapes (Scalar, 1D, 2D, 3D, 4D).
         - Data types (FP32, FP16 - ensuring auto-casting works).
         - Edge cases (Zero-sized tensors, unaligned memory).
-- [ ] **New Workloads**:
-    - [ ] **Computer Vision**: Implement and test a standard ResNet or VGG block.
-        - *Requirement:* Add `npu_conv2d` and `npu_maxpool2d` operators.
+- [x] **New Workloads**:
+    - [x] **Computer Vision**: Implement and test a standard CNN (MNIST/ResNet).
+        - [x] Add `npu_conv2d` and `npu_maxpool2d` operators.
     - [ ] **Encoder Models**: Test a BERT-like encoder (Self-Attention without causal mask).
 - [ ] **Stress Testing**:
     - [ ] **Memory Leak Check**: Run inference in a loop for 10,000+ iterations to verify stable memory usage.
@@ -59,3 +59,7 @@ This roadmap outlines the strategic direction for transforming the prototype int
 - [ ] **CI Pipeline**: Create GitHub Actions to build wheel and run `pytest`.
 - [ ] **Benchmarks**: Create `benchmarks/` folder with scripts to track latency (ms) and throughput (tok/s) across commits.
 - [ ] **API Documentation**: Auto-generate docs from docstrings (Sphinx/MkDocs).
+
+## Phase 6: Training & Fine-Tuning Support (Future)
+- [ ] **Backward Pass Implementation**: Map PyTorch autograd gradients to OpenVINO backward ops (if available) or implement custom C++ backward kernels.
+- [ ] **Optimizer Offloading**: Offload Adam/SGD parameter updates to the NPU.

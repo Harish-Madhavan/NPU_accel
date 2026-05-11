@@ -21,4 +21,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("npu_scaled_dot_product_attention", &npu_scaled_dot_product_attention, "NPU Scaled Dot Product Attention");
   m.def("npu_conv2d", &npu_conv2d, "NPU accelerated Conv2d");
   m.def("npu_max_pool2d", &npu_max_pool2d, "NPU accelerated MaxPool2d");
+  m.def("set_cache_dir", &set_npu_cache_dir, "Set OpenVINO disk cache directory");
 }

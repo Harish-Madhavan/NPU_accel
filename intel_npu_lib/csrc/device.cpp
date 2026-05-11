@@ -38,21 +38,16 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key, std::sha
 
     auto it = m_model_cache.find(key);
     if (it != m_model_cache.end()) {
-        return it->second;
+        // Key found, move to front of access order (most recent)
+        m_access_order.erase(it->second.list_it);
+        m_access_order.push_front(key);
+        it->second.list_it = m_access_order.begin();
+        return it->second.compiled_model;
     }
 
-    // Cache cleanup policy: Simple LRU-approximation or Size-limit
-    if (m_model_cache.size() > 200) {
-        // Clear half of cache to avoid thrashing? Or just clear all for simplicity in Phase 1
-        // log("Cache limit reached, clearing model cache.");
-        m_model_cache.clear();
-    }
-
+    // If key not in cache, we need to compile it.
     std::string device = "NPU";
-    // If NPU not available, fallback to CPU for testing/safety? 
-    // For now strict NPU as per library name, or let OpenVINO handle it.
     if (!m_is_available) {
-        // Warn once?
         device = "CPU"; 
     }
 
@@ -60,10 +55,30 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key, std::sha
         throw std::runtime_error("Model pointer is null but key not found in cache: " + key);
     }
 
-    // log("Compiling model for key: " + key);
+    // Compile model
     ov::CompiledModel compiled = m_core->compile_model(model, device);
-    m_model_cache[key] = compiled;
+
+    // Evict if cache is full
+    if (m_model_cache.size() >= m_max_cache_size) {
+        std::string oldest_key = m_access_order.back();
+        m_access_order.pop_back();
+        m_model_cache.erase(oldest_key);
+    }
+
+    // Add new entry to front
+    m_access_order.push_front(key);
+    m_model_cache[key] = {compiled, m_access_order.begin()};
+
     return compiled;
+}
+
+void NPUBackend::setCacheDir(const std::string& path) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    try {
+        m_core->set_property(ov::cache_dir(path));
+    } catch (const std::exception& e) {
+        std::cerr << "[Intel NPU] Failed to set cache directory: " << e.what() << std::endl;
+    }
 }
 
 // Wrappers
@@ -74,4 +89,8 @@ bool is_npu_available() {
 void initialize_npu() {
     // Just trigger singleton creation
     NPUBackend::getInstance();
+}
+
+void set_npu_cache_dir(const std::string& path) {
+    NPUBackend::getInstance().setCacheDir(path);
 }

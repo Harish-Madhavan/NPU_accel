@@ -12,7 +12,59 @@
 #include <openvino/opsets/opset8.hpp> // For GELU
 #include <openvino/opsets/opset13.hpp> // For ScaledDotProductAttention
 
+// ---------------------------------------------------------------------------
+// Dtype helpers
+// ---------------------------------------------------------------------------
+
+/// Map a PyTorch scalar type to the corresponding OpenVINO element type.
+/// Falls back to f32 for unsupported types with a stderr warning.
+static ov::element::Type torch_dtype_to_ov(const torch::Tensor& t) {
+    switch (t.scalar_type()) {
+        case torch::kFloat:   return ov::element::f32;
+        case torch::kHalf:    return ov::element::f16;
+        case torch::kBFloat16: return ov::element::bf16;
+        case torch::kDouble:  return ov::element::f64;
+        case torch::kInt:     return ov::element::i32;
+        case torch::kLong:    return ov::element::i64;
+        case torch::kShort:   return ov::element::i16;
+        case torch::kChar:    return ov::element::i8;
+        case torch::kByte:    return ov::element::u8;
+        case torch::kBool:    return ov::element::boolean;
+        default:
+            std::cerr << "[Intel NPU] Unsupported dtype: "
+                      << t.scalar_type() << ". Falling back to f32." << std::endl;
+            return ov::element::f32;
+    }
+}
+
+/// Map an OV element type back to a torch dtype for the output tensor.
+static torch::Dtype ov_dtype_to_torch(ov::element::Type ov_type) {
+    if (ov_type == ov::element::f32)      return torch::kFloat;
+    if (ov_type == ov::element::f16)      return torch::kHalf;
+    if (ov_type == ov::element::bf16)     return torch::kBFloat16;
+    if (ov_type == ov::element::f64)      return torch::kDouble;
+    if (ov_type == ov::element::i32)      return torch::kInt;
+    if (ov_type == ov::element::i64)      return torch::kLong;
+    if (ov_type == ov::element::i16)      return torch::kShort;
+    if (ov_type == ov::element::i8)       return torch::kChar;
+    if (ov_type == ov::element::u8)       return torch::kByte;
+    if (ov_type == ov::element::boolean)  return torch::kBool;
+    return torch::kFloat; // safe fallback
+}
+
+/// Make a contiguous tensor whose memory is safe to pass to OpenVINO.
+/// OpenVINO shared_memory requires contiguous layout.
+static torch::Tensor ensure_contiguous(const torch::Tensor& t) {
+    return t.is_contiguous() ? t : t.contiguous();
+}
+
 // --- Helper Functions for Key Generation ---
+
+static ov::Shape get_ov_shape(const torch::Tensor& t) {
+    ov::Shape shape;
+    for(auto d : t.sizes()) shape.push_back(d);
+    return shape;
+}
 
 std::string get_shape_str(const torch::Tensor& t) {
     std::stringstream ss;
@@ -24,7 +76,7 @@ std::string get_key(const std::string& op_name, const std::vector<torch::Tensor>
     std::stringstream ss;
     ss << op_name << "_";
     for (const auto& t : inputs) {
-        ss << get_shape_str(t) << "_";
+        ss << get_shape_str(t) << t.scalar_type() << "_";
     }
     ss << extra_args;
     return ss.str();
@@ -34,20 +86,18 @@ std::string get_key(const std::string& op_name, const std::vector<torch::Tensor>
 
 torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> model, const std::vector<torch::Tensor>& inputs) {
     try {
-        auto compiled_model = NPUBackend::getInstance().getOrCompileModel(key, model);
+        auto& backend = NPUBackend::getInstance();
+        auto compiled_model = backend.getOrCompileModel(key, model);
         auto infer_request = compiled_model.create_infer_request();
 
-        // Keep tensors alive during inference
-        std::vector<torch::Tensor> held_tensors; 
-
+        // Map inputs — use the tensor's actual dtype so OV sees the right element type.
         for (size_t i = 0; i < inputs.size(); ++i) {
-            auto t = inputs[i].contiguous();
-            held_tensors.push_back(t); // extend lifetime
-            
-            ov::Shape shape;
-            for(auto d : t.sizes()) shape.push_back(d);
-            
-            ov::Tensor input_tensor(ov::element::f32, shape, t.data_ptr<float>());
+            auto t = ensure_contiguous(inputs[i]);
+            ov::element::Type ov_type = torch_dtype_to_ov(t);
+            ov::Shape shape(t.sizes().begin(), t.sizes().end());
+
+            // shared_memory=true: OV reads directly from the torch storage — no copy.
+            ov::Tensor input_tensor(ov_type, shape, t.data_ptr());
             infer_request.set_input_tensor(i, input_tensor);
         }
         
@@ -55,175 +105,114 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
         
         auto output_tensor = infer_request.get_output_tensor();
         auto output_shape = output_tensor.get_shape();
-        
-        std::vector<int64_t> torch_shape;
-        for(auto d : output_shape) torch_shape.push_back(d);
-        
-        auto options = torch::TensorOptions().dtype(torch::kFloat32);
-        torch::Tensor result = torch::empty(torch_shape, options);
-        
-        std::memcpy(result.data_ptr<float>(), output_tensor.data<float>(), output_tensor.get_byte_size());
+        auto output_ov_type = output_tensor.get_element_type();
+
+        std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
+        torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
+
+        auto result = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
+
+        // Copy back from OV output tensor to the torch result tensor.
+        std::memcpy(result.data_ptr(), output_tensor.data(), output_tensor.get_byte_size());
 
         return result;
 
     } catch (const std::exception& e) {
-        // Fallback or rethrow
-        // For now, rethrow as a torch error
-        TORCH_CHECK(false, "NPU Execution Failed: " + std::string(e.what()));
+        TORCH_CHECK(false, "[Intel NPU] Execution Failed for key '" + key + "': " + std::string(e.what()));
     }
+    // Unreachable — silences compiler warning about missing return.
+    return torch::Tensor();
+}
+
+template <typename OpT>
+torch::Tensor execute_unary_op_helper(const std::string& name, torch::Tensor a) {
+    std::string key = get_key(name, {a});
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
+    auto op = std::make_shared<OpT>(arg_a);
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
+    return execute_op(key, model, {a});
+}
+
+template <typename OpT>
+torch::Tensor execute_binary_op_helper(const std::string& name, torch::Tensor a, torch::Tensor b) {
+    std::string key = get_key(name, {a, b});
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(b), get_ov_shape(b));
+    auto op = std::make_shared<OpT>(arg_a, arg_b);
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
+    return execute_op(key, model, {a, b});
 }
 
 // --- Op Implementations ---
 
 torch::Tensor npu_add(torch::Tensor a, torch::Tensor b) {
-    std::string key = get_key("add", {a, b});
-    
-    ov::Shape shape_a, shape_b;
-    for(auto d : a.sizes()) shape_a.push_back(d);
-    for(auto d : b.sizes()) shape_b.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
-    auto op = std::make_shared<ov::opset1::Add>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
-    
-    return execute_op(key, model, {a, b});
+    return execute_binary_op_helper<ov::opset1::Add>("add", a, b);
 }
 
 torch::Tensor npu_sub(torch::Tensor a, torch::Tensor b) {
-    std::string key = get_key("sub", {a, b});
-
-    ov::Shape shape_a, shape_b;
-    for(auto d : a.sizes()) shape_a.push_back(d);
-    for(auto d : b.sizes()) shape_b.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
-    auto op = std::make_shared<ov::opset1::Subtract>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
-    
-    return execute_op(key, model, {a, b});
+    return execute_binary_op_helper<ov::opset1::Subtract>("sub", a, b);
 }
 
 torch::Tensor npu_neg(torch::Tensor a) {
-    std::string key = get_key("neg", {a});
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto op = std::make_shared<ov::opset1::Negative>(arg_a);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
-    
-    return execute_op(key, model, {a});
+    return execute_unary_op_helper<ov::opset1::Negative>("neg", a);
 }
 
 torch::Tensor npu_mul(torch::Tensor a, torch::Tensor b) {
-    std::string key = get_key("mul", {a, b});
-
-    ov::Shape shape_a, shape_b;
-    for(auto d : a.sizes()) shape_a.push_back(d);
-    for(auto d : b.sizes()) shape_b.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
-    auto op = std::make_shared<ov::opset1::Multiply>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
-    
-    return execute_op(key, model, {a, b});
+    return execute_binary_op_helper<ov::opset1::Multiply>("mul", a, b);
 }
 
 torch::Tensor npu_div(torch::Tensor a, torch::Tensor b) {
     std::string key = get_key("div", {a, b});
-
-    ov::Shape shape_a, shape_b;
-    for(auto d : a.sizes()) shape_a.push_back(d);
-    for(auto d : b.sizes()) shape_b.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
+    ov::Shape shape_a = get_ov_shape(a);
+    ov::Shape shape_b = get_ov_shape(b);
+    // Division result is always floating-point.
+    ov::element::Type fp_type = (torch_dtype_to_ov(a) == ov::element::f16 &&
+                                  torch_dtype_to_ov(b) == ov::element::f16)
+                                 ? ov::element::f16 : ov::element::f32;
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(fp_type, shape_a);
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(fp_type, shape_b);
     auto op = std::make_shared<ov::opset1::Divide>(arg_a, arg_b);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
-    
     return execute_op(key, model, {a, b});
 }
 
 torch::Tensor npu_matmul(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.dim() >= 2 && b.dim() >= 2, "Tensors must be at least 2D for matmul");
-    std::string key = get_key("matmul", {a, b});
-
-    ov::Shape shape_a, shape_b;
-    for(auto d : a.sizes()) shape_a.push_back(d);
-    for(auto d : b.sizes()) shape_b.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
-    auto op = std::make_shared<ov::opset1::MatMul>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
-    
-    return execute_op(key, model, {a, b});
+    return execute_binary_op_helper<ov::opset1::MatMul>("matmul", a, b);
 }
 
 torch::Tensor npu_relu(torch::Tensor a) {
-    std::string key = get_key("relu", {a});
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto op = std::make_shared<ov::opset1::Relu>(arg_a);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
-    
-    return execute_op(key, model, {a});
+    return execute_unary_op_helper<ov::opset1::Relu>("relu", a);
 }
 
 torch::Tensor npu_gelu(torch::Tensor a) {
-    std::string key = get_key("gelu", {a});
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    // Gelu in opset7, default 'erf' approximation mode usually
-    auto op = std::make_shared<ov::opset8::Gelu>(arg_a);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
-    
-    return execute_op(key, model, {a});
+    return execute_unary_op_helper<ov::opset8::Gelu>("gelu", a);
 }
 
 torch::Tensor npu_silu(torch::Tensor a) {
-    std::string key = get_key("silu", {a});
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
-    auto op = std::make_shared<ov::opset4::Swish>(arg_a); // Swish is SiLU in OpenVINO opset4
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
-    
-    return execute_op(key, model, {a});
+    return execute_unary_op_helper<ov::opset4::Swish>("silu", a);
 }
 
 torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsilon) {
     std::string key = get_key("rmsnorm", {input, weight}, std::to_string(epsilon));
 
-    ov::Shape input_shape, weight_shape;
-    for(auto d : input.sizes()) input_shape.push_back(d);
-    for(auto d : weight.sizes()) weight_shape.push_back(d);
-    
-    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
-    auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov::element::f32, weight_shape);
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    ov::Shape input_shape = get_ov_shape(input);
+    ov::Shape weight_shape = get_ov_shape(weight);
+
+    auto arg_input  = std::make_shared<ov::opset1::Parameter>(ov_type, input_shape);
+    auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov_type, weight_shape);
 
     // 1. Square the input
     auto input_squared = std::make_shared<ov::opset1::Multiply>(arg_input, arg_input);
 
-    // 2. Calculate Mean Square
-    auto last_dim_idx = input_shape.size() - 1;
+    // 2. Calculate Mean Square along the last dimension
+    auto last_dim_idx = static_cast<int64_t>(input_shape.size() - 1);
     auto axes = ov::opset1::Constant::create(ov::element::i64, {1}, {last_dim_idx});
-    auto mean_square = std::make_shared<ov::opset1::ReduceMean>(input_squared, axes, true); // Keep dims
+    auto mean_square = std::make_shared<ov::opset1::ReduceMean>(input_squared, axes, true);
 
-    // 3. Add Epsilon
-    auto epsilon_const = ov::opset1::Constant::create(ov::element::f32, {}, {epsilon});
+    // 3. Add Epsilon — cast to the working dtype
+    auto epsilon_const = ov::opset1::Constant::create(ov_type, {}, {epsilon});
     auto variance = std::make_shared<ov::opset1::Add>(mean_square, epsilon_const);
 
     // 4. Square Root
@@ -234,66 +223,57 @@ torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsil
 
     // 6. Apply Weight (Gain)
     auto output = std::make_shared<ov::opset1::Multiply>(x_normalized, arg_weight);
-    
+
     auto model = std::make_shared<ov::Model>(ov::NodeVector{output}, ov::ParameterVector{arg_input, arg_weight});
-    
     return execute_op(key, model, {input, weight});
 }
 
 torch::Tensor npu_softmax(torch::Tensor a, int64_t dim) {
-    // Handle negative dim
     if (dim < 0) dim += a.dim();
-    
     std::string key = get_key("softmax", {a}, std::to_string(dim));
-
-    ov::Shape shape;
-    for(auto d : a.sizes()) shape.push_back(d);
-    
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape);
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
     auto op = std::make_shared<ov::opset1::Softmax>(arg_a, dim);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
-    
     return execute_op(key, model, {a});
 }
 
 torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
-    // Linear: y = x * A^T + b
-    std::string key = get_key("linear", {input, weight, bias});
-
-    ov::Shape shape_in, shape_w, shape_b;
-    for(auto d : input.sizes()) shape_in.push_back(d);
-    for(auto d : weight.sizes()) shape_w.push_back(d);
-    for(auto d : bias.sizes()) shape_b.push_back(d);
+    // Linear: y = x * W^T + b
+    bool has_bias = bias.defined() && bias.numel() > 0;
+    std::string key = get_key("linear", {input, weight}, has_bias ? "_bias" : "");
     
-    auto arg_in = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_in);
-    auto arg_w = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_w);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(ov::element::f32, shape_b);
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    ov::Shape shape_in = get_ov_shape(input);
+    ov::Shape shape_w  = get_ov_shape(weight);
     
+    auto arg_in = std::make_shared<ov::opset1::Parameter>(ov_type, shape_in);
+    auto arg_w  = std::make_shared<ov::opset1::Parameter>(ov_type, shape_w);
     auto matmul = std::make_shared<ov::opset1::MatMul>(arg_in, arg_w, false, true);
-    auto add = std::make_shared<ov::opset1::Add>(matmul, arg_b);
     
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{add}, ov::ParameterVector{arg_in, arg_w, arg_b});
+    std::shared_ptr<ov::Node> result = matmul;
+    ov::ParameterVector params = {arg_in, arg_w};
+    std::vector<torch::Tensor> inputs = {input, weight};
+
+    if (has_bias) {
+        auto arg_b = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(bias));
+        result = std::make_shared<ov::opset1::Add>(result, arg_b);
+        params.push_back(arg_b);
+        inputs.push_back(bias);
+    }
     
-    return execute_op(key, model, {input, weight, bias});
+    auto model = std::make_shared<ov::Model>(ov::NodeVector{result}, params);
+    return execute_op(key, model, inputs);
 }
 
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation) {
     std::stringstream ss;
     ss << "transpose_";
     for (auto p : permutation) ss << p << ",";
-    std::string extra = ss.str();
-    std::string key = get_key("transpose", {input}, extra);
-
-    ov::Shape input_shape;
-    for(auto d : input.sizes()) input_shape.push_back(d);
-
-    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
-    
+    std::string key = get_key("transpose", {input}, ss.str());
+    auto arg_input  = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto perm_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{permutation.size()}, permutation);
-    
-    auto op = std::make_shared<ov::opset1::Transpose>(arg_input, perm_const);
+    auto op    = std::make_shared<ov::opset1::Transpose>(arg_input, perm_const);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
-
     return execute_op(key, model, {input});
 }
 
@@ -301,19 +281,11 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     std::stringstream ss;
     ss << "reshape_";
     for (auto s : shape) ss << s << ",";
-    std::string extra = ss.str();
-    std::string key = get_key("reshape", {input}, extra);
-
-    ov::Shape input_shape;
-    for(auto d : input.sizes()) input_shape.push_back(d);
-
-    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
-
+    std::string key = get_key("reshape", {input}, ss.str());
+    auto arg_input   = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto shape_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{shape.size()}, shape);
-
-    auto op = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false); 
+    auto op    = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false);
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
-
     return execute_op(key, model, {input});
 }
 
@@ -328,106 +300,48 @@ torch::Tensor npu_scaled_dot_product_attention(
 ) {
     std::stringstream ss;
     ss << "sdpa_" << is_causal << "_" << scale << "_";
-    if (attn_mask.defined()) ss << "mask_";
+    if (attn_mask.defined() && attn_mask.numel() > 0) ss << "mask_";
     
     std::string extra = ss.str();
     std::vector<torch::Tensor> key_inputs = {query, key, value};
-    if (attn_mask.defined()) key_inputs.push_back(attn_mask);
+    if (attn_mask.defined() && attn_mask.numel() > 0) key_inputs.push_back(attn_mask);
     
     std::string op_key = get_key("sdpa", key_inputs, extra);
 
-    ov::Shape q_shape, k_shape, v_shape;
-    for(auto d : query.sizes()) q_shape.push_back(d);
-    for(auto d : key.sizes()) k_shape.push_back(d);
-    for(auto d : value.sizes()) v_shape.push_back(d);
-    
-    auto arg_q = std::make_shared<ov::opset1::Parameter>(ov::element::f32, q_shape);
-    auto arg_k = std::make_shared<ov::opset1::Parameter>(ov::element::f32, k_shape);
-    auto arg_v = std::make_shared<ov::opset1::Parameter>(ov::element::f32, v_shape);
+    ov::element::Type ov_type = torch_dtype_to_ov(query);
+    auto arg_q = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(query));
+    auto arg_k = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(key));
+    auto arg_v = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(value));
     
     ov::ParameterVector params = {arg_q, arg_k, arg_v};
     std::vector<torch::Tensor> inputs = {query, key, value};
     
     std::shared_ptr<ov::Node> arg_mask = nullptr;
-    if (attn_mask.defined()) {
-        ov::Shape m_shape;
-        for(auto d : attn_mask.sizes()) m_shape.push_back(d);
-        auto p_mask = std::make_shared<ov::opset1::Parameter>(ov::element::f32, m_shape);
+    if (attn_mask.defined() && attn_mask.numel() > 0) {
+        auto p_mask = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(attn_mask));
         arg_mask = p_mask;
         params.push_back(p_mask);
         inputs.push_back(attn_mask);
     }
     
     std::shared_ptr<ov::Node> arg_scale = nullptr;
-    // Torch SDPA usually defaults scale to 1/sqrt(head_dim) if not provided?
-    // Here we assume the caller passes the correct scale if they want to override, 
-    // or we might pass 0/negative to indicate "default"?
-    // But OpenVINO SDPA doesn't compute default scale internally if input is missing? 
-    // Wait, documentation says "If scale is not provided, it defaults to 1 / sqrt(query.shape[-1])".
-    // So if scale <= 0, we skip providing it?
-    // Let's assume if scale > 0, we provide it.
-    
     if (scale > 0) {
-         // Scale is scalar? Or tensor?
-         // SDPA expects scale as input 4 (after mask).
          arg_scale = ov::opset1::Constant::create(ov::element::f32, {}, {scale});
     }
 
-    // Constructor: ScaledDotProductAttention (const Output< Node > &query, const Output< Node > &key, const Output< Node > &value, const Output< Node > &attention_mask, const Output< Node > &scale, bool causal=false)
-    // Note: If args are null/missing, there are different constructors or we pass empty?
-    // Actually, C++ API usually has overloads.
-    // If we want to skip mask but provide scale: we pass null/dummy?
-    // opset13::SDPA constructor takes optional args?
-    // Let's check constructor signatures.
-    // Explicit constructor: query, key, value, attn_mask, scale, causal.
-    
     std::shared_ptr<ov::Node> op;
     if (arg_mask && arg_scale) {
         op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, arg_scale, is_causal);
     } else if (arg_mask && !arg_scale) {
         op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, is_causal);
     } else if (!arg_mask && arg_scale) {
-         // How to pass scale without mask? Pass empty/null for mask?
-         // Usually undefined/empty constant?
-         // Or overload without mask?
-         // Documentation says: "attention_mask (optional)"
-         // "If not provided, ..."
-         // The C++ API might require passing something.
-         // Let's assume we can pass a dummy empty node or there is an overload.
-         // Actually, if we look at python: query, key, value, attention_mask=None, scale=None...
-         // In C++, often `ov::Output<Node>()` or similar.
-         // But `make_shared` might not like that.
-         // Safe bet: if mask is missing but scale is present, pass an empty constant for mask? or nullptr?
-         // OpenVINO C++ nodes usually don't take nullptr for Input.
-         // They take Output<Node>.
-         // Let's try passing a dummy (empty shape?) or look for overload.
-         // If no overload, usually we construct the node and set inputs.
-         
-         // Let's assume there is a constructor `ScaledDotProductAttention(q, k, v, causal)` 
-         // and we can set inputs later?
-         // Or `ScaledDotProductAttention(q, k, v, mask, scale, causal)`
-         
-         // If I don't know the exact API, this is risky.
-         // However, I can create the node with basic args and then `.set_argument(3, scale)`?
-         
-         // Let's fallback to: if scale is provided, we MUST provide mask? 
-         // Or provide a "dummy" mask (all zeros? or booleans?).
-         // If mask is missing in SDPA, it means "attend to everything".
-         // Passing a tensor of zeros (additive mask) does the same.
-         // So if scale is needed but mask is missing, create a zero mask broadcastable?
-         
-         if (!arg_mask) {
-             // Create zero mask (1,1,1,1) ?
-             arg_mask = ov::opset1::Constant::create(ov::element::f32, {}, {0.0f});
-         }
+         arg_mask = ov::opset1::Constant::create(ov::element::f32, {}, {0.0f});
          op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, arg_mask, arg_scale, is_causal);
     } else {
-        // No mask, no scale
         op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, is_causal);
     }
 
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, params);
-    
     return execute_op(op_key, model, inputs);
 }
 
@@ -448,14 +362,11 @@ torch::Tensor npu_conv2d(
     ss << groups;
     
     std::string key = get_key("conv2d", {input, weight}, ss.str());
-    if (bias.defined()) key += "_bias";
+    if (bias.defined() && bias.numel() > 0) key += "_bias";
 
-    ov::Shape input_shape, weight_shape;
-    for(auto d : input.sizes()) input_shape.push_back(d);
-    for(auto d : weight.sizes()) weight_shape.push_back(d);
-
-    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
-    auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov::element::f32, weight_shape);
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    auto arg_input  = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+    auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
 
     ov::Strides ov_strides(stride.begin(), stride.end());
     ov::CoordinateDiff ov_pads_begin(padding.begin(), padding.end());
@@ -493,27 +404,20 @@ torch::Tensor npu_conv2d(
     }
 
     std::shared_ptr<ov::Node> result = conv_op;
-
     std::vector<torch::Tensor> inputs = {input, weight};
-    std::shared_ptr<ov::opset1::Parameter> arg_bias = nullptr;
+    ov::ParameterVector params = {arg_input, arg_weight};
 
-    if (bias.defined()) {
+    if (bias.defined() && bias.numel() > 0) {
         inputs.push_back(bias);
-        ov::Shape bias_shape;
-        for(auto d : bias.sizes()) bias_shape.push_back(d);
-        arg_bias = std::make_shared<ov::opset1::Parameter>(ov::element::f32, bias_shape);
+        auto arg_bias = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(bias));
+        params.push_back(arg_bias);
         
         auto axes_const = ov::opset1::Constant::create(ov::element::i64, {3}, {0, 2, 3});
         auto bias_4d = std::make_shared<ov::opset1::Unsqueeze>(arg_bias, axes_const);
-        
         result = std::make_shared<ov::opset1::Add>(result, bias_4d);
     }
 
-    ov::ParameterVector params = {arg_input, arg_weight};
-    if (arg_bias) params.push_back(arg_bias);
-
     auto model = std::make_shared<ov::Model>(ov::NodeVector{result}, params);
-    
     return execute_op(key, model, inputs);
 }
 
@@ -534,11 +438,7 @@ torch::Tensor npu_max_pool2d(
     ss << ceil_mode;
 
     std::string key = get_key("maxpool2d", {input}, ss.str());
-
-    ov::Shape input_shape;
-    for(auto d : input.sizes()) input_shape.push_back(d);
-    
-    auto arg_input = std::make_shared<ov::opset1::Parameter>(ov::element::f32, input_shape);
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
 
     ov::Strides ov_strides(stride.begin(), stride.end());
     ov::Shape ov_kernel(kernel_size.begin(), kernel_size.end());
@@ -559,6 +459,5 @@ torch::Tensor npu_max_pool2d(
     );
 
     auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
-    
     return execute_op(key, model, {input});
 }

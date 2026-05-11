@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <map>
+#include <list>
 #include <mutex>
 #include <iostream>
 
@@ -24,6 +25,7 @@ public:
     
     // Model Caching
     ov::CompiledModel getOrCompileModel(const std::string& key, std::shared_ptr<ov::Model> model);
+    void setCacheDir(const std::string& path);
 
     // Logging
     template<typename... Args>
@@ -40,8 +42,20 @@ private:
     NPUBackend(); // Private constructor
     ~NPUBackend() = default;
 
+    struct CacheEntry {
+        ov::CompiledModel compiled_model;
+        std::list<std::string>::iterator list_it;
+
+        CacheEntry() = default;
+        CacheEntry(ov::CompiledModel m, std::list<std::string>::iterator it)
+            : compiled_model(m), list_it(it) {}
+    };
+
     std::unique_ptr<ov::Core> m_core;
-    std::map<std::string, ov::CompiledModel> m_model_cache;
+    std::map<std::string, CacheEntry> m_model_cache;
+    std::list<std::string> m_access_order;
+    const size_t m_max_cache_size = 200;
+    
     std::mutex m_mutex;
     bool m_is_available;
 };
@@ -49,3 +63,4 @@ private:
 // C-API wrappers for Python bindings
 bool is_npu_available();
 void initialize_npu();
+void set_npu_cache_dir(const std::string& path);

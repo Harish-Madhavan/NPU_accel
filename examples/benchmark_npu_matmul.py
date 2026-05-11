@@ -29,7 +29,7 @@ def run_benchmark(size=4096, iterations=50, warmup=10, dtype_str="float32"):
         
     
     # Compile
-    print("Compiling to NPU...")
+    print("Compiling to NPU (First time)...")
     t0 = time.time()
     try:
         npu_model = npu_compiler.compile_to_npu(model, (a, b))
@@ -37,6 +37,11 @@ def run_benchmark(size=4096, iterations=50, warmup=10, dtype_str="float32"):
         print(f"Compilation failed: {e}")
         return
     print(f"Compilation finished in {time.time() - t0:.2f}s")
+    
+    print("Compiling to NPU (Second time - Should be cached)...")
+    t1 = time.time()
+    npu_model = npu_compiler.compile_to_npu(model, (a, b))
+    print(f"Second compilation finished in {time.time() - t1:.4f}s")
     
     # Warmup
     print(f"Warming up ({warmup} iterations)...")
