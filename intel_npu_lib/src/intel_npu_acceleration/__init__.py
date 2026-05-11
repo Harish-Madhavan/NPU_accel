@@ -1,41 +1,137 @@
-import torch
-import importlib.util
-import sys
 import os
+import sys
 import platform
+import logging
 
-# On Windows, we need to explicitly add OpenVINO DLLs to the search path
+# --- Logging Setup ---
+logger = logging.getLogger("intel_npu_acceleration")
+handler = logging.StreamHandler(sys.stderr)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+if not logger.handlers:
+    logger.addHandler(handler)
+logging.getLogger().setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG)
+
+# --- DLL Loading (Windows) ---
 if platform.system() == "Windows":
     try:
         import openvino
+
         libs_dir = os.path.join(os.path.dirname(openvino.__file__), "libs")
         if os.path.exists(libs_dir):
             os.add_dll_directory(libs_dir)
     except (ImportError, AttributeError):
-        # AttributeError can happen if openvino package structure changes or __file__ is missing
         pass
 
-# Try to import the compiled C++ extension
+# --- Import Core ---
+_C = None
 try:
     from . import _C
 except ImportError as e:
-    # This happens if the package is not yet built/installed
-    # We provide a warning or handling here
-    import warnings
-    warnings.warn(f"Could not load C++ extension 'intel_npu_acceleration._C': {e}. Ensure the library is installed correctly.")
-    _C = None
+    logger.warning(f"Could not load C++ extension 'intel_npu_acceleration._C': {e}")
+_CACHE_DIR = None
 
-def is_available():
-    """Checks if the Intel NPU is available on the system."""
+# --- Cache Initialization ---
+if _C is not None:
+    try:
+        # Default cache location: npu_cache in the same directory as this file's parent or current working dir
+        possible_cache_dirs = [
+            os.path.join(os.getcwd(), "npu_cache"),
+            os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "npu_cache")
+            ),
+        ]
+
+        cache_dir = None
+        for d in possible_cache_dirs:
+            if os.path.exists(d) and os.path.isdir(d):
+                cache_dir = d
+                break
+
+        if cache_dir:
+            _CACHE_DIR = cache_dir
+            logger.info(f"Setting NPU cache directory: {cache_dir}")
+            _C.set_cache_dir(cache_dir)
+        else:
+            # Optionally create it in CWD if not found
+            cwd_cache = os.path.join(os.getcwd(), "npu_cache")
+            if not os.path.exists(cwd_cache):
+                try:
+                    os.makedirs(cwd_cache, exist_ok=True)
+                    _CACHE_DIR = cwd_cache
+                    logger.info(f"Created NPU cache directory: {cwd_cache}")
+                    _C.set_cache_dir(cwd_cache)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"Failed to initialize disk cache: {e}")
+
+
+def get_cache_dir():
+    return _CACHE_DIR
+
+
+def set_cache_dir(cache_dir: str):
+    global _CACHE_DIR
+    _CACHE_DIR = cache_dir
+    logger.info(f"Setting NPU cache directory: {cache_dir}")
+    if _C is not None:
+        _C.set_cache_dir(cache_dir)
+
+
+def is_available() -> bool:
     if _C is None:
         return False
     return _C.is_npu_available()
 
-def add(a, b):
-    """
-    Performs element-wise addition using NPU acceleration (if available).
-    Falls back to CPU or standard PyTorch dispatch if NPU is unavailable.
-    """
-    if _C is not None:
-        return _C.npu_add(a, b)
-    return a + b
+
+# --- Expose Functional API ---
+from .functional import (  # noqa: E402
+    add,
+    sub,
+    mul,
+    div,
+    neg,
+    matmul,
+    linear,
+    relu,
+    gelu,
+    silu,
+    softmax,
+    rmsnorm,
+    transpose,
+    reshape,
+    conv2d,
+    max_pool2d,
+    update_kv_cache,
+)
+
+# --- Expose Compiler API ---
+from .frontend import compile_to_npu  # noqa: E402
+
+compile = compile_to_npu
+
+__all__ = [
+    "is_available",
+    "compile_to_npu",
+    "get_cache_dir",
+    "set_cache_dir",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "neg",
+    "matmul",
+    "linear",
+    "relu",
+    "gelu",
+    "silu",
+    "softmax",
+    "rmsnorm",
+    "transpose",
+    "reshape",
+    "conv2d",
+    "max_pool2d",
+    "update_kv_cache",
+]

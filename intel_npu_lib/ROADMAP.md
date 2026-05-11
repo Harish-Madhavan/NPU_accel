@@ -1,51 +1,65 @@
-# Roadmap: Intel NPU Acceleration Library (OpenVINO Backend)
+# Detailed Roadmap: Intel NPU Acceleration Library
 
-This document outlines the steps required to transform this skeleton library into a functional accelerator using **OpenVINO**. This approach abstracts low-level driver details and allows running operations on the NPU (and CPU/GPU) using a unified API.
+This roadmap outlines the strategic direction for transforming the prototype into a robust, production-grade library. The focus is on streamlining architecture, expanding test coverage beyond LLMs, and preparing for diverse AI workloads.
 
-## 1. Architecture Overview
-The library uses OpenVINO Runtime (`openvino` C++ API) to execute PyTorch operators on the NPU.
+## Phase 1: Housekeeping & Modernization (Immediate)
+*Goal: Remove technical debt, clean up the codebase, and enforce strict coding standards.*
 
-**Flow:**
-1.  **PyTorch Op called** (e.g., `npu_add`).
-2.  **Wrap Tensors:** Wrap PyTorch memory (CPU pointer) into `ov::Tensor` to avoid copies where possible.
-3.  **Graph Construction:** 
-    *   *Option A (Eager-like):* Construct a tiny OpenVINO model for the specific operation on-the-fly (using `ov::opset`).
-    *   *Option B (Graph):* Capture a sub-graph (TorchScript/FX) and convert it to OpenVINO IR.
-4.  **Execution:** Send to NPU via `ov::InferRequest`.
+- [x] **Build System Cleanup**:
+    - [x] Remove redundant `intel_npu_lib/CMakeLists.txt` (build is fully handled by `setup.py` and `setuptools`).
+    - [x] Clean up root directory artifacts (`build/` folder).
+- **Code Quality**:
+    - [x] **Logging**: Replace `std::cout` and `print()` debugging with a proper logging framework (spdlog for C++, `logging` module for Python).
+    - [ ] **Formatting**: Enforce `clang-format` for C++ and `ruff`/`black` for Python.
+    - [x] **Type Safety**: Add type hints to all Python functions and run `mypy` validation.
+- **C++ Refactoring**:
+    - [x] **Singleton Pattern**: Encapsulate global state (`g_core`, `g_model_cache`) into a thread-safe `NPUBackend` singleton class.
+    - [x] **RAII**: Ensure all OpenVINO objects are managed with smart pointers (already mostly done, but verify global maps).
 
-## 2. Integration Steps
+## Phase 2: Architecture Refinement (Short-term)
+*Goal: Modularize the compiler and improve error handling.*
 
-### Step A: Install Dependencies
-No manual SDK installation is required! The build system now automatically handles OpenVINO.
+- [x] **Compiler Modularization (`compiler.py`)**:
+    - [x] Extract `OpRegistry` into `registry.py` to decouple operator mapping from graph building.
+    - [x] Extract `OVGraphBuilder` into `graph_builder.py`.
+    - [x] Create a dedicated `frontend.py` for the user-facing `compile` API.
+- [x] **Error Handling**:
+    - [x] Implement a custom C++ Exception class (`NPUException`) that translates to a specific Python error.
+    - [x] Ensure clear error messages when an operator is not supported (instead of generic "Function not implemented").
+- [x] **Dynamic Shapes**:
+    - [x] Move away from "Constant Folding" shape tensors where possible. Use OpenVINO's dynamic shape support (`-1` dimensions) more aggressively to avoid recompiling for every new sequence length.
 
-1.  **Build System:** We use `pyproject.toml` to define build dependencies.
-2.  **Runtime:** When you install this library, `openvino` will be installed automatically via pip.
-3.  **Linking:** `setup.py` is configured to find the OpenVINO C++ headers and libraries directly from the installed Python package.
+## Phase 3: Expanded Testing & QA (Medium-term)
+*Goal: Ensure reliability across different workloads and edge cases.*
 
-### Step B: Build and Install
-Simply run:
-```bash
-pip install .
-```
-This will:
-1.  Install `torch` and `openvino` (if missing).
-2.  Locate the OpenVINO libraries.
-3.  Compile the C++ extension linking against them.
+- [ ] **Test Infrastructure**:
+    - [ ] **Parametrized Tests**: specific tests for:
+        - Input shapes (Scalar, 1D, 2D, 3D, 4D).
+        - Data types (FP32, FP16 - ensuring auto-casting works).
+        - Edge cases (Zero-sized tensors, unaligned memory).
+- [x] **New Workloads**:
+    - [x] **Computer Vision**: Implement and test a standard CNN (MNIST/ResNet).
+        - [x] Add `npu_conv2d` and `npu_maxpool2d` operators.
+    - [ ] **Encoder Models**: Test a BERT-like encoder (Self-Attention without causal mask).
+- [ ] **Stress Testing**:
+    - [ ] **Memory Leak Check**: Run inference in a loop for 10,000+ iterations to verify stable memory usage.
+    - [ ] **Context Switching**: Test interleaving calls between two different compiled models.
 
-### Step C: Implement Device Management (`csrc/device.cpp`)
-1.  Include `<openvino/openvino.hpp>`.
-2.  Instantiate `ov::Core`.
-3.  Check `core.get_available_devices()` for "NPU".
+## Phase 4: Advanced Features & Optimization (Long-term)
+*Goal: maximize performance and hardware utilization.*
 
-### Step D: Implement Kernels (`csrc/ops.cpp`)
-For a simple `add` operation:
-1.  **Create Op:** Use `ov::op::v1::Add`.
-2.  **Build Model:** Create `ov::Model` from the op.
-3.  **Compile:** `core.compile_model(model, "NPU")`.
-4.  **Infer:**
-    *   Create `ov::Tensor` from PyTorch data pointers: `ov::Tensor(type, shape, ptr)`.
-    *   `infer_request.set_input_tensor(...)`.
-    *   `infer_request.infer()`.
+- [ ] **Stateful Execution**:
+    - [ ] **KV Cache**: Investigate OpenVINO `ReadValue`/`Assign` ops to keep KV cache on the NPU memory, avoiding the expensive "Slice -> Concat -> Copy back" loop.
+- [ ] **Quantization**:
+    - [ ] Add support for `int8` weight loading and execution.
+- [ ] **Async Inference**:
+    - [ ] Expose OpenVINO's async API to Python to allow overlapping CPU pre-processing with NPU execution.
 
-## 3. Future: Zero-Copy Optimization
-OpenVINO supports "remote tensors" (using Level Zero backing) for zero-copy networking between PyTorch and NPU. This requires advanced usage of `ov::intel_gpu::ocl::ClContext` or NPU equivalents when they become public API.
+## Phase 5: CI/CD & Documentation
+- [ ] **CI Pipeline**: Create GitHub Actions to build wheel and run `pytest`.
+- [ ] **Benchmarks**: Create `benchmarks/` folder with scripts to track latency (ms) and throughput (tok/s) across commits.
+- [ ] **API Documentation**: Auto-generate docs from docstrings (Sphinx/MkDocs).
+
+## Phase 6: Training & Fine-Tuning Support (Future)
+- [ ] **Backward Pass Implementation**: Map PyTorch autograd gradients to OpenVINO backward ops (if available) or implement custom C++ backward kernels.
+- [ ] **Optimizer Offloading**: Offload Adam/SGD parameter updates to the NPU.
