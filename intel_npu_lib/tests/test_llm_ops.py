@@ -5,6 +5,7 @@ import time
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 # Custom _torch_rmsnorm for reference, matching the one in __init__.py
 def _torch_rmsnorm(input, weight, eps):
     # This is a simplified RMSNorm, might need adjustment for full compatibility
@@ -21,15 +22,15 @@ class TestIntelNPULibLLM(unittest.TestCase):
 
     def test_activation_ops(self):
         x = torch.randn(10, 10)
-        
+
         # ReLU
         res = intel_npu_acceleration.relu(x)
         self.assertTrue(torch.allclose(res, torch.relu(x), rtol=1e-2, atol=1e-2))
-        
+
         # GELU
         res = intel_npu_acceleration.gelu(x)
         self.assertTrue(torch.allclose(res, F.gelu(x), rtol=1e-2, atol=1e-2))
-        
+
         # Softmax
         res = intel_npu_acceleration.softmax(x, dim=-1)
         self.assertTrue(torch.allclose(res, F.softmax(x, dim=-1), rtol=1e-2, atol=1e-2))
@@ -48,15 +49,15 @@ class TestIntelNPULibLLM(unittest.TestCase):
         class MathModel(nn.Module):
             def forward(self, x):
                 return -x, torch.sin(x), torch.cos(x)
-        
+
         model = MathModel()
         model.eval()
         x = torch.randn(4, 4)
-        
+
         try:
             compiled = intel_npu_acceleration.compile_to_npu(model, x)
             res_neg, res_sin, res_cos = compiled(x)
-            
+
             self.assertTrue(torch.allclose(res_neg, -x, rtol=1e-2, atol=1e-2))
             self.assertTrue(torch.allclose(res_sin, torch.sin(x), rtol=1e-2, atol=1e-2))
             self.assertTrue(torch.allclose(res_cos, torch.cos(x), rtol=1e-2, atol=1e-2))
@@ -73,15 +74,15 @@ class TestIntelNPULibLLM(unittest.TestCase):
 
         model = IndexingModel()
         model.eval()
-        
+
         x = torch.randn(4, 10)
         idx = torch.tensor([0, 2, 4], dtype=torch.int64)
-        cond = torch.tensor([[True, False] * 5]).bool() # (1, 10) broadcast to (4, 10)
+        cond = torch.tensor([[True, False] * 5]).bool()  # (1, 10) broadcast to (4, 10)
 
         compiled = intel_npu_acceleration.compile_to_npu(model, (x, idx, cond))
         res_w, res_s = compiled(x, idx, cond)
         exp_w, exp_s = model(x, idx, cond)
-        
+
         self.assertTrue(torch.allclose(res_w, exp_w, rtol=1e-2, atol=1e-2))
         self.assertTrue(torch.allclose(res_s, exp_s, rtol=1e-2, atol=1e-2))
 
@@ -104,7 +105,7 @@ class TestIntelNPULibLLM(unittest.TestCase):
 
         # Test Case 3: Larger epsilon
         input3 = torch.randn(3, 5, 64)
-        weight3 = torch.rand(64) + 0.1 # Ensure weight is not too small
+        weight3 = torch.rand(64) + 0.1  # Ensure weight is not too small
         eps3 = 1e-3
         npu_res3 = intel_npu_acceleration.rmsnorm(input3, weight3, eps3)
         cpu_res3 = _torch_rmsnorm(input3, weight3, eps3)
@@ -116,20 +117,22 @@ class TestIntelNPULibLLM(unittest.TestCase):
         # Swap dim 1 and 2 -> (2, 4, 3)
         res = intel_npu_acceleration.transpose(x, 1, 2)
         expected = torch.transpose(x, 1, 2)
-        
+
         if not torch.allclose(res, expected):
             print(f"\n[Test Failure Transpose] Input:\n{x}")
             print(f"[Test Failure Transpose] Result:\n{res}")
             print(f"[Test Failure Transpose] Expected:\n{expected}")
-            
+
         self.assertTrue(torch.allclose(res, expected))
         self.assertEqual(res.shape, expected.shape)
 
     def test_reshape_op(self):
         x = torch.randn(3, 4, 5)
-        res = intel_npu_acceleration.reshape(x, (2, 30)) # Corrected shape
+        res = intel_npu_acceleration.reshape(x, (2, 30))  # Corrected shape
         expected = x.reshape(2, 30)
-        self.assertTrue(torch.allclose(res, expected, atol=1e-3, rtol=1e-4)) # Relaxed atol
+        self.assertTrue(
+            torch.allclose(res, expected, atol=1e-3, rtol=1e-4)
+        )  # Relaxed atol
 
     def test_transformer_block(self):
         class TinyTransformerBlock(nn.Module):
@@ -138,7 +141,7 @@ class TestIntelNPULibLLM(unittest.TestCase):
                 self.linear1 = nn.Linear(d_model, d_model * 4)
                 self.activation = nn.GELU()
                 self.linear2 = nn.Linear(d_model * 4, d_model)
-                
+
             def forward(self, x):
                 x = self.linear1(x)
                 x = self.activation(x)
@@ -148,24 +151,25 @@ class TestIntelNPULibLLM(unittest.TestCase):
         d_model = 16
         model = TinyTransformerBlock(d_model)
         model.eval()
-        
-        x = torch.randn(1, 8, d_model) # Batch 1, Seq 8, Dim 16
-        
+
+        x = torch.randn(1, 8, d_model)  # Batch 1, Seq 8, Dim 16
+
         compiled_model = intel_npu_acceleration.compile_to_npu(model, x)
-        
+
         # Warmup
         _ = compiled_model(x)
-        
+
         start = time.time()
         out_npu = compiled_model(x)
         print(f"Transformer Block Time: {time.time() - start:.4f}s")
-        
+
         out_cpu = model(x)
-        
+
         # The composite error might be higher, checking
         diff = (out_npu - out_cpu).abs().max().item()
         print(f"Transformer Block Max Diff: {diff}")
         self.assertTrue(torch.allclose(out_npu, out_cpu, rtol=1e-1, atol=1e-1))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

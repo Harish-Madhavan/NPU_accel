@@ -44,6 +44,7 @@ def _require_C() -> None:
 # Dtype helpers
 # ---------------------------------------------------------------------------
 
+
 def _to_f32(t: torch.Tensor) -> torch.Tensor:
     """Cast tensor to float32 if it is not already float32."""
     return t if t.dtype == torch.float32 else t.float()
@@ -63,7 +64,7 @@ def _promote_binary(a: torch.Tensor, b: torch.Tensor):
     """
     if a.dtype == b.dtype:
         return a, b, a.dtype
-    
+
     # Simple promotion: promote to the larger float type or float32 if mixed
     if a.is_floating_point() or b.is_floating_point():
         if a.dtype == torch.float64 or b.dtype == torch.float64:
@@ -76,7 +77,7 @@ def _promote_binary(a: torch.Tensor, b: torch.Tensor):
             target = torch.float16
     else:
         # Both integers
-        target = torch.int32 # Default NPU int width
+        target = torch.int32  # Default NPU int width
         if a.dtype == torch.int64 or b.dtype == torch.int64:
             target = torch.int64
 
@@ -87,32 +88,38 @@ def _promote_binary(a: torch.Tensor, b: torch.Tensor):
 # Element-wise binary ops
 # ---------------------------------------------------------------------------
 
+
 def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.add(a, b)
+    if _C is None:
+        return torch.add(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_add(a, b), orig)
 
 
 def sub(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.sub(a, b)
+    if _C is None:
+        return torch.sub(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_sub(a, b), orig)
 
 
 def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.mul(a, b)
+    if _C is None:
+        return torch.mul(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_mul(a, b), orig)
 
 
 def div(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.div(a, b)
+    if _C is None:
+        return torch.div(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_div(a, b), orig)
 
 
 def neg(a: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.neg(a)
+    if _C is None:
+        return torch.neg(a)
     return _C.npu_neg(a)
 
 
@@ -120,8 +127,10 @@ def neg(a: torch.Tensor) -> torch.Tensor:
 # Matrix multiplication
 # ---------------------------------------------------------------------------
 
+
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.matmul(a, b)
+    if _C is None:
+        return torch.matmul(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_matmul(a, b), orig)
 
@@ -131,7 +140,8 @@ def linear(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if _C is None: return torch.nn.functional.linear(input, weight, bias)
+    if _C is None:
+        return torch.nn.functional.linear(input, weight, bias)
     if bias is None:
         # C++ extension expects a bias tensor; pass an empty one if None
         bias = torch.empty(0, dtype=input.dtype)
@@ -142,29 +152,35 @@ def linear(
 # Activation functions
 # ---------------------------------------------------------------------------
 
+
 def relu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.relu(a)
+    if _C is None:
+        return torch.relu(a)
     return _C.npu_relu(a)
 
 
 def gelu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.nn.functional.gelu(a)
+    if _C is None:
+        return torch.nn.functional.gelu(a)
     return _C.npu_gelu(a)
 
 
 def silu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None: return torch.nn.functional.silu(a)
+    if _C is None:
+        return torch.nn.functional.silu(a)
     return _C.npu_silu(a)
 
 
 def softmax(a: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    if _C is None: return torch.nn.functional.softmax(a, dim=dim)
+    if _C is None:
+        return torch.nn.functional.softmax(a, dim=dim)
     return _C.npu_softmax(a, dim)
 
 
 # ---------------------------------------------------------------------------
 # Normalisation
 # ---------------------------------------------------------------------------
+
 
 def rmsnorm(
     input: torch.Tensor,
@@ -182,24 +198,30 @@ def rmsnorm(
 # Shape manipulation
 # ---------------------------------------------------------------------------
 
+
 def transpose(input: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
-    if _C is None: return torch.transpose(input, dim0, dim1)
+    if _C is None:
+        return torch.transpose(input, dim0, dim1)
     rank = input.dim()
-    if dim0 < 0: dim0 += rank
-    if dim1 < 0: dim1 += rank
+    if dim0 < 0:
+        dim0 += rank
+    if dim1 < 0:
+        dim1 += rank
     perm = list(range(rank))
     perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
     return _C.npu_transpose(input, perm)
 
 
 def reshape(input: torch.Tensor, shape: List[int]) -> torch.Tensor:
-    if _C is None: return torch.reshape(input, shape)
+    if _C is None:
+        return torch.reshape(input, shape)
     return _C.npu_reshape(input, list(shape))
 
 
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------
+
 
 def scaled_dot_product_attention(
     query: torch.Tensor,
@@ -212,8 +234,12 @@ def scaled_dot_product_attention(
 ) -> torch.Tensor:
     if _C is None:
         return torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, attn_mask=attn_mask,
-            dropout_p=dropout_p, is_causal=is_causal,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
         )
     if attn_mask is None:
         attn_mask = torch.empty(0, dtype=query.dtype)
@@ -226,29 +252,24 @@ def scaled_dot_product_attention(
 # KV-cache update (slice-assign pattern used in autoregressive LLM inference)
 # ---------------------------------------------------------------------------
 
+
+import torch.fx
+
 def update_kv_cache(
     cache: torch.Tensor,
     new_kv: torch.Tensor,
     position: int,
 ) -> torch.Tensor:
-    """
-    Insert new_kv into cache at the sequence position `position`.
-
-    cache  : (batch, heads, seq_len, head_dim)
-    new_kv : (batch, heads, 1,       head_dim)
-
-    Returns a new tensor — does NOT modify cache in-place.
-    NOTE: This is currently a CPU fallback; on-NPU stateful KV cache
-          (via OpenVINO ReadValue/Assign) is on the roadmap.
-    """
-    result = cache.clone()
-    result[:, :, position : position + new_kv.shape[2], :] = new_kv
-    return result
+    seq_len = new_kv.shape[1]
+    left = cache[:, :position, :, :]
+    right = cache[:, position + seq_len :, :, :]
+    return torch.cat([left, new_kv, right], dim=1)
 
 
 # ---------------------------------------------------------------------------
 # CV ops
 # ---------------------------------------------------------------------------
+
 
 def conv2d(
     input: torch.Tensor,
@@ -261,8 +282,13 @@ def conv2d(
 ) -> torch.Tensor:
     if _C is None:
         return torch.nn.functional.conv2d(
-            input, weight, bias, stride=stride, padding=padding,
-            dilation=dilation, groups=groups,
+            input,
+            weight,
+            bias,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
         )
 
     def _to_pair(v):
@@ -272,8 +298,12 @@ def conv2d(
         bias = torch.empty(0, dtype=input.dtype)
 
     return _C.npu_conv2d(
-        input, weight, bias,
-        _to_pair(stride), _to_pair(padding), _to_pair(dilation),
+        input,
+        weight,
+        bias,
+        _to_pair(stride),
+        _to_pair(padding),
+        _to_pair(dilation),
         groups,
     )
 
@@ -288,8 +318,12 @@ def max_pool2d(
 ) -> torch.Tensor:
     if _C is None:
         return torch.nn.functional.max_pool2d(
-            input, kernel_size, stride=stride, padding=padding,
-            dilation=dilation, ceil_mode=ceil_mode,
+            input,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            ceil_mode=ceil_mode,
         )
 
     def _to_pair(v):
@@ -300,8 +334,10 @@ def max_pool2d(
 
     return _C.npu_max_pool2d(
         input,
-        _to_pair(kernel_size), _to_pair(stride),
-        _to_pair(padding), _to_pair(dilation),
+        _to_pair(kernel_size),
+        _to_pair(stride),
+        _to_pair(padding),
+        _to_pair(dilation),
         ceil_mode,
     )
 
@@ -309,6 +345,7 @@ def max_pool2d(
 # ---------------------------------------------------------------------------
 # No-ops (pass-through) — present so the functional API is complete
 # ---------------------------------------------------------------------------
+
 
 def identity(input: torch.Tensor) -> torch.Tensor:
     return input

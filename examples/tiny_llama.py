@@ -1,9 +1,9 @@
-
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 from dataclasses import dataclass
 import math
+from intel_npu_acceleration.functional import update_kv_cache
 
 @dataclass
 class LlamaConfig:
@@ -17,7 +17,7 @@ class LlamaConfig:
     max_seq_len: int = 128
     rope_theta: float = 10000.0
 
-from intel_npu_acceleration.functional import update_kv_cache
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -32,6 +32,7 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -39,41 +40,23 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     # Return cos and sin
     return torch.cos(freqs), torch.sin(freqs)
 
+
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     # x: (bsz, seqlen, n_heads, head_dim)
     # cos, sin: (seqlen, head_dim/2) -> need broadcasting
-    
-    # Reshape x into pairs (..., head_dim/2, 2)
-    # Actually, standard RoPE implementation:
-    # x = [x1, x2, x3, x4]
-    # rotate_half(x) = [-x2, x1, -x4, x3]
-    # We need to match the precomputed freqs which correspond to pairs.
-    
-    # Assuming cos/sin are shaped broadcastable to x.
-    # x shape: (B, S, H, D)
-    # cos shape: (S, D/2) - we need to duplicate to (S, D) or apply to halves?
-    # The precomputed freqs are for pairs. 
-    
-    # Let's use the "rotate_half" helper
+
     d = x.shape[-1]
-    x1 = x[..., :d//2]
-    x2 = x[..., d//2:]
-    
-    # Prepare cos/sin
-    # cos/sin are (S, D/2). Unsqueeze for B and H.
-    # (S, D/2) -> (1, S, 1, D/2)
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2 :]
+
     cos = cos.view(1, cos.shape[0], 1, cos.shape[1])
     sin = sin.view(1, sin.shape[0], 1, sin.shape[1])
-    
-    # Apply
-    # out1 = x1 * cos - x2 * sin
-    # out2 = x1 * sin + x2 * cos
-    # This corresponds to rotation matrix [[cos, -sin], [sin, cos]]
-    
+
     out1 = x1 * cos - x2 * sin
     out2 = x1 * sin + x2 * cos
-    
+
     return torch.cat([out1, out2], dim=-1).type_as(x)
+
 
 class Attention(nn.Module):
     def __init__(self, args: LlamaConfig):
@@ -82,13 +65,22 @@ class Attention(nn.Module):
         self.n_local_heads = args.n_heads
         self.n_local_kv_heads = self.n_kv_heads
         self.head_dim = args.dim // args.n_heads
-        
+
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor], cache_k: Optional[torch.Tensor]=None, cache_v: Optional[torch.Tensor]=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache_k: Optional[torch.Tensor] = None,
+        cache_v: Optional[torch.Tensor] = None,
+    ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -103,11 +95,11 @@ class Attention(nn.Module):
         # Functional Cache Update
         keys = xk
         values = xv
-        
+
         if cache_k is not None and cache_v is not None:
-            cache_k = update_kv_cache(cache_k, xk, start_pos, seqlen)
-            cache_v = update_kv_cache(cache_v, xv, start_pos, seqlen)
-            
+            cache_k = update_kv_cache(cache_k, xk, start_pos)
+            cache_v = update_kv_cache(cache_v, xv, start_pos)
+
             keys = cache_k[:, : start_pos + seqlen]
             values = cache_v[:, : start_pos + seqlen]
 
@@ -115,7 +107,7 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        
+
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bsz, n_local_heads, seqlen, cache_len + seqlen)
@@ -123,6 +115,7 @@ class Attention(nn.Module):
         output = torch.matmul(scores, values)  # (bsz, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output), cache_k, cache_v
+
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int):
@@ -136,6 +129,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: LlamaConfig):
@@ -153,11 +147,29 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mask: Optional[torch.Tensor], cache_k=None, cache_v=None):
-        att_out, new_k, new_v = self.attention(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask, cache_k, cache_v)
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache_k=None,
+        cache_v=None,
+    ):
+        att_out, new_k, new_v = self.attention(
+            self.attention_norm(x),
+            start_pos,
+            freqs_cos,
+            freqs_sin,
+            mask,
+            cache_k,
+            cache_v,
+        )
         h = x + att_out
         out = h + self.feed_forward(self.ffn_norm(h))
         return out, new_k, new_v
+
 
 class Llama(nn.Module):
     def __init__(self, params: LlamaConfig):
@@ -178,13 +190,18 @@ class Llama(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int, kv_cache: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+        kv_cache: Optional[torch.Tensor] = None,
+    ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        
+
         freqs_cos = self.freqs_cos.to(h.device)
         freqs_sin = self.freqs_sin.to(h.device)
-        
+
         # Use arange for slicing with dynamic shapes (FX proxies)
         idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
         freqs_cos = freqs_cos[idx]
@@ -200,73 +217,84 @@ class Llama(nn.Module):
                 # kv_cache shape: (N_Layers * 2, B, MaxSeqLen, H, D)
                 ck = kv_cache[2 * i]
                 cv = kv_cache[2 * i + 1]
-            
+
             h, nk, nv = layer(h, start_pos, freqs_cos, freqs_sin, mask, ck, cv)
-            
+
             if nk is not None and nv is not None:
                 new_kvs_flat.append(nk)
                 new_kvs_flat.append(nv)
 
         h = self.norm(h)
         output = self.output(h).float()
-        
+
         new_kv_cache = None
         if len(new_kvs_flat) > 0:
             new_kv_cache = torch.stack(new_kvs_flat, dim=0)
-            
+
         return output, new_kv_cache
+
 
 def test_llama_impl():
     conf = LlamaConfig()
     model = Llama(conf)
     model.eval()
-    
+
     # Test Input
     x = torch.randint(0, conf.vocab_size, (1, 10))
     start_pos = 0
-    
+
     # Initialize Cache (N_Layers * 2, B, MaxSeqLen, H, D)
-    kv_cache = torch.zeros(conf.n_layers * 2, 1, conf.max_seq_len, conf.n_kv_heads, conf.dim // conf.n_heads)
-    
+    kv_cache = torch.zeros(
+        conf.n_layers * 2,
+        1,
+        conf.max_seq_len,
+        conf.n_kv_heads,
+        conf.dim // conf.n_heads,
+    )
+
     print("Running on CPU...")
     with torch.no_grad():
         logits_cpu, cache_cpu = model(x, start_pos, kv_cache)
-    print(f"CPU Logits shape: {logits_cpu.shape}") 
+    print(f"CPU Logits shape: {logits_cpu.shape}")
     print(f"CPU Cache shape: {cache_cpu.shape}")
 
     # Compile to NPU
     try:
-        import intel_npu_acceleration.compiler as npu_compiler
+        import intel_npu_acceleration as npu_compiler
         import time
-        
+
         print("\nCompiling to NPU...")
         t0 = time.time()
         # Input signature: (tokens, start_pos, kv_cache)
         npu_model = npu_compiler.compile_to_npu(model, (x, start_pos, kv_cache))
         print(f"Compilation finished in {time.time() - t0:.2f}s")
-        
+
         print("Running on NPU...")
         t0 = time.time()
         logits_npu, cache_npu = npu_model(x, start_pos, kv_cache)
-        print(f"NPU Inference time: {(time.time() - t0)*1000:.2f} ms")
+        print(f"NPU Inference time: {(time.time() - t0) * 1000:.2f} ms")
         print(f"NPU Logits shape: {logits_npu.shape}")
-        
+
         if logits_cpu.shape == logits_npu.shape:
             print("Logits Shape check PASSED")
         else:
-            print(f"Logits Shape check FAILED: {logits_cpu.shape} vs {logits_npu.shape}")
+            print(
+                f"Logits Shape check FAILED: {logits_cpu.shape} vs {logits_npu.shape}"
+            )
 
         if cache_cpu.shape == cache_npu.shape:
             print("Cache Shape check PASSED")
         else:
-             print(f"Cache Shape check FAILED: {cache_cpu.shape} vs {cache_npu.shape}")
+            print(f"Cache Shape check FAILED: {cache_cpu.shape} vs {cache_npu.shape}")
 
     except ImportError:
         print("Intel NPU library not found. Skipping NPU test.")
     except Exception as e:
         print(f"NPU Test Failed: {e}")
         import traceback
+
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     test_llama_impl()

@@ -1,5 +1,6 @@
 from typing import Dict, Any, Callable, Optional
 
+
 class OpRegistry:
     _function_converters: Dict[Any, Callable] = {}
     _method_converters: Dict[str, Callable] = {}
@@ -11,6 +12,7 @@ class OpRegistry:
             for t in targets:
                 cls._function_converters[t] = func
             return func
+
         return decorator
 
     @classmethod
@@ -19,6 +21,7 @@ class OpRegistry:
             for n in names:
                 cls._method_converters[n] = func
             return func
+
         return decorator
 
     @classmethod
@@ -27,8 +30,9 @@ class OpRegistry:
             for t in types:
                 cls._module_converters[t] = func
             return func
+
         return decorator
-    
+
     @classmethod
     def get_function(cls, target) -> Optional[Callable]:
         return cls._function_converters.get(target)
@@ -36,7 +40,7 @@ class OpRegistry:
     @classmethod
     def get_method(cls, name: str) -> Optional[Callable]:
         return cls._method_converters.get(name)
-    
+
     @classmethod
     def get_module(cls, module_type) -> Optional[Callable]:
         return cls._module_converters.get(module_type)

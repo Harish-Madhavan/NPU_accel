@@ -5,9 +5,9 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 import intel_npu_acceleration as npu
 import time
-import os
 
 # --- Model Definition ---
+
 
 class Net(nn.Module):
     def __init__(self):
@@ -21,41 +21,55 @@ class Net(nn.Module):
     def forward(self, x):
         # We use explicit NPU ops for computation
         # Since functional.py is autograd-aware, this works for training!
-        x = npu.conv2d(x, self.conv1.weight, self.conv1.bias, 
-                       stride=self.conv1.stride, padding=self.conv1.padding)
+        x = npu.conv2d(
+            x,
+            self.conv1.weight,
+            self.conv1.bias,
+            stride=self.conv1.stride,
+            padding=self.conv1.padding,
+        )
         x = npu.relu(x)
-        
-        x = npu.conv2d(x, self.conv2.weight, self.conv2.bias,
-                       stride=self.conv2.stride, padding=self.conv2.padding)
+
+        x = npu.conv2d(
+            x,
+            self.conv2.weight,
+            self.conv2.bias,
+            stride=self.conv2.stride,
+            padding=self.conv2.padding,
+        )
         x = npu.relu(x)
-        
+
         x = npu.max_pool2d(x, 2)
         x = torch.flatten(x, 1)
-        
+
         x = npu.linear(x, self.fc1.weight, self.fc1.bias)
         x = npu.relu(x)
-        
+
         x = npu.linear(x, self.fc2.weight, self.fc2.bias)
         output = npu.softmax(x, dim=1)
-        return torch.log(output + 1e-10) # LogSoftmax poorman's impl
+        return torch.log(output + 1e-10)  # LogSoftmax poorman's impl
+
 
 def train(model, device, train_loader, optimizer, epoch):
     model.train()
-    print(f"\nTraining on Hybrid NPU (Forward) + CPU (Backward)...")
+    print("\nTraining on Hybrid NPU (Forward) + CPU (Backward)...")
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        
-        # This will now use NPU accelerated ops if wrapped properly, 
+
+        # This will now use NPU accelerated ops if wrapped properly,
         # but since we want to show 'manual' use of NPU ops in training:
         output = model(data)
-        
+
         loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % 100 == 0:
-            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                  f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+            print(
+                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} "
+                f"({100.0 * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
+            )
+
 
 def test_npu(compiled_model, test_loader):
     print("\nEvaluating on Intel NPU...")
@@ -69,10 +83,13 @@ def test_npu(compiled_model, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     elapsed = time.time() - start_time
-    print(f'NPU Test set: Accuracy: {correct}/{len(test_loader.dataset)} '
-          f'({100. * correct / len(test_loader.dataset):.2f}%)')
-    print(f'Total NPU Inference Time: {elapsed:.3f}s')
+    print(
+        f"NPU Test set: Accuracy: {correct}/{len(test_loader.dataset)} "
+        f"({100.0 * correct / len(test_loader.dataset):.2f}%)"
+    )
+    print(f"Total NPU Inference Time: {elapsed:.3f}s")
     return elapsed
+
 
 def test_cpu(model, test_loader):
     print("\nEvaluating on CPU...")
@@ -86,25 +103,29 @@ def test_cpu(model, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     elapsed = time.time() - start_time
-    print(f'CPU Test set: Accuracy: {correct}/{len(test_loader.dataset)} '
-          f'({100. * correct / len(test_loader.dataset):.2f}%)')
-    print(f'Total CPU Inference Time: {elapsed:.3f}s')
+    print(
+        f"CPU Test set: Accuracy: {correct}/{len(test_loader.dataset)} "
+        f"({100.0 * correct / len(test_loader.dataset):.2f}%)"
+    )
+    print(f"Total CPU Inference Time: {elapsed:.3f}s")
     return elapsed
+
 
 def main():
     # Training on CPU
     device = torch.device("cpu")
-    
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    
+
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+    )
+
     # Download and load MNIST
     print("Loading MNIST dataset...")
-    train_set = datasets.MNIST('../data', train=True, download=True, transform=transform)
-    test_set = datasets.MNIST('../data', train=False, transform=transform)
-    
+    train_set = datasets.MNIST(
+        "../data", train=True, download=True, transform=transform
+    )
+    test_set = datasets.MNIST("../data", train=False, transform=transform)
+
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=64)
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=1000)
 
@@ -119,11 +140,13 @@ def main():
     print("\nStep 2: Compiling model for Intel NPU...")
     model.eval()
     example_input = torch.randn(1, 1, 28, 28)
-    
+
     # Check if NPU is available before compiling
     if not npu.is_available():
-        print("⚠️ Warning: Intel NPU not detected. Compiler will fallback to CPU (OpenVINO optimized).")
-    
+        print(
+            "⚠️ Warning: Intel NPU not detected. Compiler will fallback to CPU (OpenVINO optimized)."
+        )
+
     npu_model = npu.compile(model, example_input)
 
     # Step 3: Compare Performance
@@ -133,5 +156,6 @@ def main():
     speedup = cpu_time / npu_time if npu_time > 0 else 0
     print(f"\n🚀 NPU Speedup: {speedup:.2f}x")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
