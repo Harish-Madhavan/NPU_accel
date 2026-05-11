@@ -253,7 +253,6 @@ def scaled_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 
-import torch.fx
 
 def update_kv_cache(
     cache: torch.Tensor,
@@ -261,9 +260,8 @@ def update_kv_cache(
     position: int,
 ) -> torch.Tensor:
     seq_len = new_kv.shape[1]
-    left = cache[:, :position, :, :]
-    right = cache[:, position + seq_len :, :, :]
-    return torch.cat([left, new_kv, right], dim=1)
+    indices = torch.arange(position, position + seq_len, dtype=torch.long)
+    return cache.index_copy(1, indices, new_kv)
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,28 @@ class TestParametrizedOps(unittest.TestCase):
                 res = npu.add(a, b)
                 self.assertTrue(torch.allclose(res, a + b, atol=1e-2, rtol=1e-2))
 
+    def test_broadcasting_backward(self):
+        cases = [
+            ((2, 3), (3,)),  # Add vector to matrix
+            ((2, 3, 4), (1, 1, 4)),
+            ((2, 3, 4), (1,)),
+        ]
+
+        for s1, s2 in cases:
+            with self.subTest(s1=s1, s2=s2):
+                a1 = torch.randn(s1, requires_grad=True)
+                b1 = torch.randn(s2, requires_grad=True)
+                res1 = npu.add(a1, b1)
+                res1.sum().backward()
+
+                a2 = a1.detach().clone().requires_grad_(True)
+                b2 = b1.detach().clone().requires_grad_(True)
+                res2 = a2 + b2
+                res2.sum().backward()
+
+                self.assertTrue(torch.allclose(a1.grad, a2.grad, atol=1e-3))
+                self.assertTrue(torch.allclose(b1.grad, b2.grad, atol=1e-3))
+
 
 if __name__ == "__main__":
     unittest.main()

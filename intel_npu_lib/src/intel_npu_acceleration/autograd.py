@@ -3,6 +3,19 @@ import math
 from . import _functional as F_npu
 
 
+def _unbroadcast(grad, target_shape):
+    if grad.shape == target_shape:
+        return grad
+    grad_dim = len(grad.shape)
+    target_dim = len(target_shape)
+    if grad_dim > target_dim:
+        grad = grad.sum(dim=tuple(range(grad_dim - target_dim)))
+    for i, dim in enumerate(target_shape):
+        if dim == 1 and grad.shape[i] > 1:
+            grad = grad.sum(dim=i, keepdim=True)
+    return grad
+
+
 class NPUMatMul(torch.autograd.Function):
     """
     NPU-accelerated Matrix Multiplication with Autograd support.
@@ -19,7 +32,7 @@ class NPUMatMul(torch.autograd.Function):
         a, b = ctx.saved_tensors
         grad_a = grad_output @ b.transpose(-2, -1)
         grad_b = a.transpose(-2, -1) @ grad_output
-        return grad_a, grad_b
+        return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
 
 
 class NPUAdd(torch.autograd.Function):
@@ -27,11 +40,13 @@ class NPUAdd(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a, b):
+        ctx.save_for_backward(a, b)
         return F_npu.add(a, b)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, grad_output
+        a, b = ctx.saved_tensors
+        return _unbroadcast(grad_output, a.shape), _unbroadcast(grad_output, b.shape)
 
 
 class NPUSub(torch.autograd.Function):
@@ -39,11 +54,13 @@ class NPUSub(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a, b):
+        ctx.save_for_backward(a, b)
         return F_npu.sub(a, b)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, -grad_output
+        a, b = ctx.saved_tensors
+        return _unbroadcast(grad_output, a.shape), _unbroadcast(-grad_output, b.shape)
 
 
 class NPUMul(torch.autograd.Function):
@@ -59,7 +76,7 @@ class NPUMul(torch.autograd.Function):
         a, b = ctx.saved_tensors
         grad_a = grad_output * b
         grad_b = grad_output * a
-        return grad_a, grad_b
+        return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
 
 
 class NPUReLU(torch.autograd.Function):

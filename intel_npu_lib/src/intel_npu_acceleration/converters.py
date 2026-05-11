@@ -141,14 +141,12 @@ def convert_matmul(builder: OVGraphBuilder, node, args, kwargs):
 
 
 @OpRegistry.register_function(torch.relu, torch.nn.functional.relu, npu_relu_func)
-@OpRegistry.register_module(torch.nn.ReLU)
 def convert_relu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     return ops.relu(inp)
 
 
 @OpRegistry.register_function(torch.nn.functional.gelu, npu_gelu_func)
-@OpRegistry.register_module(torch.nn.GELU)
 def convert_gelu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     approx = kwargs.get("approximate", "none")
@@ -157,7 +155,6 @@ def convert_gelu(builder: OVGraphBuilder, node, args, kwargs):
 
 
 @OpRegistry.register_function(torch.nn.functional.silu, npu_silu_func)
-@OpRegistry.register_module(torch.nn.SiLU)
 def convert_silu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     return ops.swish(inp)
@@ -590,13 +587,6 @@ def convert_setitem(builder: OVGraphBuilder, node, args, kwargs):
 
 
 
-@OpRegistry.register_function(torch.where)
-def convert_where(builder: OVGraphBuilder, node, args, kwargs):
-    condition = builder.get_input_or_constant(args[0])
-    x = builder.get_input_or_constant(args[1])
-    y = builder.get_input_or_constant(args[2])
-    x, y = builder.align_types(x, y)
-    return ops.select(condition, x, y)
 
 
 @OpRegistry.register_function(torch.index_select)
@@ -607,6 +597,23 @@ def convert_index_select(builder: OVGraphBuilder, node, args, kwargs):
 
     axis = ops.constant(np.array([dim]), dtype=np.int64)
     return ops.gather(inp, index, axis)
+
+
+@OpRegistry.register_method("index_copy")
+def convert_index_copy(builder: OVGraphBuilder, node, args, kwargs):
+    data = builder.get_input_or_constant(args[0])
+    dim = builder.get_input_or_constant(args[1])
+    indices = builder.get_input_or_constant(args[2])
+    updates = builder.get_input_or_constant(args[3])
+    
+    data, updates = builder.align_types(data, updates)
+    
+    if not isinstance(dim, ov.Node):
+        dim = ops.constant([dim], dtype=np.int64)
+    else:
+        dim = ops.reshape(dim, ops.constant([1], dtype=np.int64), special_zero=False)
+        
+    return ops.scatter_update(data, indices, updates, dim)
 
 
 @OpRegistry.register_function(torch.triu)
@@ -806,18 +813,6 @@ def convert_getitem(builder: OVGraphBuilder, node, args, kwargs):
 # --- Module Converters ---
 
 
-@OpRegistry.register_module(torch.nn.Linear)
-def convert_linear_module(builder: OVGraphBuilder, node, submod, args, kwargs):
-    inp = builder.get_input_or_constant(args[0])
-    w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
-
-    mm = ops.matmul(inp, w_const, transpose_a=False, transpose_b=True)
-    res = mm
-    if submod.bias is not None:
-        b_const = builder.add_constant(f"{node.target}.bias", submod.bias)
-        res = ops.add(mm, b_const)
-    return res
-
 
 @OpRegistry.register_module(torch.nn.Embedding)
 def convert_embedding_module(builder: OVGraphBuilder, node, submod, args, kwargs):
@@ -825,6 +820,14 @@ def convert_embedding_module(builder: OVGraphBuilder, node, submod, args, kwargs
     w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
     axis = ops.constant([0], dtype=np.int64)
     return ops.gather(w_const, indices, axis)
+
+
+@OpRegistry.register_function(torch.nn.functional.embedding)
+def convert_embedding_functional(builder: OVGraphBuilder, node, args, kwargs):
+    indices = builder.get_input_or_constant(args[0])
+    weight = builder.get_input_or_constant(args[1])
+    axis = ops.constant([0], dtype=np.int64)
+    return ops.gather(weight, indices, axis)
 
 
 @OpRegistry.register_module(torch.nn.ReLU)

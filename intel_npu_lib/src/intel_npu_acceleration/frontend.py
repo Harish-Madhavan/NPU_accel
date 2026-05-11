@@ -10,7 +10,7 @@ from typing import Any
 import intel_npu_acceleration as npu
 from .registry import OpRegistry
 from .graph_builder import OVGraphBuilder, ValueCapturingInterpreter
-from . import converters  # Import converters to ensure they are registered
+from . import converters  # noqa: F401
 logger = logging.getLogger(__name__)
 
 # --- Global Cache for Compiled Graphs ---
@@ -42,10 +42,7 @@ class NPUGraphModule(torch.nn.Module):
         self.compiled_model = compiled_model
         self.input_names = input_names
         self.infer_request = self.compiled_model.create_infer_request()
-
-    # ... (rest of NPUGraphModule remains same) ...
-    def forward(self, *args):
-        # Map inputs
+        
         _OV_TO_NP = {
             ov.Type.f32: np.float32,
             ov.Type.f16: np.float16,
@@ -56,22 +53,43 @@ class NPUGraphModule(torch.nn.Module):
             ov.Type.boolean: bool,
         }
 
-        for i, val in enumerate(args):
-            ov_input = self.compiled_model.inputs[i]
-            ov_type = ov_input.get_element_type()
-
+        # Pre-compute input properties to eliminate Python overhead in forward pass
+        self.target_dtypes = []
+        for i in range(len(self.compiled_model.inputs)):
+            ov_type = self.compiled_model.inputs[i].get_element_type()
             target_dtype = _OV_TO_NP.get(ov_type)
             if target_dtype is None:
-                # Fallback for complex strings
-                str_type = str(ov_type)
-                if "i32" in str_type:
-                    target_dtype = np.int32
-                elif "i64" in str_type:
-                    target_dtype = np.int64
-                elif "f16" in str_type:
-                    target_dtype = np.float16
-                else:
-                    target_dtype = np.float32
+                str_type = ov_type.get_type_name()
+                if "i32" in str_type: target_dtype = np.int32
+                elif "i64" in str_type: target_dtype = np.int64
+                elif "f16" in str_type: target_dtype = np.float16
+                else: target_dtype = np.float32
+            self.target_dtypes.append(target_dtype)
+
+        # Pre-compute output properties for zero-copy allocation
+        self.output_info = []
+        for j in range(len(self.compiled_model.outputs)):
+            ov_out = self.compiled_model.outputs[j]
+            partial_shape = ov_out.get_partial_shape()
+            if partial_shape.is_static:
+                shape = tuple(partial_shape.get_shape())
+                ov_type = ov_out.get_element_type()
+                target_dtype = _OV_TO_NP.get(ov_type)
+                if target_dtype is None:
+                    str_type = ov_type.get_type_name()
+                    if "i32" in str_type: target_dtype = np.int32
+                    elif "i64" in str_type: target_dtype = np.int64
+                    elif "f16" in str_type: target_dtype = np.float16
+                    else: target_dtype = np.float32
+                torch_dtype = torch.from_numpy(np.array(0, dtype=target_dtype)).dtype
+                self.output_info.append((True, shape, torch_dtype))
+            else:
+                self.output_info.append((False, None, None))
+
+
+    def forward(self, *args):
+        for i, val in enumerate(args):
+            target_dtype = self.target_dtypes[i]
 
             if isinstance(val, torch.Tensor):
                 np_view = val.detach().cpu().numpy()
@@ -90,14 +108,27 @@ class NPUGraphModule(torch.nn.Module):
                 i, ov.Tensor(np_view, shared_memory=True)
             )
 
+        outputs_prealloc = []
+        for j in range(len(self.compiled_model.outputs)):
+            is_static, shape, torch_dtype = self.output_info[j]
+            
+            if is_static:
+                out_pt = torch.empty(shape, dtype=torch_dtype)
+                ov_out_tensor = ov.Tensor(out_pt.numpy(), shared_memory=True)
+                self.infer_request.set_output_tensor(j, ov_out_tensor)
+                outputs_prealloc.append(out_pt)
+            else:
+                outputs_prealloc.append(None)
+
         self.infer_request.infer()
 
         outputs = []
         for j in range(len(self.compiled_model.outputs)):
-            out_tensor = self.infer_request.get_output_tensor(j)
-            # clone() is necessary because out_tensor.data is a view into the NPU's output buffer
-            # which will be overwritten on the next inference.
-            outputs.append(torch.from_numpy(out_tensor.data).clone())
+            if outputs_prealloc[j] is not None:
+                outputs.append(outputs_prealloc[j])
+            else:
+                out_tensor = self.infer_request.get_output_tensor(j)
+                outputs.append(torch.from_numpy(out_tensor.data).clone())
 
         if len(outputs) == 1:
             return outputs[0]
@@ -238,7 +269,10 @@ def compile_to_npu(model: torch.nn.Module, example_input: Any) -> torch.nn.Modul
             target_device = "CPU"
         else:
             # Add performance hints for NPU if available
-            config = {"PERFORMANCE_HINT": "LATENCY"}
+            config = {
+                "PERFORMANCE_HINT": "LATENCY",
+                "INFERENCE_PRECISION_HINT": "f16"
+            }
 
         logger.info(f"Compiling model for {target_device}...")
         compiled = core.compile_model(ov_model, target_device, config)

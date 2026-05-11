@@ -72,6 +72,14 @@ def get_cache_dir():
     return _CACHE_DIR
 
 
+def set_cache_dir(cache_dir: str):
+    global _CACHE_DIR
+    _CACHE_DIR = cache_dir
+    logger.info(f"Setting NPU cache directory: {cache_dir}")
+    if _C is not None:
+        _C.set_cache_dir(cache_dir)
+
+
 def is_available() -> bool:
     if _C is None:
         return False
@@ -107,6 +115,8 @@ compile = compile_to_npu
 __all__ = [
     "is_available",
     "compile_to_npu",
+    "get_cache_dir",
+    "set_cache_dir",
     "add",
     "sub",
     "mul",

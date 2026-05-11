@@ -2,8 +2,6 @@ from . import _functional as F_base
 from . import autograd as F_auto
 
 # --- Combined API (Autograd-aware) ---
-import torch.fx
-torch.fx.wrap(F_base.update_kv_cache)
 
 # Ops with full autograd (forward on NPU, backward computed on CPU)
 add = F_auto.add
