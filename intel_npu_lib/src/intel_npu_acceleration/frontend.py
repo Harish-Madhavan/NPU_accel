@@ -60,10 +60,14 @@ class NPUGraphModule(torch.nn.Module):
             target_dtype = _OV_TO_NP.get(ov_type)
             if target_dtype is None:
                 str_type = ov_type.get_type_name()
-                if "i32" in str_type: target_dtype = np.int32
-                elif "i64" in str_type: target_dtype = np.int64
-                elif "f16" in str_type: target_dtype = np.float16
-                else: target_dtype = np.float32
+                if "i32" in str_type:
+                    target_dtype = np.int32
+                elif "i64" in str_type:
+                    target_dtype = np.int64
+                elif "f16" in str_type:
+                    target_dtype = np.float16
+                else:
+                    target_dtype = np.float32
             self.target_dtypes.append(target_dtype)
 
         # Pre-compute output properties for zero-copy allocation
@@ -77,10 +81,14 @@ class NPUGraphModule(torch.nn.Module):
                 target_dtype = _OV_TO_NP.get(ov_type)
                 if target_dtype is None:
                     str_type = ov_type.get_type_name()
-                    if "i32" in str_type: target_dtype = np.int32
-                    elif "i64" in str_type: target_dtype = np.int64
-                    elif "f16" in str_type: target_dtype = np.float16
-                    else: target_dtype = np.float32
+                    if "i32" in str_type:
+                        target_dtype = np.int32
+                    elif "i64" in str_type:
+                        target_dtype = np.int64
+                    elif "f16" in str_type:
+                        target_dtype = np.float16
+                    else:
+                        target_dtype = np.float32
                 torch_dtype = torch.from_numpy(np.array(0, dtype=target_dtype)).dtype
                 self.output_info.append((True, shape, torch_dtype))
             else:
