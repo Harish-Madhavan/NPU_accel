@@ -55,8 +55,15 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key, std::sha
         throw std::runtime_error("Model pointer is null but key not found in cache: " + key);
     }
 
-    // Compile model
-    ov::CompiledModel compiled = m_core->compile_model(model, device);
+    // Compile model with performance hints if targeting NPU
+    ov::CompiledModel compiled;
+    if (device == "NPU") {
+        compiled = m_core->compile_model(model, device,
+            ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY),
+            ov::hint::inference_precision(ov::element::f16));
+    } else {
+        compiled = m_core->compile_model(model, device);
+    }
 
     // Evict if cache is full
     if (m_model_cache.size() >= m_max_cache_size) {

@@ -25,3 +25,4 @@ max_pool2d = F_base.max_pool2d
 update_kv_cache = F_base.update_kv_cache
 identity = F_base.identity
 dropout = F_base.dropout
+layer_norm = F_base.layer_norm

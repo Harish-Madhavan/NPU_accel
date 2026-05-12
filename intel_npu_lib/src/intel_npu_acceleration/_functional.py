@@ -194,6 +194,22 @@ def rmsnorm(
     return _C.npu_rmsnorm(input, weight, eps)
 
 
+def layer_norm(
+    input: torch.Tensor,
+    normalized_shape: List[int],
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    if _C is None:
+        return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
+    if weight is None:
+        weight = torch.empty(0, dtype=input.dtype)
+    if bias is None:
+        bias = torch.empty(0, dtype=input.dtype)
+    return _C.npu_layer_norm(input, list(normalized_shape), weight, bias, eps)
+
+
 # ---------------------------------------------------------------------------
 # Shape manipulation
 # ---------------------------------------------------------------------------

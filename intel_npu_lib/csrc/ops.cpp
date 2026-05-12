@@ -247,6 +247,55 @@ torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsil
     return execute_op(key, model, {input, weight});
 }
 
+torch::Tensor npu_layer_norm(torch::Tensor input, std::vector<int64_t> normalized_shape, torch::Tensor weight, torch::Tensor bias, float epsilon) {
+    std::string key = get_key("layernorm", {input, weight, bias}, std::to_string(epsilon));
+
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    ov::Shape input_shape = get_ov_shape(input);
+
+    auto arg_input  = std::make_shared<ov::opset1::Parameter>(ov_type, input_shape);
+    
+    std::vector<torch::Tensor> inputs = {input};
+    ov::ParameterVector params = {arg_input};
+
+    // Calculate axes for reduction based on normalized_shape
+    int64_t rank = input_shape.size();
+    int64_t norm_rank = normalized_shape.size();
+    std::vector<int64_t> axes_vec;
+    for (int64_t i = rank - norm_rank; i < rank; ++i) {
+        axes_vec.push_back(i);
+    }
+    auto axes = ov::opset1::Constant::create(ov::element::i64, {axes_vec.size()}, axes_vec);
+
+    auto mean = std::make_shared<ov::opset1::ReduceMean>(arg_input, axes, true);
+    auto sub = std::make_shared<ov::opset1::Subtract>(arg_input, mean);
+    auto sq = std::make_shared<ov::opset1::Multiply>(sub, sub);
+    auto variance = std::make_shared<ov::opset1::ReduceMean>(sq, axes, true);
+
+    auto eps_const = ov::opset1::Constant::create(ov_type, {}, {epsilon});
+    auto var_eps = std::make_shared<ov::opset1::Add>(variance, eps_const);
+    auto std_dev = std::make_shared<ov::opset1::Sqrt>(var_eps);
+
+    std::shared_ptr<ov::Node> result = std::make_shared<ov::opset1::Divide>(sub, std_dev);
+
+    if (weight.defined() && weight.numel() > 0) {
+        auto arg_weight = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
+        params.push_back(arg_weight);
+        inputs.push_back(weight);
+        result = std::make_shared<ov::opset1::Multiply>(result, arg_weight);
+    }
+
+    if (bias.defined() && bias.numel() > 0) {
+        auto arg_bias = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(bias));
+        params.push_back(arg_bias);
+        inputs.push_back(bias);
+        result = std::make_shared<ov::opset1::Add>(result, arg_bias);
+    }
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, params);
+    return execute_op(key, model, inputs);
+}
+
 torch::Tensor npu_softmax(torch::Tensor a, int64_t dim) {
     if (dim < 0) dim += a.dim();
     std::string key = get_key("softmax", {a}, std::to_string(dim));

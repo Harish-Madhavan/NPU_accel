@@ -308,6 +308,38 @@ def convert_rmsnorm(builder: OVGraphBuilder, node, args, kwargs):
     return ops.multiply(x_norm, weight)
 
 
+@OpRegistry.register_function(torch.nn.functional.layer_norm)
+def convert_layer_norm(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    normalized_shape = args[1]
+    weight = builder.get_input_or_constant(kwargs.get("weight", args[2] if len(args) > 2 else None))
+    bias = builder.get_input_or_constant(kwargs.get("bias", args[3] if len(args) > 3 else None))
+    eps = kwargs.get("eps", args[4] if len(args) > 4 else 1e-5)
+
+    rank = inp.get_output_partial_shape(0).rank.get_length()
+    norm_rank = len(normalized_shape)
+    axes_list = list(range(rank - norm_rank, rank))
+    axes = ops.constant(axes_list, dtype=np.int64)
+
+    mean = ops.reduce_mean(inp, axes, keep_dims=True)
+    sub = ops.subtract(inp, mean)
+    sq = ops.multiply(sub, sub)
+    variance = ops.reduce_mean(sq, axes, keep_dims=True)
+
+    eps_const = ops.constant(eps, dtype=np.float32)
+    var_eps = ops.add(variance, eps_const)
+    std_dev = ops.sqrt(var_eps)
+
+    x_norm = ops.divide(sub, std_dev)
+
+    if weight is not None:
+        x_norm = ops.multiply(x_norm, weight)
+    if bias is not None:
+        x_norm = ops.add(x_norm, bias)
+
+    return x_norm
+
+
 @OpRegistry.register_function(builtins.getattr)
 def convert_getattr(builder: OVGraphBuilder, node, args, kwargs):
     obj_node = args[0]

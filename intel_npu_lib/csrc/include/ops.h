@@ -12,6 +12,7 @@ torch::Tensor npu_relu(torch::Tensor a);
 torch::Tensor npu_gelu(torch::Tensor a);
 torch::Tensor npu_silu(torch::Tensor a);
 torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsilon);
+torch::Tensor npu_layer_norm(torch::Tensor input, std::vector<int64_t> normalized_shape, torch::Tensor weight, torch::Tensor bias, float epsilon);
 torch::Tensor npu_softmax(torch::Tensor a, int64_t dim);
 torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation);
