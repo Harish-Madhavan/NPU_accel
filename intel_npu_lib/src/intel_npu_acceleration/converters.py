@@ -135,6 +135,15 @@ def convert_matmul(builder: OVGraphBuilder, node, args, kwargs):
     inp0 = builder.get_input_or_constant(args[0])
     inp1 = builder.get_input_or_constant(args[1])
 
+    # Check for INT8/UINT8 operands and promote to float16 to trigger NPU INT8 acceleration
+    t0 = inp0.get_element_type().get_type_name()
+    t1 = inp1.get_element_type().get_type_name()
+    
+    if t0 in ["i8", "u8"]:
+        inp0 = ops.convert(inp0, destination_type=np.float16)
+    if t1 in ["i8", "u8"]:
+        inp1 = ops.convert(inp1, destination_type=np.float16)
+
     inp0, inp1 = builder.align_types(inp0, inp1)
 
     return ops.matmul(inp0, inp1, transpose_a=False, transpose_b=False)

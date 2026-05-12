@@ -155,9 +155,23 @@ torch::Tensor execute_unary_op_helper(const std::string& name, torch::Tensor a) 
 template <typename OpT>
 torch::Tensor execute_binary_op_helper(const std::string& name, torch::Tensor a, torch::Tensor b) {
     std::string key = get_key(name, {a, b});
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(b), get_ov_shape(b));
-    auto op = std::make_shared<OpT>(arg_a, arg_b);
+    ov::element::Type type_a = torch_dtype_to_ov(a);
+    ov::element::Type type_b = torch_dtype_to_ov(b);
+    
+    // Determine target execution precision
+    ov::element::Type fp_type = (type_a == ov::element::f32 || type_b == ov::element::f32) 
+                                 ? ov::element::f32 : ov::element::f16;
+                                 
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(type_a, get_ov_shape(a));
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(type_b, get_ov_shape(b));
+    
+    std::shared_ptr<ov::Node> node_a = arg_a;
+    std::shared_ptr<ov::Node> node_b = arg_b;
+    
+    if (type_a != fp_type) node_a = std::make_shared<ov::opset1::Convert>(arg_a, fp_type);
+    if (type_b != fp_type) node_b = std::make_shared<ov::opset1::Convert>(arg_b, fp_type);
+
+    auto op = std::make_shared<OpT>(node_a, node_b);
     auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a, arg_b});
     return execute_op(key, model, {a, b});
 }
@@ -310,20 +324,28 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
     bool has_bias = bias.defined() && bias.numel() > 0;
     std::string key = get_key("linear", {input, weight}, has_bias ? "_bias" : "");
     
-    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    ov::element::Type ov_in_type = torch_dtype_to_ov(input);
+    ov::element::Type ov_w_type  = torch_dtype_to_ov(weight);
     ov::Shape shape_in = get_ov_shape(input);
     ov::Shape shape_w  = get_ov_shape(weight);
     
-    auto arg_in = std::make_shared<ov::opset1::Parameter>(ov_type, shape_in);
-    auto arg_w  = std::make_shared<ov::opset1::Parameter>(ov_type, shape_w);
-    auto matmul = std::make_shared<ov::opset1::MatMul>(arg_in, arg_w, false, true);
+    auto arg_in = std::make_shared<ov::opset1::Parameter>(ov_in_type, shape_in);
+    auto arg_w  = std::make_shared<ov::opset1::Parameter>(ov_w_type, shape_w);
+    
+    std::shared_ptr<ov::Node> weight_node = arg_w;
+    if (ov_in_type != ov_w_type) {
+        // Convert weight to input type (triggers W8A16 hardware acceleration on NPU if weight is i8)
+        weight_node = std::make_shared<ov::opset1::Convert>(arg_w, ov_in_type);
+    }
+    
+    auto matmul = std::make_shared<ov::opset1::MatMul>(arg_in, weight_node, false, true);
     
     std::shared_ptr<ov::Node> result = matmul;
     ov::ParameterVector params = {arg_in, arg_w};
     std::vector<torch::Tensor> inputs = {input, weight};
 
     if (has_bias) {
-        auto arg_b = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(bias));
+        auto arg_b = std::make_shared<ov::opset1::Parameter>(ov_in_type, get_ov_shape(bias));
         result = std::make_shared<ov::opset1::Add>(result, arg_b);
         params.push_back(arg_b);
         inputs.push_back(bias);
