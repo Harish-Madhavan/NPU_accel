@@ -129,7 +129,7 @@ torch::Tensor execute_unary_op_helper(const std::string& name, torch::Tensor a) 
     std::string key = get_key(name, {a});
     auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
     auto op = std::make_shared<OpT>(arg_a);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a});
     return execute_op(key, model, {a});
 }
 
@@ -139,7 +139,7 @@ torch::Tensor execute_binary_op_helper(const std::string& name, torch::Tensor a,
     auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
     auto arg_b = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(b), get_ov_shape(b));
     auto op = std::make_shared<OpT>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a, arg_b});
     return execute_op(key, model, {a, b});
 }
 
@@ -172,7 +172,7 @@ torch::Tensor npu_div(torch::Tensor a, torch::Tensor b) {
     auto arg_a = std::make_shared<ov::opset1::Parameter>(fp_type, shape_a);
     auto arg_b = std::make_shared<ov::opset1::Parameter>(fp_type, shape_b);
     auto op = std::make_shared<ov::opset1::Divide>(arg_a, arg_b);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a, arg_b});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a, arg_b});
     return execute_op(key, model, {a, b});
 }
 
@@ -224,7 +224,7 @@ torch::Tensor npu_rmsnorm(torch::Tensor input, torch::Tensor weight, float epsil
     // 6. Apply Weight (Gain)
     auto output = std::make_shared<ov::opset1::Multiply>(x_normalized, arg_weight);
 
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{output}, ov::ParameterVector{arg_input, arg_weight});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{output}, ov::ParameterVector{arg_input, arg_weight});
     return execute_op(key, model, {input, weight});
 }
 
@@ -233,7 +233,7 @@ torch::Tensor npu_softmax(torch::Tensor a, int64_t dim) {
     std::string key = get_key("softmax", {a}, std::to_string(dim));
     auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
     auto op = std::make_shared<ov::opset1::Softmax>(arg_a, dim);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_a});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a});
     return execute_op(key, model, {a});
 }
 
@@ -261,7 +261,7 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
         inputs.push_back(bias);
     }
     
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{result}, params);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, params);
     return execute_op(key, model, inputs);
 }
 
@@ -273,7 +273,7 @@ torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutatio
     auto arg_input  = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto perm_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{permutation.size()}, permutation);
     auto op    = std::make_shared<ov::opset1::Transpose>(arg_input, perm_const);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input});
     return execute_op(key, model, {input});
 }
 
@@ -285,7 +285,7 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     auto arg_input   = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto shape_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{shape.size()}, shape);
     auto op    = std::make_shared<ov::opset1::Reshape>(arg_input, shape_const, false);
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input});
     return execute_op(key, model, {input});
 }
 
@@ -341,7 +341,7 @@ torch::Tensor npu_scaled_dot_product_attention(
         op = std::make_shared<ov::opset13::ScaledDotProductAttention>(arg_q, arg_k, arg_v, is_causal);
     }
 
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, params);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, params);
     return execute_op(op_key, model, inputs);
 }
 
@@ -417,7 +417,7 @@ torch::Tensor npu_conv2d(
         result = std::make_shared<ov::opset1::Add>(result, bias_4d);
     }
 
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{result}, params);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, params);
     return execute_op(key, model, inputs);
 }
 
@@ -458,6 +458,6 @@ torch::Tensor npu_max_pool2d(
         ov::op::PadType::EXPLICIT
     );
 
-    auto model = std::make_shared<ov::Model>(ov::NodeVector{op}, ov::ParameterVector{arg_input});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input});
     return execute_op(key, model, {input});
 }
