@@ -101,19 +101,38 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
             infer_request.set_input_tensor(i, input_tensor);
         }
         
+        // Pre-allocate output tensor to enable zero-copy if shape is static
+        auto out_port = compiled_model.output(0);
+        auto partial_shape = out_port.get_partial_shape();
+        
+        torch::Tensor result;
+        bool preallocated = false;
+        if (partial_shape.is_static()) {
+            auto output_shape = partial_shape.get_shape();
+            auto output_ov_type = out_port.get_element_type();
+            std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
+            torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
+            result = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
+            ov::Tensor output_tensor(output_ov_type, output_shape, result.data_ptr());
+            infer_request.set_output_tensor(0, output_tensor);
+            preallocated = true;
+        }
+
         infer_request.infer();
         
-        auto output_tensor = infer_request.get_output_tensor();
-        auto output_shape = output_tensor.get_shape();
-        auto output_ov_type = output_tensor.get_element_type();
+        if (!preallocated) {
+            auto output_tensor = infer_request.get_output_tensor();
+            auto output_shape = output_tensor.get_shape();
+            auto output_ov_type = output_tensor.get_element_type();
 
-        std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
-        torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
+            std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
+            torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
 
-        auto result = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
+            result = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
 
-        // Copy back from OV output tensor to the torch result tensor.
-        std::memcpy(result.data_ptr(), output_tensor.data(), output_tensor.get_byte_size());
+            // Fallback: Copy back from OV output tensor to the torch result tensor.
+            std::memcpy(result.data_ptr(), output_tensor.data(), output_tensor.get_byte_size());
+        }
 
         return result;
 
