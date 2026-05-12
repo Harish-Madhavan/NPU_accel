@@ -17,6 +17,9 @@ torch::Tensor npu_softmax(torch::Tensor a, int64_t dim);
 torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation);
 torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape);
+torch::Tensor npu_cat(std::vector<torch::Tensor> tensors, int64_t dim);
+torch::Tensor npu_stack(std::vector<torch::Tensor> tensors, int64_t dim);
+torch::Tensor npu_mean(torch::Tensor input, std::vector<int64_t> dim, bool keepdim);
 
 torch::Tensor npu_scaled_dot_product_attention(
     torch::Tensor query,

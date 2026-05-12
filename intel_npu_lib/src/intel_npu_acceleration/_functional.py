@@ -234,6 +234,28 @@ def reshape(input: torch.Tensor, shape: List[int]) -> torch.Tensor:
     return _C.npu_reshape(input, list(shape))
 
 
+def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    if _C is None:
+        return torch.cat(tensors, dim=dim)
+    return _C.npu_cat(tensors, dim)
+
+
+def stack(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    if _C is None:
+        return torch.stack(tensors, dim=dim)
+    return _C.npu_stack(tensors, dim)
+
+
+def mean(input: torch.Tensor, dim: Optional[List[int]] = None, keepdim: bool = False) -> torch.Tensor:
+    if _C is None:
+        if dim is None:
+            return torch.mean(input)
+        return torch.mean(input, dim=dim, keepdim=keepdim)
+    if dim is None:
+        dim = []
+    return _C.npu_mean(input, dim, keepdim)
+
+
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------

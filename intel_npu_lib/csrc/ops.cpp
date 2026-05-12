@@ -357,6 +357,68 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     return execute_op(key, model, {input});
 }
 
+torch::Tensor npu_cat(std::vector<torch::Tensor> tensors, int64_t dim) {
+    if (tensors.empty()) throw std::runtime_error("npu_cat expects at least one tensor");
+    if (dim < 0) dim += tensors[0].dim();
+    std::string key = get_key("cat", tensors, std::to_string(dim));
+
+    ov::ParameterVector params;
+    ov::OutputVector concat_inputs;
+    
+    for (const auto& t : tensors) {
+        auto param = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(t), get_ov_shape(t));
+        params.push_back(param);
+        concat_inputs.push_back(param);
+    }
+
+    auto concat = std::make_shared<ov::opset1::Concat>(concat_inputs, dim);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{concat}, params);
+    return execute_op(key, model, tensors);
+}
+
+torch::Tensor npu_stack(std::vector<torch::Tensor> tensors, int64_t dim) {
+    if (tensors.empty()) throw std::runtime_error("npu_stack expects at least one tensor");
+    int64_t rank = tensors[0].dim();
+    if (dim < 0) dim += rank + 1;
+    
+    std::string key = get_key("stack", tensors, std::to_string(dim));
+
+    ov::ParameterVector params;
+    ov::OutputVector concat_inputs;
+    
+    for (const auto& t : tensors) {
+        auto param = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(t), get_ov_shape(t));
+        params.push_back(param);
+        
+        auto unsqueeze_dim = ov::opset1::Constant::create(ov::element::i64, {1}, {dim});
+        auto unsqueeze = std::make_shared<ov::opset1::Unsqueeze>(param, unsqueeze_dim);
+        concat_inputs.push_back(unsqueeze);
+    }
+
+    auto concat = std::make_shared<ov::opset1::Concat>(concat_inputs, dim);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{concat}, params);
+    return execute_op(key, model, tensors);
+}
+
+torch::Tensor npu_mean(torch::Tensor input, std::vector<int64_t> dim, bool keepdim) {
+    std::stringstream ss;
+    for (auto d : dim) ss << d << ",";
+    std::string key = get_key("mean", {input}, ss.str() + std::to_string(keepdim));
+
+    auto arg_input = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
+    
+    if (dim.empty()) {
+        int64_t rank = input.dim();
+        for (int64_t i = 0; i < rank; ++i) dim.push_back(i);
+    }
+    
+    auto axes = ov::opset1::Constant::create(ov::element::i64, {dim.size()}, dim);
+    auto reduce = std::make_shared<ov::opset1::ReduceMean>(arg_input, axes, keepdim);
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{reduce}, ov::ParameterVector{arg_input});
+    return execute_op(key, model, {input});
+}
+
 torch::Tensor npu_scaled_dot_product_attention(
     torch::Tensor query,
     torch::Tensor key,
