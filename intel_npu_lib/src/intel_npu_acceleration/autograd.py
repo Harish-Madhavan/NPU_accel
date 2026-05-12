@@ -275,61 +275,61 @@ class NPUConv2d(torch.autograd.Function):
 
 
 def matmul(a, b):
-    if a.requires_grad or b.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
         return NPUMatMul.apply(a, b)
     return F_npu.matmul(a, b)
 
 
 def add(a, b):
-    if a.requires_grad or b.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
         return NPUAdd.apply(a, b)
     return F_npu.add(a, b)
 
 
 def sub(a, b):
-    if a.requires_grad or b.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
         return NPUSub.apply(a, b)
     return F_npu.sub(a, b)
 
 
 def mul(a, b):
-    if a.requires_grad or b.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
         return NPUMul.apply(a, b)
     return F_npu.mul(a, b)
 
 
 def relu(a):
-    if a.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
         return NPUReLU.apply(a)
     return F_npu.relu(a)
 
 
 def gelu(a):
-    if a.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
         return NPUGeLU.apply(a)
     return F_npu.gelu(a)
 
 
 def silu(a):
-    if a.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
         return NPUSiLU.apply(a)
     return F_npu.silu(a)
 
 
 def rmsnorm(input, weight, eps=1e-6):
-    if input.requires_grad or weight.requires_grad:
+    if not isinstance(input, torch.fx.Proxy) and (input.requires_grad or weight.requires_grad):
         return NPURMSNorm.apply(input, weight, eps)
     return F_npu.rmsnorm(input, weight, eps)
 
 
 def softmax(a, dim=-1):
-    if a.requires_grad:
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
         return NPUSoftmax.apply(a, dim)
     return F_npu.softmax(a, dim)
 
 
 def linear(input, weight, bias=None):
-    if (
+    if not isinstance(input, torch.fx.Proxy) and (
         input.requires_grad
         or weight.requires_grad
         or (bias is not None and bias.requires_grad)
@@ -341,11 +341,26 @@ def linear(input, weight, bias=None):
 def conv2d(
     input, weight, bias=None, stride=(1, 1), padding=(0, 0), dilation=(1, 1), groups=1
 ):
-    needs_grad = (
+    if not isinstance(input, torch.fx.Proxy) and (
         input.requires_grad
         or weight.requires_grad
         or (bias is not None and bias.requires_grad)
-    )
-    if needs_grad:
+    ):
         return NPUConv2d.apply(input, weight, bias, stride, padding, dilation, groups)
     return F_npu.conv2d(input, weight, bias, stride, padding, dilation, groups)
+
+
+import torch.fx
+
+# Wrap public functions to prevent FX tracing into requires_grad checks
+torch.fx.wrap(matmul)
+torch.fx.wrap(add)
+torch.fx.wrap(sub)
+torch.fx.wrap(mul)
+torch.fx.wrap(relu)
+torch.fx.wrap(gelu)
+torch.fx.wrap(silu)
+torch.fx.wrap(rmsnorm)
+torch.fx.wrap(softmax)
+torch.fx.wrap(linear)
+torch.fx.wrap(conv2d)

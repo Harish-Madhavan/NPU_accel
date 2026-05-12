@@ -29,3 +29,4 @@ update_kv_cache = F_base.update_kv_cache
 identity = F_base.identity
 dropout = F_base.dropout
 layer_norm = F_base.layer_norm
+scaled_dot_product_attention = F_base.scaled_dot_product_attention

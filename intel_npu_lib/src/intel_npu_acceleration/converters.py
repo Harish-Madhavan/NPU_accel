@@ -169,12 +169,17 @@ def convert_silu(builder: OVGraphBuilder, node, args, kwargs):
     return ops.swish(inp)
 
 
+@OpRegistry.register_function(torch.sqrt)
+def convert_sqrt(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.sqrt(inp)
+
+
 @OpRegistry.register_function(torch.rsqrt)
 def convert_rsqrt(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
-    exp_node = ops.constant([-0.5], dtype=np.float32)
-    inp, exp_node = builder.align_types(inp, exp_node)
-    return ops.power(inp, exp_node)
+    # rsqrt(x) = x^(-0.5)
+    return ops.power(inp, ops.constant([-0.5], dtype=np.float32))
 
 
 @OpRegistry.register_function(torch.where)
@@ -361,13 +366,99 @@ def convert_getattr(builder: OVGraphBuilder, node, args, kwargs):
             raise RuntimeError(f"Cannot get shape for {obj_node.name}: no meta info")
     elif attr_name == "device":
         return ops.constant(np.array([0], dtype=np.int32))
+    elif attr_name == "dtype":
+        # Return a dummy int32 to represent a dtype; most ops handle types automatically in OV
+        return ops.constant(np.array([0], dtype=np.int32))
     raise NotImplementedError(f"getattr({attr_name}) not implemented")
+
+
+@OpRegistry.register_method("reshape", "view")
+def convert_reshape_method(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    # Shape can be passed as multiple args or a single list/tuple
+    if len(args) > 2:
+        shape = args[1:]
+    else:
+        shape = args[1]
+
+    if isinstance(shape, torch.fx.Node):
+        shape_node = builder.get_input_or_constant(shape)
+    elif isinstance(shape, (list, tuple)):
+        shape_nodes = []
+        for s in shape:
+            if isinstance(s, int):
+                shape_nodes.append(ops.constant([s], dtype=np.int64))
+            else:
+                v = builder.get_input_or_constant(s)
+                shape_nodes.append(
+                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
+                )
+        shape_node = ops.concat(shape_nodes, axis=0)
+    else:
+        shape_node = ops.constant(np.array([shape], dtype=np.int64))
+
+    return ops.reshape(inp, shape_node, special_zero=False)
+
+
+@OpRegistry.register_method("expand")
+def convert_expand_method(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    shape = args[1:] if len(args) > 2 else args[1]
+
+    if isinstance(shape, torch.fx.Node):
+        shape_node = builder.get_input_or_constant(shape)
+    elif isinstance(shape, (list, tuple)):
+        shape_nodes = []
+        for s in shape:
+            if isinstance(s, int):
+                shape_nodes.append(ops.constant([s], dtype=np.int64))
+            else:
+                v = builder.get_input_or_constant(s)
+                shape_nodes.append(
+                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
+                )
+        shape_node = ops.concat(shape_nodes, axis=0)
+    else:
+        shape_node = ops.constant(np.array([shape], dtype=np.int64))
+
+    return ops.broadcast(inp, shape_node)
+
+
+@OpRegistry.register_method("transpose")
+def convert_transpose_method(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    dim0, dim1 = args[1], args[2]
+    
+    # Generate permutation
+    rank = len(inp.get_output_partial_shape(0))
+    perm = list(range(rank))
+    perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+    
+    return ops.transpose(inp, ops.constant(np.array(perm, dtype=np.int64)))
+
+
+@OpRegistry.register_method("permute")
+def convert_permute_method(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    dims = args[1:] if len(args) > 2 else args[1]
+    return ops.transpose(inp, ops.constant(np.array(dims, dtype=np.int64)))
+
+
+@OpRegistry.register_method("contiguous", "type_as", "to", "float", "half")
+def convert_identity_methods(builder: OVGraphBuilder, node, args, kwargs):
+    # These are mostly identity or type casts which we handle via align_types/auto-conversion
+    return builder.get_input_or_constant(args[0])
 
 
 @OpRegistry.register_function(torch.full)
 def convert_full(builder: OVGraphBuilder, node, args, kwargs):
     size = args[0]
     fill_value = args[1]
+    dtype = kwargs.get("dtype", torch.float32)
+
+    np_dtype = np.float32
+    if dtype == torch.int64:
+        np_dtype = np.int64
 
     if isinstance(size, (tuple, list)):
         shape_nodes = []
@@ -377,15 +468,13 @@ def convert_full(builder: OVGraphBuilder, node, args, kwargs):
             else:
                 v = builder.get_input_or_constant(s)
                 shape_nodes.append(
-                    ops.reshape(
-                        v, ops.constant([1], dtype=np.int64), special_zero=False
-                    )
+                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
                 )
         shape_node = ops.concat(shape_nodes, axis=0)
     else:
         shape_node = builder.get_input_or_constant(size)
 
-    val_node = builder.get_input_or_constant(fill_value)
+    val_node = ops.constant(np.array([fill_value], dtype=np_dtype))
     return ops.broadcast(val_node, shape_node)
 
 
