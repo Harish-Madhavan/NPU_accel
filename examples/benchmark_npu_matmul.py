@@ -1,5 +1,6 @@
 import torch
 import time
+import math
 import intel_npu_acceleration as npu_compiler
 import argparse
 
@@ -9,104 +10,151 @@ class MatMulModel(torch.nn.Module):
         return torch.matmul(x, y)
 
 
-def run_benchmark(size=4096, iterations=50, warmup=10, dtype_str="float32"):
-    print(f"Benchmarking NPU MatMul with size {size}x{size} using {dtype_str}...")
+def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="float16", seed=42):
+    torch.manual_seed(seed)
+    
+    print("=" * 70)
+    print("              INTEL NPU MATMUL PERFORMANCE BENCHMARK             ")
+    print("=" * 70)
+    print(f"PyTorch Version  : {torch.__version__}")
+    
+    npu_available = npu_compiler.is_available()
+    print(f"NPU Hardware     : {'Detected' if npu_available else 'Not Detected (CPU Fallback)'}")
+    
+    # Inputs
+    print(f"Matrix Shape     : ({m}x{n}) x ({n}x{k}) -> ({m}x{k})")
+    print(f"Data Type        : {dtype_str}")
+    print(f"Iterations       : {iterations} (Warmup: {warmup})")
+    print("-" * 70)
+
+    # Prepare input tensors
+    if dtype_str == "float16":
+        dtype = torch.float16
+        a = torch.randn(m, n, dtype=dtype)
+        b = torch.randn(n, k, dtype=dtype)
+    elif dtype_str == "int8":
+        dtype = torch.int8
+        a = torch.randint(-128, 127, (m, n), dtype=dtype)
+        b = torch.randint(-128, 127, (n, k), dtype=dtype)
+    else:
+        dtype = torch.float32
+        a = torch.randn(m, n, dtype=dtype)
+        b = torch.randn(n, k, dtype=dtype)
 
     model = MatMulModel()
     model.eval()
 
-    # Inputs
-    if dtype_str == "float16":
-        dtype = torch.float16
-        a = torch.randn(size, size, dtype=dtype)
-        b = torch.randn(size, size, dtype=dtype)
-    elif dtype_str == "int8":
-        dtype = torch.int8
-        a = torch.randint(-128, 127, (size, size), dtype=dtype)
-        b = torch.randint(-128, 127, (size, size), dtype=dtype)
-    else:
-        dtype = torch.float32
-        a = torch.randn(size, size, dtype=dtype)
-        b = torch.randn(size, size, dtype=dtype)
-
-    # Compile
-    print("Compiling to NPU (First time)...")
+    # Compile to NPU
+    print("Compiling model for NPU...")
     t0 = time.time()
     try:
         npu_model = npu_compiler.compile_to_npu(model, (a, b))
     except Exception as e:
-        print(f"Compilation failed: {e}")
+        print(f"NPU compilation failed: {e}")
         return
-    print(f"Compilation finished in {time.time() - t0:.2f}s")
+    print(f"Ahead-of-Time NPU Compilation finished in {time.time() - t0:.2f}s")
 
-    print("Compiling to NPU (Second time - Should be cached)...")
-    t1 = time.time()
-    npu_model = npu_compiler.compile_to_npu(model, (a, b))
-    print(f"Second compilation finished in {time.time() - t1:.4f}s")
-
-    # Warmup
-    print(f"Warming up ({warmup} iterations)...")
+    # Warmup NPU
+    print(f"Warming up NPU ({warmup} iterations)...")
     for _ in range(warmup):
         _ = npu_model(a, b)
 
-    # Benchmark
-    print(f"Running stress test ({iterations} iterations)...")
-    start_time = time.time()
+    # NPU Stress iterations
+    print(f"Running NPU stress test ({iterations} iterations)...")
+    npu_latencies = []
     for i in range(iterations):
+        t_start = time.time()
         _ = npu_model(a, b)
-        # Optional: Print progress every 10%
-        if iterations >= 10 and (i + 1) % (iterations // 10) == 0:
-            print(f"Progress: {i + 1}/{iterations}")
+        t_end = time.time()
+        npu_latencies.append((t_end - t_start) * 1000.0)  # ms
+        
+        if iterations >= 10 and (i + 1) % (iterations // 5) == 0:
+            print(f"  Progress: {i + 1:3d}/{iterations:3d}")
 
-    end_time = time.time()
+    # NPU statistics
+    avg_npu = sum(npu_latencies) / iterations
+    min_npu = min(npu_latencies)
+    max_npu = max(npu_latencies)
+    var_npu = sum((x - avg_npu) ** 2 for x in npu_latencies) / iterations
+    std_npu = math.sqrt(var_npu)
 
-    total_time = end_time - start_time
-    avg_time = total_time / iterations
+    # Multiply-accumulate FLOPs: 2 * M * N * K
+    ops = 2 * m * n * k
+    avg_sec = avg_npu / 1000.0
+    gops = (ops / avg_sec) / 1e9 if avg_sec > 0 else 0
+    tops = (ops / avg_sec) / 1e12 if avg_sec > 0 else 0
 
-    # OPS calculation: 2 * N^3 for matrix multiplication (NxN * NxN)
-    ops = 2 * (size**3)
-    flops = ops / avg_time
-    gflops = flops / 1e9
-    tflops = flops / 1e12
+    print("\n" + "=" * 70)
+    print("                              NPU RESULTS                             ")
+    print("=" * 70)
+    print(f"Average Latency  : {avg_npu:.3f} ms")
+    print(f"Latency Range    : {min_npu:.3f} ms - {max_npu:.3f} ms")
+    print(f"Latency StdDev   : {std_npu:.3f} ms (Jitter: {std_npu / avg_npu * 100.0:.2f}%)")
+    print(f"Throughput       : {gops:.2f} GOPS ({tops:.4f} TOPS)")
+    print("=" * 70)
 
-    print("\nResults:")
-    print(f"Matrix Size: {size}x{size} ({dtype_str})")
-    print(f"Total Time: {total_time:.4f}s")
-    print(f"Avg Latency: {avg_time * 1000:.2f} ms")
-    print(f"Throughput: {gflops:.2f} GOPS ({tflops:.4f} TOPS)")
-
-    # CPU Comparison (Optional, for small sizes)
+    # CPU Comparison (if float32 or float16)
     if dtype_str != "int8":
-        print("\nComparing with CPU (PyTorch)...")
-        start_cpu = time.time()
-        for _ in range(5):  # Run fewer iters for CPU
+        print("\nRunning CPU Comparison (PyTorch FP32/FP16 native)...")
+        # CPU Warmup
+        print(f"Warming up CPU ({min(5, warmup)} iterations)...")
+        for _ in range(min(5, warmup)):
             torch.matmul(a, b)
-        avg_cpu = (time.time() - start_cpu) / 5
-        print(f"CPU Avg Latency: {avg_cpu * 1000:.2f} ms")
-        print(f"Speedup vs CPU: {avg_cpu / avg_time:.2f}x")
-    elif dtype_str == "int8":
-        print("\nSkipping CPU comparison for int8.")
+
+        # CPU Benchmark
+        cpu_iters = min(10, iterations)
+        print(f"Running CPU test ({cpu_iters} iterations)...")
+        cpu_latencies = []
+        for _ in range(cpu_iters):
+            t_start = time.time()
+            torch.matmul(a, b)
+            t_end = time.time()
+            cpu_latencies.append((t_end - t_start) * 1000.0)
+
+        avg_cpu = sum(cpu_latencies) / cpu_iters
+        min_cpu = min(cpu_latencies)
+        max_cpu = max(cpu_latencies)
+        var_cpu = sum((x - avg_cpu) ** 2 for x in cpu_latencies) / cpu_iters
+        std_cpu = math.sqrt(var_cpu)
+
+        speedup = avg_cpu / avg_npu if avg_npu > 0 else 0
+
+        print("\n" + "=" * 70)
+        print("                              CPU RESULTS                             ")
+        print("=" * 70)
+        print(f"Average Latency  : {avg_cpu:.3f} ms")
+        print(f"Latency Range    : {min_cpu:.3f} ms - {max_cpu:.3f} ms")
+        print(f"Latency StdDev   : {std_cpu:.3f} ms")
+        print(f"Speedup vs CPU   : {speedup:.2f}x")
+        print("=" * 70 + "\n")
+    else:
+        print("\nSkipping CPU comparison for INT8 (PyTorch CPU does not natively support direct eager i8 matmul).\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Intel NPU MatMul Stress Test")
-    parser.add_argument(
-        "--size", type=int, default=2048, help="Matrix size (NxN). Default: 1024"
-    )
-    parser.add_argument(
-        "--iters",
-        type=int,
-        default=50,
-        help="Number of benchmark iterations. Default: 50",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float16",
-        choices=["float32", "float16", "int8"],
-        help="Data type. Default: float32",
-    )
+    parser = argparse.ArgumentParser(description="Intel NPU MatMul Stress & Benchmark Test")
+    parser.add_argument("--size", type=int, default=None, help="Matrix dimension (NxN). Overrides --m, --n, --k if set.")
+    parser.add_argument("--m", type=int, default=2048, help="Matrix M dimension (Rows of A)")
+    parser.add_argument("--n", type=int, default=2048, help="Matrix N dimension (Cols of A / Rows of B)")
+    parser.add_argument("--k", type=int, default=2048, help="Matrix K dimension (Cols of B)")
+    parser.add_argument("--iters", type=int, default=50, help="Number of benchmark iterations")
+    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float32", "float16", "int8"], help="Data type")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
 
-    run_benchmark(size=args.size, iterations=args.iters, dtype_str=args.dtype)
+    # Use --size if set to override m, n, k
+    m_val = args.size if args.size is not None else args.m
+    n_val = args.size if args.size is not None else args.n
+    k_val = args.size if args.size is not None else args.k
+
+    run_benchmark(
+        m=m_val,
+        n=n_val,
+        k=k_val,
+        iterations=args.iters,
+        warmup=args.warmup,
+        dtype_str=args.dtype,
+        seed=args.seed
+    )

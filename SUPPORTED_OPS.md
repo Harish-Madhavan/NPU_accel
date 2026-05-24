@@ -7,6 +7,7 @@ The `intel_npu_lib` is a custom PyTorch extension designed to accelerate tensor 
 The library operates on two primary levels:
 1. **Eager Mode Execution (`functional.py` & `csrc/ops.cpp`)**: Overrides basic PyTorch functions to execute directly on the NPU via C++ bindings. This uses OpenVINO's `Core::compile_model` with `LATENCY` and `f16` hints. It features true zero-copy outputs where OpenVINO writes results directly to pre-allocated `torch::Tensor` memory.
 2. **Graph Compilation Mode (`frontend.py` & `converters.py`)**: Uses `torch.fx` to trace entire models (like LLMs or Vision models). It builds a holistic OpenVINO graph, avoiding Python dispatch overhead and enabling massive operator fusion.
+3. **Level Zero Backend Optimizations**: The library explicitly utilizes the Intel Level Zero (OneCompute) interface for low-level NPU communication. This includes hardware turbo-boost, multi-tiling compilation, and persistent InferRequest caching to minimize synchronization overhead between CPU and NPU.
 
 ---
 
@@ -35,8 +36,9 @@ The following table lists the operations supported by the NPU library, comparing
 | :--- | :---: | :---: | :--- |
 | `torch.matmul`, `torch.mm` | ✅ | ✅ | |
 | `torch.nn.functional.linear` | ✅ | ✅ | Decomposed to `MatMul + Add` in FX graph. |
-| `torch.nn.functional.conv2d` | ✅ | ❌ | Currently eager-only dispatch support. |
-| `torch.nn.functional.max_pool2d` | ✅ | ❌ | |
+| `torch.nn.functional.conv2d` | ✅ | ✅ | |
+| `torch.nn.functional.max_pool2d` | ✅ | ✅ | |
+| `torch.nn.functional.avg_pool2d` | ❌ | ✅ | |
 | `torch.nn.functional.scaled_dot_product_attention` | ✅ | ✅ | Natively uses OpenVINO's SDPA node. |
 | `torch.nn.functional.dropout` | ✅ | ✅ | Treated as Identity (No-op) during inference. |
 
@@ -47,6 +49,7 @@ The following table lists the operations supported by the NPU library, comparing
 | `torch.nn.functional.gelu` | ✅ | ✅ | Supports both `erf` and `tanh` approximations. |
 | `torch.nn.functional.silu` | ✅ | ✅ | Maps to OpenVINO `swish` operation. |
 | `torch.softmax`, `F.softmax` | ✅ | ✅ | |
+| `torch.nn.functional.batch_norm` | ❌ | ✅ | |
 | `rmsnorm` (Custom) | ✅ | ✅ | Manually mapped using Variance, Mean, Divide. |
 | `torch.nn.functional.layer_norm` | ✅ | ✅ | Manually mapped using Variance, Mean, Divide. |
 
@@ -55,6 +58,7 @@ The following table lists the operations supported by the NPU library, comparing
 | :--- | :---: | :---: | :--- |
 | `torch.reshape`, `view` | ✅ | ✅ | |
 | `torch.transpose` | ✅ | ✅ | |
+| `torch.squeeze`, `unsqueeze` | ❌ | ✅ | |
 | `torch.cat`, `torch.stack` | ✅ | ✅ | |
 | `torch.mean` | ✅ | ✅ | |
 | `torch.zeros`, `ones`, `full` | ❌ | ✅ | Supports dynamic sizing from FX Nodes. |

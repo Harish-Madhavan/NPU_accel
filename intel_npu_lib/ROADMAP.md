@@ -10,7 +10,7 @@ This roadmap outlines the strategic direction for transforming the prototype int
     - [x] Clean up root directory artifacts (`build/` folder).
 - **Code Quality**:
     - [x] **Logging**: Replace `std::cout` and `print()` debugging with a proper logging framework (spdlog for C++, `logging` module for Python).
-    - [ ] **Formatting**: Enforce `clang-format` for C++ and `ruff`/`black` for Python.
+    - [x] **Formatting**: Enforce `clang-format` for C++ and `ruff`/`black` for Python.
     - [x] **Type Safety**: Add type hints to all Python functions and run `mypy` validation.
 - **C++ Refactoring**:
     - [x] **Singleton Pattern**: Encapsulate global state (`g_core`, `g_model_cache`) into a thread-safe `NPUBackend` singleton class.

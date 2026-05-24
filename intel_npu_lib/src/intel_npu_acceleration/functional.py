@@ -1,3 +1,4 @@
+import torch.fx
 from . import _functional as F_base
 from . import autograd as F_auto
 
@@ -26,7 +27,10 @@ stack = F_base.stack
 mean = F_base.mean
 max_pool2d = F_base.max_pool2d
 update_kv_cache = F_base.update_kv_cache
+quantized_linear = F_base.quantized_linear
 identity = F_base.identity
 dropout = F_base.dropout
 layer_norm = F_base.layer_norm
 scaled_dot_product_attention = F_base.scaled_dot_product_attention
+
+torch.fx.wrap(quantized_linear)

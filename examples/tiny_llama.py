@@ -3,7 +3,9 @@ import torch.nn as nn
 from typing import Optional, List
 from dataclasses import dataclass
 import math
+import time
 import intel_npu_acceleration.functional as n_f
+import intel_npu_acceleration as npu_compiler
 
 
 @dataclass
@@ -12,7 +14,7 @@ class LlamaConfig:
     n_layers: int = 2
     n_heads: int = 4
     n_kv_heads: int = 4
-    vocab_size: int = 128
+    vocab_size: int = 128  # ASCII Range
     multiple_of: int = 4
     norm_eps: float = 1e-5
     max_seq_len: int = 128
@@ -33,14 +35,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
-    # Return cos and sin
     return torch.cos(freqs), torch.sin(freqs)
 
 
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    # x: (bsz, seqlen, n_heads, head_dim)
-    # cos, sin: (seqlen, head_dim/2) -> need broadcasting
-
     d = x.shape[-1]
     x1 = x[..., : d // 2]
     x2 = x[..., d // 2 :]
@@ -55,7 +53,6 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -141,7 +138,6 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        # silu(w1(x)) * w3(x) is the SwiGLU pattern
         return self.w2(n_f.silu(self.w1(x)) * self.w3(x))
 
 
@@ -199,7 +195,6 @@ class Llama(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        # Return cos, sin
         self.freqs_cos, self.freqs_sin = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
@@ -216,7 +211,6 @@ class Llama(nn.Module):
         freqs_cos = self.freqs_cos.to(h.device)
         freqs_sin = self.freqs_sin.to(h.device)
 
-        # Use arange for slicing with dynamic shapes (FX proxies)
         idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
         freqs_cos = freqs_cos[idx]
         freqs_sin = freqs_sin[idx]
@@ -228,7 +222,6 @@ class Llama(nn.Module):
         for i, layer in enumerate(self.layers):
             ck, cv = None, None
             if kv_cache is not None:
-                # kv_cache shape: (N_Layers * 2, B, MaxSeqLen, H, D)
                 ck = kv_cache[2 * i]
                 cv = kv_cache[2 * i + 1]
 
@@ -255,29 +248,24 @@ def quantize_to_int8(model: nn.Module):
     with torch.no_grad():
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
-                # Scale to [-128, 127]
                 w = module.weight.data
                 scale = w.abs().max() / 127.0
                 quantized_w = (w / scale).round().clamp(-128, 127).to(torch.int8)
                 
-                # Replace weight with a non-gradient integer tensor
-                # We use .data to bypass parameter checks
                 module.weight.requires_grad = False
                 module.weight.data = quantized_w
-                
-                # Store scale for later
                 setattr(module, "weight_scale", scale)
     return model
 
 
-def test_llama_impl():
-    conf = LlamaConfig(dim=256, n_layers=4, n_heads=8)
-    model = Llama(conf)
-    model.eval()
-
-    # Test Input
-    x = torch.randint(0, conf.vocab_size, (1, 10))
-    start_pos = 0
+def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig):
+    # Convert characters to ASCII integers
+    tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
+    if not tokens:
+        tokens = [32]  # space
+        
+    print(f"  Prompt tokens: {tokens}")
+    print(f"  Generated Text : '{prompt}", end="", flush=True)
 
     # Initialize Cache (N_Layers * 2, B, MaxSeqLen, H, D)
     kv_cache = torch.zeros(
@@ -288,64 +276,106 @@ def test_llama_impl():
         conf.dim // conf.n_heads,
     )
 
-    print("Running on CPU...")
-    with torch.no_grad():
-        logits_cpu, cache_cpu = model(x, start_pos, kv_cache)
-    print(f"CPU Logits shape: {logits_cpu.shape}")
-    print(f"CPU Cache shape: {cache_cpu.shape}")
-
-    # Compile to NPU
-    try:
-        import intel_npu_acceleration as npu_compiler
-        import time
-
-        print("\nCompiling to NPU (FP16)...")
-        t0 = time.time()
-        npu_model_fp16 = npu_compiler.compile_to_npu(model, (x, start_pos, kv_cache))
-        print(f"FP16 Compilation finished in {time.time() - t0:.2f}s")
-
-        print("Running FP16 on NPU...")
-        # Warmup
-        for _ in range(5):
-            _ = npu_model_fp16(x, start_pos, kv_cache)
+    t_start = time.time()
+    
+    # 1. Prefill Phase (fed token-by-token to maintain static shape [1, 1])
+    # Feed prompt tokens one-by-one to populate KV cache
+    for start_pos, tok_id in enumerate(tokens[:-1]):
+        input_t = torch.tensor([[tok_id]], dtype=torch.long)
+        _, kv_cache = npu_model(input_t, start_pos, kv_cache)
+        
+    # The last token of the prompt will produce the first generated token
+    next_token = tokens[-1]
+    start_pos = len(tokens) - 1
+    
+    # 2. Decode Phase
+    latencies = []
+    for step in range(max_gen_len):
+        current_pos = start_pos + step
+        if current_pos >= conf.max_seq_len:
+            break
+            
+        input_t = torch.tensor([[next_token]], dtype=torch.long)
         
         t0 = time.time()
-        for _ in range(20):
-            logits_npu, cache_npu = npu_model_fp16(x, start_pos, kv_cache)
-        print(f"NPU FP16 Avg Inference time: {(time.time() - t0) / 20 * 1000:.2f} ms")
+        logits, kv_cache = npu_model(input_t, current_pos, kv_cache)
+        t1 = time.time()
+        latencies.append((t1 - t0) * 1000.0)
 
-        # INT8 Test
-        print("\nQuantizing model to INT8...")
-        model_int8 = quantize_to_int8(model)
+        # Greedy decoding: pick highest logit index
+        next_token = torch.argmax(logits[0, -1]).item()
         
-        print("Compiling to NPU (INT8)...")
-        t0 = time.time()
-        npu_model_int8 = npu_compiler.compile_to_npu(model_int8, (x, start_pos, kv_cache))
-        print(f"INT8 Compilation finished in {time.time() - t0:.2f}s")
+        # Safe ASCII decode
+        char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
+        print(char, end="", flush=True)
+        time.sleep(0.015)  # Fast typing effect
 
-        print("Running INT8 on NPU...")
-        # Warmup
-        for _ in range(5):
-            _ = npu_model_int8(x, start_pos, kv_cache)
+    t_total = time.time() - t_start
+    avg_step = sum(latencies) / len(latencies) if latencies else 0
+    print(f"'\n  [Metrics] Generation finished in {t_total:.2f}s | Avg decode step: {avg_step:.2f} ms")
+    return avg_step
 
-        t0 = time.time()
-        for _ in range(20):
-            logits_int8, cache_int8 = npu_model_int8(x, start_pos, kv_cache)
-        print(f"NPU INT8 Avg Inference time: {(time.time() - t0) / 20 * 1000:.2f} ms")
 
-        if logits_cpu.shape == logits_npu.shape:
-            print("\nLogits Shape check PASSED")
-        else:
-            print(f"\nLogits Shape check FAILED")
+def main():
+    print("==========================================================")
+    print("      Intel NPU Tiny LLaMA Autoregressive Text Gen        ")
+    print("==========================================================")
 
-    except ImportError:
-        print("Intel NPU library not found. Skipping NPU test.")
-    except Exception as e:
-        print(f"NPU Test Failed: {e}")
-        import traceback
+    # Initialize a tiny model
+    conf = LlamaConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=4)
+    model = Llama(conf)
+    model.eval()
 
-        traceback.print_exc()
+    # Define a visual seed
+    torch.manual_seed(42)
+
+    prompt = "Intel NPU:"
+    max_gen_len = 30
+
+    # We compile the graph using a static shape (1, 1)
+    compile_input_token = torch.tensor([[65]], dtype=torch.long)
+    compile_start_pos = 0
+    compile_cache = torch.zeros(
+        conf.n_layers * 2,
+        1,
+        conf.max_seq_len,
+        conf.n_kv_heads,
+        conf.dim // conf.n_heads,
+    )
+
+    # Compile FP16 model
+    print("\n[Step 1] Compiling Tiny LLaMA FP16 model for NPU...")
+    t0 = time.time()
+    npu_model_fp16 = npu_compiler.compile_to_npu(model, (compile_input_token, compile_start_pos, compile_cache))
+    print(f"Compilation finished in {time.time() - t0:.2f}s.")
+
+    print("\n[Step 2] Executing Autoregressive Text Generation (NPU FP16):")
+    fp16_latency = run_text_generation(npu_model_fp16, prompt, max_gen_len, conf)
+
+    # Compile INT8 quantized model
+    print("\n[Step 3] Simulating Weight-Only INT8 Quantization...")
+    model_int8 = quantize_to_int8(model)
+
+    print("\n[Step 4] Compiling Tiny LLaMA INT8 model for NPU...")
+    t0 = time.time()
+    npu_model_int8 = npu_compiler.compile_to_npu(model_int8, (compile_input_token, compile_start_pos, compile_cache))
+    print(f"Compilation finished in {time.time() - t0:.2f}s.")
+
+    print("\n[Step 5] Executing Autoregressive Text Generation (NPU INT8):")
+    int8_latency = run_text_generation(npu_model_int8, prompt, max_gen_len, conf)
+
+    # Comparison summary
+    print("\n" + "=" * 60)
+    print("                LLaMA GENERATION LATENCY SUMMARY                ")
+    print("=" * 60)
+    print(f"| Precision Target         | Avg Decode Latency (per Token)  |")
+    print("-" * 60)
+    print(f"| NPU FP16                 | {fp16_latency:25.2f} ms |")
+    print(f"| NPU INT8 (Weight-Only)   | {int8_latency:25.2f} ms |")
+    print("=" * 60)
+    speedup = fp16_latency / int8_latency if int8_latency > 0 else 0
+    print(f"INT8 speedup factor: {speedup:.2f}x\n")
 
 
 if __name__ == "__main__":
-    test_llama_impl()
+    main()

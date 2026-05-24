@@ -44,6 +44,31 @@ class TestKVCache(unittest.TestCase):
         expected[:, start_pos : start_pos + seq_len] = update
         self.assertTrue(torch.allclose(out_npu, expected, atol=1e-3, rtol=1e-3))
 
+    def test_kv_update_eager(self):
+        # Test direct eager execution with the functional interface
+        B, Max, H, D = 2, 128, 8, 64
+        cache = torch.randn(B, Max, H, D, dtype=torch.float32)
+
+        # 1. Test basic eager update
+        start_pos = 16
+        seq_len = 8
+        update = torch.randn(B, seq_len, H, D, dtype=torch.float32)
+
+        out_eager = update_kv_cache(cache, update, start_pos)
+
+        expected = cache.clone()
+        expected[:, start_pos : start_pos + seq_len] = update
+        self.assertTrue(torch.allclose(out_eager, expected, atol=1e-3, rtol=1e-3))
+
+        # 2. Test eager update with float16
+        cache_f16 = cache.half()
+        update_f16 = update.half()
+        out_eager_f16 = update_kv_cache(cache_f16, update_f16, start_pos)
+        self.assertEqual(out_eager_f16.dtype, torch.float16)
+        self.assertTrue(
+            torch.allclose(out_eager_f16.float(), expected, atol=1e-2, rtol=1e-2)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

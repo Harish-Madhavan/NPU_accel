@@ -24,4 +24,4 @@ if exist "%VCVARS_PATH%" (
 SET DISTUTILS_USE_SDK=1
 cd /d "%~dp0intel_npu_lib"
 echo Building and installing intel_npu_lib in development mode...
-pip install -e .[dev]
+python setup.py build_ext --inplace > build_log.txt 2>&1

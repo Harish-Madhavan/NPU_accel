@@ -14,6 +14,7 @@ This is an internal module. External code should use `functional.py` instead
 """
 
 import torch
+import torch.fx
 from typing import Optional, List
 import logging
 
@@ -57,6 +58,16 @@ def _restore_dtype(result: torch.Tensor, original_dtype: torch.dtype) -> torch.T
     return result.to(original_dtype)
 
 
+def _is_proxy(*args) -> bool:
+    for arg in args:
+        if isinstance(arg, torch.fx.Proxy):
+            return True
+        if isinstance(arg, (list, tuple)):
+            if _is_proxy(*arg):
+                return True
+    return False
+
+
 def _promote_binary(a: torch.Tensor, b: torch.Tensor):
     """
     Ensure both tensors share a common dtype that the C++ layer can handle.
@@ -90,35 +101,35 @@ def _promote_binary(a: torch.Tensor, b: torch.Tensor):
 
 
 def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a, b):
         return torch.add(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_add(a, b), orig)
 
 
 def sub(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a, b):
         return torch.sub(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_sub(a, b), orig)
 
 
 def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a, b):
         return torch.mul(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_mul(a, b), orig)
 
 
 def div(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a, b):
         return torch.div(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_div(a, b), orig)
 
 
 def neg(a: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a):
         return torch.neg(a)
     return _C.npu_neg(a)
 
@@ -129,7 +140,7 @@ def neg(a: torch.Tensor) -> torch.Tensor:
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a, b):
         return torch.matmul(a, b)
     a, b, orig = _promote_binary(a, b)
     return _restore_dtype(_C.npu_matmul(a, b), orig)
@@ -140,7 +151,11 @@ def linear(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if _C is None:
+    if (
+        _C is None
+        or isinstance(input, torch.fx.Proxy)
+        or isinstance(weight, torch.fx.Proxy)
+    ):
         return torch.nn.functional.linear(input, weight, bias)
     if bias is None:
         # C++ extension expects a bias tensor; pass an empty one if None
@@ -154,25 +169,25 @@ def linear(
 
 
 def relu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or isinstance(a, torch.fx.Proxy):
         return torch.relu(a)
     return _C.npu_relu(a)
 
 
 def gelu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a):
         return torch.nn.functional.gelu(a)
     return _C.npu_gelu(a)
 
 
 def silu(a: torch.Tensor) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(a):
         return torch.nn.functional.silu(a)
     return _C.npu_silu(a)
 
 
 def softmax(a: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    if _C is None:
+    if _C is None or isinstance(a, torch.fx.Proxy):
         return torch.nn.functional.softmax(a, dim=dim)
     return _C.npu_softmax(a, dim)
 
@@ -187,7 +202,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(input, weight):
         # Pure-PyTorch fallback
         rms = torch.sqrt(input.float().pow(2).mean(-1, keepdim=True) + eps)
         return ((input.float() / rms) * weight.float()).to(input.dtype)
@@ -201,8 +216,10 @@ def layer_norm(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    if _C is None:
-        return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
+    if _C is None or _is_proxy(input, weight, bias):
+        return torch.nn.functional.layer_norm(
+            input, normalized_shape, weight, bias, eps
+        )
     if weight is None:
         weight = torch.empty(0, dtype=input.dtype)
     if bias is None:
@@ -216,7 +233,7 @@ def layer_norm(
 
 
 def transpose(input: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(input):
         return torch.transpose(input, dim0, dim1)
     rank = input.dim()
     if dim0 < 0:
@@ -229,25 +246,27 @@ def transpose(input: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
 
 
 def reshape(input: torch.Tensor, shape: List[int]) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(input):
         return torch.reshape(input, shape)
     return _C.npu_reshape(input, list(shape))
 
 
 def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(*tensors):
         return torch.cat(tensors, dim=dim)
     return _C.npu_cat(tensors, dim)
 
 
 def stack(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(*tensors):
         return torch.stack(tensors, dim=dim)
     return _C.npu_stack(tensors, dim)
 
 
-def mean(input: torch.Tensor, dim: Optional[List[int]] = None, keepdim: bool = False) -> torch.Tensor:
-    if _C is None:
+def mean(
+    input: torch.Tensor, dim: Optional[List[int]] = None, keepdim: bool = False
+) -> torch.Tensor:
+    if _C is None or _is_proxy(input):
         if dim is None:
             return torch.mean(input)
         return torch.mean(input, dim=dim, keepdim=keepdim)
@@ -270,7 +289,7 @@ def scaled_dot_product_attention(
     is_causal: bool = False,
     scale: float = 0.0,
 ) -> torch.Tensor:
-    if _C is None:
+    if _C is None or _is_proxy(query, key, value, attn_mask):
         return torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
@@ -291,15 +310,77 @@ def scaled_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 
-
 def update_kv_cache(
     cache: torch.Tensor,
     new_kv: torch.Tensor,
     position: int,
 ) -> torch.Tensor:
-    seq_len = new_kv.shape[1]
-    indices = torch.arange(position, position + seq_len, dtype=torch.long)
-    return cache.index_copy(1, indices, new_kv)
+    if (
+        _C is None
+        or isinstance(cache, torch.fx.Proxy)
+        or isinstance(new_kv, torch.fx.Proxy)
+        or isinstance(position, torch.fx.Proxy)
+    ):
+        seq_len = new_kv.shape[1]
+        if isinstance(position, (int, float)):
+            indices = torch.arange(position, position + seq_len, dtype=torch.long)
+        elif isinstance(position, torch.Tensor) and not isinstance(
+            position, torch.fx.Proxy
+        ):
+            indices = torch.arange(
+                position.item(), position.item() + seq_len, dtype=torch.long
+            )
+        else:
+            indices = (
+                torch.arange(seq_len, dtype=torch.long, device=new_kv.device) + position
+            )
+        return cache.index_copy(1, indices, new_kv)
+
+    if isinstance(position, int):
+        pos_tensor = torch.tensor(position, dtype=torch.long, device=cache.device)
+    else:
+        if isinstance(position, torch.Tensor) and position.dim() > 0:
+            pos_tensor = position.squeeze()
+        else:
+            pos_tensor = position
+
+    return _C.npu_update_kv_cache(cache, new_kv, pos_tensor)
+
+
+def quantized_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    is_int4 = (
+        weight.dtype == torch.uint8
+        and len(weight.shape) == 2
+        and weight.shape[1] == input.shape[-1] // 2
+    )
+
+    if _C is None:
+        if is_int4:
+            w_odd = torch.floor_divide(weight, 16)
+            w_even = weight - w_odd * 16
+            w_unpacked = torch.stack([w_even, w_odd], dim=-1).view(weight.shape[0], -1)
+            w_float = w_unpacked.float()
+        else:
+            w_float = weight.float()
+
+        if zero_point is not None and zero_point.numel() > 0:
+            w_float = w_float - zero_point.float()
+        w_float = w_float * scale.float()
+        w_float = w_float.to(input.dtype)
+        return torch.nn.functional.linear(input, w_float, bias)
+
+    if zero_point is None:
+        zero_point = torch.empty(0, dtype=input.dtype, device=input.device)
+    if bias is None:
+        bias = torch.empty(0, dtype=input.dtype, device=input.device)
+
+    return _C.npu_quantized_linear(input, weight, scale, zero_point, bias)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +397,7 @@ def conv2d(
     dilation=(1, 1),
     groups: int = 1,
 ) -> torch.Tensor:
-    if _C is None:
+    if _C is None or isinstance(input, torch.fx.Proxy):
         return torch.nn.functional.conv2d(
             input,
             weight,
@@ -352,7 +433,7 @@ def max_pool2d(
     dilation=1,
     ceil_mode: bool = False,
 ) -> torch.Tensor:
-    if _C is None:
+    if _C is None or isinstance(input, torch.fx.Proxy):
         return torch.nn.functional.max_pool2d(
             input,
             kernel_size,

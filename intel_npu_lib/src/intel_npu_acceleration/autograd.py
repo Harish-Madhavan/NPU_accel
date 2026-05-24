@@ -1,4 +1,5 @@
 import torch
+import torch.fx
 import math
 from . import _functional as F_npu
 
@@ -317,7 +318,9 @@ def silu(a):
 
 
 def rmsnorm(input, weight, eps=1e-6):
-    if not isinstance(input, torch.fx.Proxy) and (input.requires_grad or weight.requires_grad):
+    if not isinstance(input, torch.fx.Proxy) and (
+        input.requires_grad or weight.requires_grad
+    ):
         return NPURMSNorm.apply(input, weight, eps)
     return F_npu.rmsnorm(input, weight, eps)
 
@@ -349,8 +352,6 @@ def conv2d(
         return NPUConv2d.apply(input, weight, bias, stride, padding, dilation, groups)
     return F_npu.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
-
-import torch.fx
 
 # Wrap public functions to prevent FX tracing into requires_grad checks
 torch.fx.wrap(matmul)

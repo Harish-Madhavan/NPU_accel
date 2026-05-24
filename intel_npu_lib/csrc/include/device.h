@@ -1,12 +1,15 @@
 #pragma once
 #include <torch/extension.h>
-#include <openvino/openvino.hpp>
-#include <string>
-#include <memory>
-#include <map>
-#include <list>
-#include <mutex>
+
 #include <iostream>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <openvino/openvino.hpp>
+#include <set>
+#include <string>
+#include <unordered_map>
 
 /**
  * NPUBackend: Singleton class to manage OpenVINO Core and Model Cache.
@@ -22,13 +25,21 @@ public:
 
     // Accessors
     ov::Core& getCore();
-    
+    ov::RemoteContext& getContext();
+
     // Model Caching
     ov::CompiledModel getOrCompileModel(const std::string& key, std::shared_ptr<ov::Model> model);
+    ov::InferRequest getOrCachedInferRequest(const std::string& key);
     void setCacheDir(const std::string& path);
+    void setProperty(const std::string& key, const std::string& value);
+    void setPerformanceHint(const std::string& hint);
+
+    // Property probing
+    bool isPropertySupported(const std::string& key) const;
+    std::string getSupportedPropertiesList() const;
 
     // Logging
-    template<typename... Args>
+    template <typename... Args>
     void log(const std::string& fmt, Args... args) {
         // Simple logger for now, can be replaced with spdlog later
         // Use a lock if writing to shared stream
@@ -39,7 +50,7 @@ public:
     bool isAvailable();
 
 private:
-    NPUBackend(); // Private constructor
+    NPUBackend();  // Private constructor
     ~NPUBackend() = default;
 
     struct CacheEntry {
@@ -48,19 +59,31 @@ private:
 
         CacheEntry() = default;
         CacheEntry(ov::CompiledModel m, std::list<std::string>::iterator it)
-            : compiled_model(m), list_it(it) {}
+            : compiled_model(std::move(m)), list_it(it) {
+        }
+        // NOTE: InferRequest is NOT cached here.
+        // A fresh InferRequest is created per call (see getOrCachedInferRequest)
+        // to avoid shared-mutable-state races on concurrent inference.
     };
 
     std::unique_ptr<ov::Core> m_core;
+    ov::RemoteContext m_context;
     std::map<std::string, CacheEntry> m_model_cache;
     std::list<std::string> m_access_order;
     const size_t m_max_cache_size = 200;
-    
+
     std::mutex m_mutex;
     bool m_is_available;
+    bool m_has_context = false;               // True when RemoteContext init succeeded
+    std::set<std::string> m_supported_props;  // Populated by probeProperties()
+    ov::hint::PerformanceMode m_performance_hint = ov::hint::PerformanceMode::LATENCY;
+
+    void probeProperties();  // Queries ov::supported_properties at init
 };
 
 // C-API wrappers for Python bindings
 bool is_npu_available();
 void initialize_npu();
 void set_npu_cache_dir(const std::string& path);
+void set_npu_property(const std::string& key, const std::string& value);
+void set_npu_performance_hint(const std::string& hint);

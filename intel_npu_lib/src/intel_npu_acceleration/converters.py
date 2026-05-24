@@ -13,12 +13,20 @@ from . import linear as npu_linear_func
 from . import relu as npu_relu_func
 from . import gelu as npu_gelu_func
 from . import silu as npu_silu_func
+from .functional import quantized_linear as npu_quantized_linear_func
 
 
 def _to_list(val, n=2):
     if isinstance(val, int):
         return [val] * n
     return list(val)
+
+
+def _get_partial_shape(node_or_output):
+    """Return the PartialShape of an ov.Node (output 0) or ov.Output."""
+    if isinstance(node_or_output, ov.Output):
+        return node_or_output.get_partial_shape()
+    return node_or_output.get_output_partial_shape(0)
 
 
 # --- Converters ---
@@ -41,7 +49,7 @@ def convert_sdpa(builder: OVGraphBuilder, node, args, kwargs):
 
     if scale is None:
         # Default scale: 1 / sqrt(query.size(-1))
-        q_shape = query.get_output_partial_shape(0)
+        q_shape = _get_partial_shape(query)
         head_dim = q_shape[-1].get_length()
         scale_val = 1.0 / np.sqrt(head_dim)
         scale_node = ops.constant(scale_val, dtype=np.float32)
@@ -138,7 +146,7 @@ def convert_matmul(builder: OVGraphBuilder, node, args, kwargs):
     # Check for INT8/UINT8 operands and promote to float16 to trigger NPU INT8 acceleration
     t0 = inp0.get_element_type().get_type_name()
     t1 = inp1.get_element_type().get_type_name()
-    
+
     if t0 in ["i8", "u8"]:
         inp0 = ops.convert(inp0, destination_type=np.float16)
     if t1 in ["i8", "u8"]:
@@ -182,6 +190,30 @@ def convert_rsqrt(builder: OVGraphBuilder, node, args, kwargs):
     return ops.power(inp, ops.constant([-0.5], dtype=np.float32))
 
 
+@OpRegistry.register_function(torch.log)
+def convert_log(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.log(inp)
+
+
+@OpRegistry.register_function(torch.exp)
+def convert_exp(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.exp(inp)
+
+
+@OpRegistry.register_function(torch.abs)
+def convert_abs(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.abs(inp)
+
+
+@OpRegistry.register_function(torch.tanh)
+def convert_tanh(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.tanh(inp)
+
+
 @OpRegistry.register_function(torch.where)
 def convert_where(builder: OVGraphBuilder, node, args, kwargs):
     cond = builder.get_input_or_constant(args[0])
@@ -219,7 +251,7 @@ def convert_mean(builder: OVGraphBuilder, node, args, kwargs):
 
     if dim is None:
         # Global mean: reduce over all axes.
-        rank = inp.get_output_partial_shape(0).rank.get_length()
+        rank = _get_partial_shape(inp).rank.get_length()
         axes = ops.constant(list(range(rank)), dtype=np.int64)
     elif isinstance(dim, int):
         axes = ops.constant([dim], dtype=np.int64)
@@ -265,7 +297,7 @@ def convert_transpose(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     dim0 = args[1]
     dim1 = args[2]
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     perm = list(range(rank))
     if dim0 < 0:
         dim0 += rank
@@ -311,7 +343,7 @@ def convert_rmsnorm(builder: OVGraphBuilder, node, args, kwargs):
     eps = args[2]
 
     x_sq = ops.multiply(inp, inp)
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     axes = ops.constant([rank - 1], dtype=np.int64)
     mean_sq = ops.reduce_mean(x_sq, axes, keep_dims=True)
 
@@ -326,11 +358,15 @@ def convert_rmsnorm(builder: OVGraphBuilder, node, args, kwargs):
 def convert_layer_norm(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     normalized_shape = args[1]
-    weight = builder.get_input_or_constant(kwargs.get("weight", args[2] if len(args) > 2 else None))
-    bias = builder.get_input_or_constant(kwargs.get("bias", args[3] if len(args) > 3 else None))
+    weight = builder.get_input_or_constant(
+        kwargs.get("weight", args[2] if len(args) > 2 else None)
+    )
+    bias = builder.get_input_or_constant(
+        kwargs.get("bias", args[3] if len(args) > 3 else None)
+    )
     eps = kwargs.get("eps", args[4] if len(args) > 4 else 1e-5)
 
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     norm_rank = len(normalized_shape)
     axes_list = list(range(rank - norm_rank, rank))
     axes = ops.constant(axes_list, dtype=np.int64)
@@ -391,7 +427,9 @@ def convert_reshape_method(builder: OVGraphBuilder, node, args, kwargs):
             else:
                 v = builder.get_input_or_constant(s)
                 shape_nodes.append(
-                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
+                    ops.reshape(
+                        v, ops.constant([1], dtype=np.int64), special_zero=False
+                    )
                 )
         shape_node = ops.concat(shape_nodes, axis=0)
     else:
@@ -415,7 +453,9 @@ def convert_expand_method(builder: OVGraphBuilder, node, args, kwargs):
             else:
                 v = builder.get_input_or_constant(s)
                 shape_nodes.append(
-                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
+                    ops.reshape(
+                        v, ops.constant([1], dtype=np.int64), special_zero=False
+                    )
                 )
         shape_node = ops.concat(shape_nodes, axis=0)
     else:
@@ -428,12 +468,12 @@ def convert_expand_method(builder: OVGraphBuilder, node, args, kwargs):
 def convert_transpose_method(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     dim0, dim1 = args[1], args[2]
-    
+
     # Generate permutation
-    rank = len(inp.get_output_partial_shape(0))
+    rank = len(_get_partial_shape(inp))
     perm = list(range(rank))
     perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
-    
+
     return ops.transpose(inp, ops.constant(np.array(perm, dtype=np.int64)))
 
 
@@ -468,7 +508,9 @@ def convert_full(builder: OVGraphBuilder, node, args, kwargs):
             else:
                 v = builder.get_input_or_constant(s)
                 shape_nodes.append(
-                    ops.reshape(v, ops.constant([1], dtype=np.int64), special_zero=False)
+                    ops.reshape(
+                        v, ops.constant([1], dtype=np.int64), special_zero=False
+                    )
                 )
         shape_node = ops.concat(shape_nodes, axis=0)
     else:
@@ -561,7 +603,7 @@ def convert_setitem(builder: OVGraphBuilder, node, args, kwargs):
     if not isinstance(indices_raw, tuple):
         indices_raw = (indices_raw,)
 
-    target_ov.get_output_partial_shape(0).rank.get_length()
+    _get_partial_shape(target_ov).rank.get_length()
 
     # Determine which dims are integer-indexed (scalar select) and which are sliced.
     # We build a begin/end/step for StridedSlice to identify the *destination* region,
@@ -715,10 +757,6 @@ def convert_setitem(builder: OVGraphBuilder, node, args, kwargs):
     return res
 
 
-
-
-
-
 @OpRegistry.register_function(torch.index_select)
 def convert_index_select(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
@@ -735,14 +773,19 @@ def convert_index_copy(builder: OVGraphBuilder, node, args, kwargs):
     dim = builder.get_input_or_constant(args[1])
     indices = builder.get_input_or_constant(args[2])
     updates = builder.get_input_or_constant(args[3])
-    
+
     data, updates = builder.align_types(data, updates)
-    
+
+    # Ensure indices element type is integral (i64 or i32)
+    indices_type = indices.get_element_type()
+    if not (indices_type == ov.Type.i64 or indices_type == ov.Type.i32):
+        indices = ops.convert(indices, destination_type="i64")
+
     if not isinstance(dim, ov.Node):
         dim = ops.constant([dim], dtype=np.int64)
     else:
         dim = ops.reshape(dim, ops.constant([1], dtype=np.int64), special_zero=False)
-        
+
     return ops.scatter_update(data, indices, updates, dim)
 
 
@@ -752,7 +795,7 @@ def convert_triu(builder: OVGraphBuilder, node, args, kwargs):
     diagonal = kwargs.get("diagonal", args[1] if len(args) > 1 else 0)
 
     shape = ops.shape_of(inp)
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     if rank < 2:
         return inp
 
@@ -943,7 +986,6 @@ def convert_getitem(builder: OVGraphBuilder, node, args, kwargs):
 # --- Module Converters ---
 
 
-
 @OpRegistry.register_module(torch.nn.Embedding)
 def convert_embedding_module(builder: OVGraphBuilder, node, submod, args, kwargs):
     indices = builder.get_input_or_constant(args[0])
@@ -996,12 +1038,13 @@ def convert_to_float(builder: OVGraphBuilder, node, args, kwargs):
 
 
 @OpRegistry.register_method("flatten")
+@OpRegistry.register_function(torch.flatten)
 def convert_flatten(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     start_dim = args[1] if len(args) > 1 else 0
     end_dim = args[2] if len(args) > 2 else -1
 
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     if start_dim < 0:
         start_dim += rank
     if end_dim < 0:
@@ -1061,7 +1104,7 @@ def convert_conv2d(builder: OVGraphBuilder, node, args, kwargs):
     else:
         # OV group_convolution expects weight shape: (groups, C_out/groups, C_in/groups, kH, kW)
         # The incoming weight is (C_out, C_in/groups, kH, kW) — reshape it.
-        w_shape = weight.get_output_partial_shape(0)
+        w_shape = _get_partial_shape(weight)
         c_out = w_shape[0].get_length()
         c_in_g = w_shape[1].get_length()
         kH = w_shape[2].get_length()
@@ -1076,10 +1119,143 @@ def convert_conv2d(builder: OVGraphBuilder, node, args, kwargs):
 
     res = conv
     if bias is not None:
-        bias_node = builder.get_input_or_constant(bias)
         axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
-        bias_4d = ops.unsqueeze(bias_node, axes)
+        bias_4d = ops.unsqueeze(bias, axes)
         res = ops.add(conv, bias_4d)
+
+    return res
+
+
+@OpRegistry.register_function(torch.squeeze)
+@OpRegistry.register_method("squeeze")
+def convert_squeeze(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    if len(args) > 1:
+        dim = args[1]
+        axes = ops.constant(np.array([dim]), dtype=np.int64)
+        return ops.squeeze(inp, axes)
+    elif "dim" in kwargs:
+        dim = kwargs["dim"]
+        axes = ops.constant(np.array([dim]), dtype=np.int64)
+        return ops.squeeze(inp, axes)
+    else:
+        return ops.squeeze(inp)
+
+
+@OpRegistry.register_function(torch.unsqueeze)
+@OpRegistry.register_method("unsqueeze")
+def convert_unsqueeze(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    dim = args[1] if len(args) > 1 else kwargs["dim"]
+    axes = ops.constant(np.array([dim]), dtype=np.int64)
+    return ops.unsqueeze(inp, axes)
+
+
+@OpRegistry.register_function(torch.nn.functional.avg_pool2d)
+def convert_avg_pool2d(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    kernel_size = kwargs.get("kernel_size", args[1] if len(args) > 1 else None)
+    stride = kwargs.get("stride", args[2] if len(args) > 2 else None)
+    padding = kwargs.get("padding", args[3] if len(args) > 3 else 0)
+    ceil_mode = kwargs.get("ceil_mode", args[4] if len(args) > 4 else False)
+    count_include_pad = kwargs.get(
+        "count_include_pad", args[5] if len(args) > 5 else True
+    )
+
+    if kernel_size is None:
+        raise ValueError("kernel_size must be provided for avg_pool2d")
+
+    if stride is None:
+        stride = kernel_size
+
+    k_list = _to_list(kernel_size)
+    s_list = _to_list(stride)
+    p_list = _to_list(padding)
+
+    ov_strides = np.array(s_list, dtype=np.int64)
+    ov_pads_begin = np.array(p_list, dtype=np.int64)
+    ov_pads_end = np.array(p_list, dtype=np.int64)
+    ov_kernel = np.array(k_list, dtype=np.int64)
+
+    rounding_type = "ceil" if ceil_mode else "floor"
+    exclude_pad = not count_include_pad
+
+    return ops.avg_pool(
+        inp,
+        ov_strides,
+        ov_pads_begin,
+        ov_pads_end,
+        ov_kernel,
+        exclude_pad=exclude_pad,
+        rounding_type=rounding_type,
+    )
+
+
+@OpRegistry.register_module(torch.nn.AvgPool2d)
+def convert_avgpool2d_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+
+    k_list = _to_list(submod.kernel_size)
+    s_list = _to_list(submod.stride)
+    p_list = _to_list(submod.padding)
+
+    ov_strides = np.array(s_list, dtype=np.int64)
+    ov_pads_begin = np.array(p_list, dtype=np.int64)
+    ov_pads_end = np.array(p_list, dtype=np.int64)
+    ov_kernel = np.array(k_list, dtype=np.int64)
+
+    rounding_type = "ceil" if submod.ceil_mode else "floor"
+    exclude_pad = not submod.count_include_pad
+
+    return ops.avg_pool(
+        inp,
+        ov_strides,
+        ov_pads_begin,
+        ov_pads_end,
+        ov_kernel,
+        exclude_pad=exclude_pad,
+        rounding_type=rounding_type,
+    )
+
+
+@OpRegistry.register_function(torch.nn.functional.batch_norm)
+def convert_batch_norm_functional(builder: OVGraphBuilder, node, args, kwargs):
+    # args: input, running_mean, running_var, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5
+    inp = builder.get_input_or_constant(args[0])
+    mean = builder.get_input_or_constant(
+        kwargs.get("running_mean", args[1] if len(args) > 1 else None)
+    )
+    var = builder.get_input_or_constant(
+        kwargs.get("running_var", args[2] if len(args) > 2 else None)
+    )
+    weight = builder.get_input_or_constant(
+        kwargs.get("weight", args[3] if len(args) > 3 else None)
+    )
+    bias = builder.get_input_or_constant(
+        kwargs.get("bias", args[4] if len(args) > 4 else None)
+    )
+    eps = kwargs.get("eps", args[7] if len(args) > 7 else 1e-5)
+
+    if mean is None or var is None:
+        raise ValueError(
+            "running_mean and running_var must be provided for functional batch_norm"
+        )
+
+    axes = ops.constant(np.array([0, 2, 3]), dtype=np.int64)
+    mean_4d = ops.unsqueeze(mean, axes)
+    var_4d = ops.unsqueeze(var, axes)
+
+    eps_const = ops.constant(eps, dtype=np.float32)
+    std = ops.sqrt(ops.add(var_4d, eps_const))
+    norm = ops.divide(ops.subtract(inp, mean_4d), std)
+
+    res = norm
+    if weight is not None:
+        w_4d = ops.unsqueeze(weight, axes)
+        res = ops.multiply(res, w_4d)
+    if bias is not None:
+        b_4d = ops.unsqueeze(bias, axes)
+        res = ops.add(res, b_4d)
 
     return res
 
@@ -1087,11 +1263,14 @@ def convert_conv2d(builder: OVGraphBuilder, node, args, kwargs):
 @OpRegistry.register_function(torch.nn.functional.max_pool2d)
 def convert_max_pool2d(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
-    kernel_size = kwargs.get("kernel_size", args[1])
+    kernel_size = kwargs.get("kernel_size", args[1] if len(args) > 1 else None)
     stride = kwargs.get("stride", args[2] if len(args) > 2 else None)
     padding = kwargs.get("padding", args[3] if len(args) > 3 else 0)
     dilation = kwargs.get("dilation", args[4] if len(args) > 4 else 1)
     ceil_mode = kwargs.get("ceil_mode", args[5] if len(args) > 5 else False)
+
+    if kernel_size is None:
+        raise ValueError("kernel_size must be provided for max_pool2d")
 
     if stride is None:
         stride = kernel_size
@@ -1109,7 +1288,7 @@ def convert_max_pool2d(builder: OVGraphBuilder, node, args, kwargs):
 
     rounding_type = "ceil" if ceil_mode else "floor"
 
-    return ops.max_pool(
+    res = ops.max_pool(
         inp,
         ov_strides,
         ov_dilations,
@@ -1118,12 +1297,26 @@ def convert_max_pool2d(builder: OVGraphBuilder, node, args, kwargs):
         ov_kernel,
         rounding_type=rounding_type,
     )
+    return res.output(0)
 
 
 @OpRegistry.register_module(torch.nn.Linear)
 def convert_linear_module(builder: OVGraphBuilder, node, submod, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
+
+    # Check for INT8/UINT8 weight to trigger NPU W8A16 acceleration
+    if w_const.get_element_type().get_type_name() in ["i8", "u8"]:
+        w_const = ops.convert(w_const, destination_type=np.float16)
+        if hasattr(submod, "weight_scale"):
+            scale = getattr(submod, "weight_scale")
+            if isinstance(scale, torch.Tensor):
+                scale_val = scale.detach().cpu().numpy()
+            else:
+                scale_val = float(scale)
+            scale_node = ops.constant(scale_val, dtype=np.float32)
+            w_const = ops.multiply(w_const, scale_node)
+
     inp, w_const = builder.align_types(inp, w_const)
     mm = ops.matmul(inp, w_const, transpose_a=False, transpose_b=True)
 
@@ -1138,6 +1331,18 @@ def convert_linear_module(builder: OVGraphBuilder, node, submod, args, kwargs):
 def convert_conv2d_module(builder: OVGraphBuilder, node, submod, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     w_const = builder.add_constant(f"{node.target}.weight", submod.weight)
+
+    # Check for INT8/UINT8 weight to trigger NPU hardware acceleration
+    if w_const.get_element_type().get_type_name() in ["i8", "u8"]:
+        w_const = ops.convert(w_const, destination_type=np.float16)
+        if hasattr(submod, "weight_scale"):
+            scale = getattr(submod, "weight_scale")
+            if isinstance(scale, torch.Tensor):
+                scale_val = scale.detach().cpu().numpy()
+            else:
+                scale_val = float(scale)
+            scale_node = ops.constant(scale_val, dtype=np.float32)
+            w_const = ops.multiply(w_const, scale_node)
 
     ov_strides = np.array(_to_list(submod.stride), dtype=np.int64)
     ov_pads_begin = np.array(_to_list(submod.padding), dtype=np.int64)
@@ -1187,7 +1392,7 @@ def convert_maxpool2d_module(builder: OVGraphBuilder, node, submod, args, kwargs
 
     rounding_type = "ceil" if submod.ceil_mode else "floor"
 
-    return ops.max_pool(
+    res = ops.max_pool(
         inp,
         ov_strides,
         ov_dilations,
@@ -1196,6 +1401,7 @@ def convert_maxpool2d_module(builder: OVGraphBuilder, node, submod, args, kwargs
         ov_kernel,
         rounding_type=rounding_type,
     )
+    return res.output(0)
 
 
 @OpRegistry.register_module(torch.nn.BatchNorm2d)
@@ -1272,7 +1478,7 @@ def convert_adaptive_avg_pool2d(builder: OVGraphBuilder, node, submod, args, kwa
     output_size = _to_list(submod.output_size)
     if output_size == [1, 1]:
         # Global Average Pooling
-        rank = inp.get_output_partial_shape(0).rank.get_length()
+        rank = _get_partial_shape(inp).rank.get_length()
         axes = ops.constant(np.array([rank - 2, rank - 1]), dtype=np.int64)
         return ops.reduce_mean(inp, axes, keep_dims=True)
     else:
@@ -1296,9 +1502,6 @@ def convert_log_softmax(builder: OVGraphBuilder, node, *args, **kwargs):
 
     softmax = ops.softmax(inp, axis=dim)
     return ops.log(softmax)
-
-
-
 
 
 @OpRegistry.register_function(torch.nn.functional.linear, npu_linear_func)
@@ -1325,7 +1528,7 @@ def convert_layernorm_module(builder: OVGraphBuilder, node, submod, args, kwargs
     # LayerNorm reduces over normalized_shape (usually the last D dims)
     # We use OpenVINO MVN or LayerNormalization
     normalized_shape = submod.normalized_shape
-    rank = inp.get_output_partial_shape(0).rank.get_length()
+    rank = _get_partial_shape(inp).rank.get_length()
     axes = ops.constant(list(range(rank - len(normalized_shape), rank)), dtype=np.int64)
 
     # Compute mean and variance
@@ -1344,3 +1547,72 @@ def convert_layernorm_module(builder: OVGraphBuilder, node, submod, args, kwargs
         res = ops.add(ops.multiply(norm, w_const), b_const)
 
     return res
+
+
+@OpRegistry.register_function(npu_quantized_linear_func)
+def convert_quantized_linear(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    weight = builder.get_input_or_constant(args[1])
+    scale = builder.get_input_or_constant(args[2])
+
+    zero_point = (
+        builder.get_input_or_constant(args[3])
+        if len(args) > 3
+        else kwargs.get("zero_point", None)
+    )
+    bias = (
+        builder.get_input_or_constant(args[4])
+        if len(args) > 4
+        else kwargs.get("bias", None)
+    )
+
+    # 1. Convert/unpack weight to the dtype matching inp (usually FP16 or FP32)
+    weight_tensor = builder.node_values.get(args[1], None)
+    is_int4 = (
+        weight_tensor is not None
+        and isinstance(weight_tensor, torch.Tensor)
+        and weight_tensor.dtype == torch.uint8
+        and len(weight_tensor.shape) == 2
+    )
+
+    if is_int4:
+        c_out, c_in_half = weight_tensor.shape
+        c_in = c_in_half * 2
+        inp_type = inp.get_element_type()
+        w_cast = ops.convert(weight, destination_type=inp_type)
+
+        scale_16 = ops.constant(16.0, dtype=np.float32)
+        w_div = ops.divide(w_cast, scale_16)
+        w_odd = ops.floor(w_div)
+
+        w_odd_mul = ops.multiply(w_odd, scale_16)
+        w_even = ops.subtract(w_cast, w_odd_mul)
+
+        shape_3d = ops.constant([c_out, c_in_half, 1], dtype=np.int64)
+        w_even_3d = ops.reshape(w_even, shape_3d, special_zero=False)
+        w_odd_3d = ops.reshape(w_odd, shape_3d, special_zero=False)
+
+        w_concat = ops.concat([w_even_3d, w_odd_3d], axis=2)
+
+        shape_final = ops.constant([c_out, c_in], dtype=np.int64)
+        weight_float = ops.reshape(w_concat, shape_final, special_zero=False)
+    else:
+        weight_float = ops.convert(weight, destination_type=inp.get_element_type())
+
+    # 2. Subtract zero point if defined
+    if zero_point is not None:
+        zp_cast = ops.convert(zero_point, destination_type=inp.get_element_type())
+        weight_float = ops.subtract(weight_float, zp_cast)
+
+    # 3. Multiply by scale
+    scale_cast = ops.convert(scale, destination_type=inp.get_element_type())
+    weight_float = ops.multiply(weight_float, scale_cast)
+
+    # 4. MatMul with transposed weights: y = x * W^T
+    mm = ops.matmul(inp, weight_float, transpose_a=False, transpose_b=True)
+
+    # 5. Add bias if defined
+    if bias is not None:
+        bias_cast = ops.convert(bias, destination_type=inp.get_element_type())
+        return ops.add(mm, bias_cast)
+    return mm

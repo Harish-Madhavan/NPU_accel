@@ -55,6 +55,10 @@ class OVGraphBuilder:
         elif isinstance(arg, (list, tuple)):
             # Recursively handle lists/tuples (e.g. for reshape shapes)
             return [self.get_input_or_constant(x) for x in arg]
+        elif isinstance(arg, ov.Node):
+            return arg
+        elif isinstance(arg, ov.Output):
+            return arg
         elif arg is None:
             return None
         else:

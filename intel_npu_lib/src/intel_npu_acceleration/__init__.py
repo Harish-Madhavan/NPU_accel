@@ -25,11 +25,11 @@ if platform.system() == "Windows":
         pass
 
 # --- Import Core ---
-_C = None
 try:
     from . import _C
 except ImportError as e:
     logger.warning(f"Could not load C++ extension 'intel_npu_acceleration._C': {e}")
+    _C = None
 _CACHE_DIR = None
 
 # --- Cache Initialization ---
@@ -86,6 +86,32 @@ def is_available() -> bool:
     return _C.is_npu_available()
 
 
+def set_property(key: str, value: str):
+    """Set global NPU property (Level Zero backend)."""
+    if _C is not None:
+        _C.set_property(key, value)
+    else:
+        logger.warning("NPU C++ extension not loaded. Cannot set property.")
+
+
+def set_performance_hint(hint: str):
+    """Set global NPU performance hint (LATENCY, THROUGHPUT)."""
+    if _C is not None:
+        _C.set_performance_hint(hint)
+    else:
+        logger.warning("NPU C++ extension not loaded. Cannot set performance hint.")
+
+
+def enable_turbo():
+    """Enable Level Zero Turbo mode for maximum performance."""
+    set_property("NPU_TURBO", "YES")
+
+
+def enable_sda():
+    """Enable Shared Device Address for zero-copy memory transfers."""
+    set_property("NPU_USE_SDA", "YES")
+
+
 # --- Expose Functional API ---
 from .functional import (  # noqa: E402
     add,
@@ -105,15 +131,19 @@ from .functional import (  # noqa: E402
     conv2d,
     max_pool2d,
     update_kv_cache,
+    quantized_linear,
 )
 
 # --- Expose Compiler API ---
-from .frontend import compile_to_npu  # noqa: E402
-
-compile = compile_to_npu
+from .frontend import compile, compile_to_npu  # noqa: E402
 
 __all__ = [
     "is_available",
+    "set_property",
+    "set_performance_hint",
+    "enable_turbo",
+    "enable_sda",
+    "compile",
     "compile_to_npu",
     "get_cache_dir",
     "set_cache_dir",
@@ -134,4 +164,5 @@ __all__ = [
     "conv2d",
     "max_pool2d",
     "update_kv_cache",
+    "quantized_linear",
 ]
