@@ -210,9 +210,7 @@ class NPUGraphModule(torch.nn.Module):
                 if buf is not None:
                     # Return a clone to avoid user accidentally corrupting the internal buffer
                     # or seeing it change on the next call.
-                    # For maximum performance, we could return a view, but that's unsafe.
-                    # Given the user wants TFLOPS, let's return a view but warn in docs.
-                    outputs.append(buf)
+                    outputs.append(buf.clone())
                 else:
                     out_tensor = infer_request.get_output_tensor(j)
                     outputs.append(torch.from_numpy(out_tensor.data).clone())
@@ -278,7 +276,7 @@ class NPUGraphModule(torch.nn.Module):
         for j in range(len(self.compiled_model.outputs)):
             buf = self.output_buffers[handle][j]
             if buf is not None:
-                outputs.append(buf)
+                outputs.append(buf.clone())
             else:
                 out_tensor = infer_request.get_output_tensor(j)
                 outputs.append(torch.from_numpy(out_tensor.data).clone())

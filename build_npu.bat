@@ -25,3 +25,11 @@ SET DISTUTILS_USE_SDK=1
 cd /d "%~dp0intel_npu_lib"
 echo Building and installing intel_npu_lib in development mode...
 python setup.py build_ext --inplace > build_log.txt 2>&1
+
+if %ERRORLEVEL% equ 0 (
+  echo [SUCCESS] C++ Extension built and installed inplace successfully!
+) else (
+  echo [ERROR] C++ Extension compilation failed!
+  echo Please check 'intel_npu_lib\build_log.txt' for compilation errors.
+  exit /b %ERRORLEVEL%
+)

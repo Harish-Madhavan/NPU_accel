@@ -18,7 +18,9 @@ class MultiplicationModel(nn.Module):
 class TestNPUStress(unittest.TestCase):
     def setUp(self):
         if not is_available():
-            self.skipTest("NPU is not available; skipping stress tests.")
+            print(
+                "WARNING: Intel NPU is not available; running stress tests in CPU fallback mode."
+            )
 
     def test_inference_stability(self):
         # 1. Compilation

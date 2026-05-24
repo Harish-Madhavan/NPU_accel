@@ -102,8 +102,8 @@ class TestAsyncAndHybrid(unittest.TestCase):
             def forward(self, x, y):
                 # 1. Supported op (torch.add)
                 z = torch.add(x, y)
-                # 2. Unsupported op (torch.sigmoid - not in OpRegistry)
-                s = torch.sigmoid(z)
+                # 2. Unsupported op (torch.erf - not in OpRegistry)
+                s = torch.erf(z)
                 # 3. Supported op (torch.mul)
                 w = torch.mul(s, x)
                 return w

@@ -1,0 +1,68 @@
+# ==========================================
+# Intel NPU Acceleration Library .gitignore
+# ==========================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+.venv/
+venv/
+ENV/
+env/
+
+# --- C/C++ & Compiler Outputs ---
+*.o
+*.obj
+*.dll
+*.lib
+*.dylib
+*.pdb
+*.exp
+*.ilk
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.tlog
+*.log
+*.ipch
+.ninja_deps
+.ninja_log
+build_log.txt
+intel_npu_lib/build_log.txt
+
+# --- Intel NPU Runtime Cache ---
+npu_cache/
+intel_npu_lib/npu_cache/
+
+# --- IDEs & Editors ---
+.vscode/
+.idea/
+.vs/
+*.sln
+*.vcxproj
+*.filters
+*.user
+*.suo
+*.workspace
+*.project
+*.cproject
+
+# --- OS-specific Junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini

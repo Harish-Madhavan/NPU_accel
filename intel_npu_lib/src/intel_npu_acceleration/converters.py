@@ -177,6 +177,62 @@ def convert_silu(builder: OVGraphBuilder, node, args, kwargs):
     return ops.swish(inp)
 
 
+@OpRegistry.register_function(torch.sigmoid, torch.nn.functional.sigmoid)
+@OpRegistry.register_method("sigmoid")
+def convert_sigmoid(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.sigmoid(inp)
+
+
+@OpRegistry.register_module(torch.nn.Sigmoid)
+def convert_sigmoid_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.sigmoid(inp)
+
+
+@OpRegistry.register_function(torch.tanh, torch.nn.functional.tanh)
+@OpRegistry.register_method("tanh")
+def convert_tanh(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.tanh(inp)
+
+
+@OpRegistry.register_module(torch.nn.Tanh)
+def convert_tanh_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.tanh(inp)
+
+
+@OpRegistry.register_function(torch.nn.functional.relu6)
+@OpRegistry.register_method("relu6")
+def convert_relu6(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.clamp(inp, 0.0, 6.0)
+
+
+@OpRegistry.register_module(torch.nn.ReLU6)
+def convert_relu6_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.clamp(inp, 0.0, 6.0)
+
+
+@OpRegistry.register_function(torch.nn.functional.leaky_relu)
+@OpRegistry.register_method("leaky_relu")
+def convert_leaky_relu(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    slope = kwargs.get("negative_slope", args[1] if len(args) > 1 else 0.01)
+    slope_node = ops.constant(slope, dtype=np.float32)
+    return ops.prelu(inp, slope_node)
+
+
+@OpRegistry.register_module(torch.nn.LeakyReLU)
+def convert_leaky_relu_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    slope = submod.negative_slope
+    slope_node = ops.constant(slope, dtype=np.float32)
+    return ops.prelu(inp, slope_node)
+
+
 @OpRegistry.register_function(torch.sqrt)
 def convert_sqrt(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
@@ -206,12 +262,6 @@ def convert_exp(builder: OVGraphBuilder, node, args, kwargs):
 def convert_abs(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     return ops.abs(inp)
-
-
-@OpRegistry.register_function(torch.tanh)
-def convert_tanh(builder: OVGraphBuilder, node, args, kwargs):
-    inp = builder.get_input_or_constant(args[0])
-    return ops.tanh(inp)
 
 
 @OpRegistry.register_function(torch.where)
