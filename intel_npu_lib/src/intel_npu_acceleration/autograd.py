@@ -269,6 +269,114 @@ class NPUConv2d(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
+# LayerNorm  —  y = (x - mean(x)) / sqrt(var(x) + ε) * w + b
+# ---------------------------------------------------------------------------
+
+
+class NPULayerNorm(torch.autograd.Function):
+    """NPU-accelerated LayerNorm with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, normalized_shape, weight=None, bias=None, eps=1e-5):
+        out = F_npu.layer_norm(input, normalized_shape, weight, bias, eps)
+
+        # Calculate mean and variance to save for backward
+        # Normalized dimensions are the last k dimensions
+        rank = input.dim()
+        k = len(normalized_shape)
+        axes = tuple(range(rank - k, rank))
+
+        mean = input.float().mean(dim=axes, keepdim=True)
+        var = input.float().var(dim=axes, keepdim=True, unbiased=False)
+        rms = torch.sqrt(var + eps)
+        x_norm = ((input.float() - mean) / rms).to(input.dtype)
+
+        ctx.save_for_backward(x_norm, weight, bias)
+        ctx.rms = rms
+        ctx.axes = axes
+        ctx.normalized_shape = normalized_shape
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_norm, weight, bias = ctx.saved_tensors
+        rms = ctx.rms
+        axes = ctx.axes
+        normalized_shape = ctx.normalized_shape
+
+        go = grad_output.float()
+        xn = x_norm.float()
+
+        # Sum gradients over all batch dimensions for weight/bias
+        # The non-normalized dimensions are all dimensions except the last k
+        non_norm_dims = tuple(range(go.dim() - len(normalized_shape)))
+
+        grad_weight = None
+        if weight is not None and ctx.needs_input_grad[2]:
+            grad_weight = (go * xn).sum(dim=non_norm_dims).to(weight.dtype)
+
+        grad_bias = None
+        if bias is not None and ctx.needs_input_grad[3]:
+            grad_bias = go.sum(dim=non_norm_dims).to(bias.dtype)
+
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            w = weight.float() if weight is not None else 1.0
+            dL_dxn = go * w
+
+            # LayerNorm derivative terms
+            N = math.prod(normalized_shape)
+            mean_dL_dxn = dL_dxn.sum(dim=axes, keepdim=True) / N
+            mean_dL_dxn_xn = (dL_dxn * xn).sum(dim=axes, keepdim=True) / N
+
+            grad_input = ((dL_dxn - mean_dL_dxn - xn * mean_dL_dxn_xn) / rms).to(grad_output.dtype)
+
+        return grad_input, None, grad_weight, grad_bias, None
+
+
+# ---------------------------------------------------------------------------
+# HardSigmoid  —  y = clamp(x + 3, 0, 6) / 6
+# ---------------------------------------------------------------------------
+
+
+class NPUHardSigmoid(torch.autograd.Function):
+    """NPU-accelerated HardSigmoid with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a)
+        return F_npu.hardsigmoid(a)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (a,) = ctx.saved_tensors
+        grad_a = torch.where((-3.0 < a) & (a < 3.0), grad_output / 6.0, 0.0)
+        return grad_a
+
+
+# ---------------------------------------------------------------------------
+# HardSwish  —  y = x * clamp(x + 3, 0, 6) / 6
+# ---------------------------------------------------------------------------
+
+
+class NPUHardSwish(torch.autograd.Function):
+    """NPU-accelerated HardSwish with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a):
+        ctx.save_for_backward(a)
+        return F_npu.hardswish(a)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (a,) = ctx.saved_tensors
+        h = torch.clamp(a + 3.0, 0.0, 6.0) / 6.0
+        slope = torch.where((-3.0 < a) & (a < 3.0), a / 6.0, 0.0)
+        grad_a = (h + slope) * grad_output
+        return grad_a
+
+
+# ---------------------------------------------------------------------------
 # Public autograd-aware wrappers
 # Routes to the Function class only when gradients are actually required,
 # so there is zero autograd overhead during pure inference.
@@ -353,6 +461,28 @@ def conv2d(
     return F_npu.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
 
+def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+    if not isinstance(input, torch.fx.Proxy) and (
+        input.requires_grad
+        or (weight is not None and weight.requires_grad)
+        or (bias is not None and bias.requires_grad)
+    ):
+        return NPULayerNorm.apply(input, normalized_shape, weight, bias, eps)
+    return F_npu.layer_norm(input, normalized_shape, weight, bias, eps)
+
+
+def hardsigmoid(a):
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
+        return NPUHardSigmoid.apply(a)
+    return F_npu.hardsigmoid(a)
+
+
+def hardswish(a):
+    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
+        return NPUHardSwish.apply(a)
+    return F_npu.hardswish(a)
+
+
 # Wrap public functions to prevent FX tracing into requires_grad checks
 torch.fx.wrap(matmul)
 torch.fx.wrap(add)
@@ -365,3 +495,6 @@ torch.fx.wrap(rmsnorm)
 torch.fx.wrap(softmax)
 torch.fx.wrap(linear)
 torch.fx.wrap(conv2d)
+torch.fx.wrap(layer_norm)
+torch.fx.wrap(hardsigmoid)
+torch.fx.wrap(hardswish)

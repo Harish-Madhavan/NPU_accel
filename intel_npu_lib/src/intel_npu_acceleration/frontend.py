@@ -8,7 +8,7 @@ import openvino as ov
 import openvino.properties as ov_props
 import openvino.properties.hint as ov_hints
 import numpy as np
-from typing import Any
+from typing import Any, Optional, List
 
 import intel_npu_acceleration as npu
 from .registry import OpRegistry
@@ -30,6 +30,12 @@ class NPUTracer(torch.fx.Tracer):
         from .functional import quantized_linear
 
         self._autowrap_function_ids.add(id(quantized_linear))
+
+    def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+        from .functional import NPUStatefulKVCache
+        if isinstance(m, NPUStatefulKVCache):
+            return True
+        return super().is_leaf_module(m, module_qualified_name)
 
 
 # --- Global Cache for Compiled Graphs ---
@@ -102,13 +108,14 @@ class NPUCompilationError(Exception):
 
 class NPUGraphModule(torch.nn.Module):
     def __init__(
-        self, compiled_model, input_names, performance_hint="LATENCY", num_streams=1
+        self, compiled_model, input_names, performance_hint="LATENCY", num_streams=1, clone_outputs=True
     ):
         super().__init__()
         self.compiled_model = compiled_model
         self.input_names = input_names
         self.performance_hint = performance_hint
         self.num_streams = num_streams
+        self.clone_outputs = clone_outputs
 
         # Multiple infer requests for throughput mode
         self.infer_requests = [
@@ -116,6 +123,9 @@ class NPUGraphModule(torch.nn.Module):
         ]
         self.request_idx = 0
         self._lock = threading.Lock()
+
+        # Track active inputs and their output buffer indices during async execution to prevent temporary tensors going out of scope
+        self._active_inputs = [None for _ in range(num_streams)]
 
         _OV_TO_NP = {
             ov.Type.f32: np.float32,
@@ -139,9 +149,10 @@ class NPUGraphModule(torch.nn.Module):
             t_dtype = torch.from_numpy(np.array(0, dtype=target_dtype)).dtype
             self.target_torch_dtypes.append(t_dtype)
 
-        # Pre-compute output properties and pre-allocate buffers for zero-copy
+        # Pre-compute output properties and pre-allocate double buffers for zero-copy memory safety
         self.output_info = []
-        self.output_buffers = [[] for _ in range(num_streams)]
+        self.output_buffers = [[[] for _ in range(2)] for _ in range(num_streams)]
+        self.active_buffer_idx = [0 for _ in range(num_streams)]
 
         for j in range(len(self.compiled_model.outputs)):
             ov_out = self.compiled_model.outputs[j]
@@ -153,16 +164,16 @@ class NPUGraphModule(torch.nn.Module):
                 torch_dtype = torch.from_numpy(np.array(0, dtype=target_dtype)).dtype
                 self.output_info.append((True, shape, torch_dtype))
 
-                # Pre-allocate one buffer per stream
+                # Pre-allocate two buffers per stream for safe double-buffering
                 for s in range(num_streams):
-                    buf = torch.empty(shape, dtype=torch_dtype)
-                    self.output_buffers[s].append(buf)
-                    ov_out_tensor = ov.Tensor(buf.numpy(), shared_memory=True)
-                    self.infer_requests[s].set_output_tensor(j, ov_out_tensor)
+                    for b in range(2):
+                        buf = torch.empty(shape, dtype=torch_dtype)
+                        self.output_buffers[s][b].append(buf)
             else:
                 self.output_info.append((False, None, None))
                 for s in range(num_streams):
-                    self.output_buffers[s].append(None)
+                    for b in range(2):
+                        self.output_buffers[s][b].append(None)
 
     def forward(self, *args):
         with self._lock:
@@ -170,6 +181,10 @@ class NPUGraphModule(torch.nn.Module):
             idx = self.request_idx
             infer_request = self.infer_requests[idx]
             self.request_idx = (self.request_idx + 1) % self.num_streams
+
+            # Retrieve active double buffer index
+            buf_idx = self.active_buffer_idx[idx]
+            self.active_buffer_idx[idx] = 1 - buf_idx
 
             for i, val in enumerate(args):
                 target_dtype = self.target_dtypes[i]
@@ -202,18 +217,24 @@ class NPUGraphModule(torch.nn.Module):
                     i, ov.Tensor(np_view, shared_memory=True)
                 )
 
+            # Bind double buffer output tensors to the request
+            for j in range(len(self.compiled_model.outputs)):
+                buf = self.output_buffers[idx][buf_idx][j]
+                if buf is not None:
+                    ov_out_tensor = ov.Tensor(buf.numpy(), shared_memory=True)
+                    infer_request.set_output_tensor(j, ov_out_tensor)
+
             infer_request.infer()
 
             outputs = []
             for j in range(len(self.compiled_model.outputs)):
-                buf = self.output_buffers[idx][j]
+                buf = self.output_buffers[idx][buf_idx][j]
                 if buf is not None:
-                    # Return a clone to avoid user accidentally corrupting the internal buffer
-                    # or seeing it change on the next call.
-                    outputs.append(buf.clone())
+                    outputs.append(buf.clone() if self.clone_outputs else buf)
                 else:
                     out_tensor = infer_request.get_output_tensor(j)
-                    outputs.append(torch.from_numpy(out_tensor.data).clone())
+                    data_tensor = torch.from_numpy(out_tensor.data)
+                    outputs.append(data_tensor.clone() if self.clone_outputs else data_tensor)
 
             if len(outputs) == 1:
                 return outputs[0]
@@ -230,6 +251,11 @@ class NPUGraphModule(torch.nn.Module):
             infer_request = self.infer_requests[idx]
             self.request_idx = (self.request_idx + 1) % self.num_streams
 
+            # Retrieve active double buffer index
+            buf_idx = self.active_buffer_idx[idx]
+            self.active_buffer_idx[idx] = 1 - buf_idx
+
+            keep_alive = []
             for i, val in enumerate(args):
                 target_dtype = self.target_dtypes[i]
 
@@ -241,6 +267,7 @@ class NPUGraphModule(torch.nn.Module):
                         and val.is_contiguous()
                     ):
                         np_view = val.detach().numpy()
+                        keep_alive.append(val)
                     else:
                         cpu_val = val.detach()
                         if cpu_val.device.type != "cpu":
@@ -250,17 +277,27 @@ class NPUGraphModule(torch.nn.Module):
                         if not cpu_val.is_contiguous():
                             cpu_val = cpu_val.contiguous()
                         np_view = cpu_val.numpy()
+                        keep_alive.append(cpu_val)
                 else:
                     np_view = np.array(val)
                     if np_view.dtype != target_dtype:
                         np_view = np_view.astype(target_dtype)
                     if not np_view.flags["C_CONTIGUOUS"]:
                         np_view = np.ascontiguousarray(np_view)
+                    keep_alive.append(np_view)
 
                 infer_request.set_input_tensor(
                     i, ov.Tensor(np_view, shared_memory=True)
                 )
 
+            # Bind double buffer output tensors to the request
+            for j in range(len(self.compiled_model.outputs)):
+                buf = self.output_buffers[idx][buf_idx][j]
+                if buf is not None:
+                    ov_out_tensor = ov.Tensor(buf.numpy(), shared_memory=True)
+                    infer_request.set_output_tensor(j, ov_out_tensor)
+
+            self._active_inputs[idx] = (keep_alive, buf_idx)
             infer_request.start_async()
             return idx
 
@@ -272,18 +309,208 @@ class NPUGraphModule(torch.nn.Module):
         infer_request = self.infer_requests[handle]
         infer_request.wait()
 
+        # Retrieve active double buffer index for this request
+        active_info = self._active_inputs[handle]
+        buf_idx = active_info[1] if active_info is not None else 0
+
+        # Clear active inputs reference to allow immediate garbage collection
+        self._active_inputs[handle] = None
+
         outputs = []
         for j in range(len(self.compiled_model.outputs)):
-            buf = self.output_buffers[handle][j]
+            buf = self.output_buffers[handle][buf_idx][j]
             if buf is not None:
-                outputs.append(buf.clone())
+                outputs.append(buf.clone() if self.clone_outputs else buf)
             else:
                 out_tensor = infer_request.get_output_tensor(j)
-                outputs.append(torch.from_numpy(out_tensor.data).clone())
+                data_tensor = torch.from_numpy(out_tensor.data)
+                outputs.append(data_tensor.clone() if self.clone_outputs else data_tensor)
 
         if len(outputs) == 1:
             return outputs[0]
         return tuple(outputs)
+
+    def reset_states(self):
+        """Reset all internal state variables (like KV-caches) in the NPU hardware."""
+        for request in self.infer_requests:
+            for state in request.query_state():
+                state.reset()
+
+
+class NPUDynamicGraphModule(torch.nn.Module):
+    """
+    Runtime wrapper that matches dynamic sequence lengths to static predefined buckets,
+    dynamically padding input tensors and slicing output tensors back.
+    Mathematically avoids driver compilation overhead by compiling static shape graphs
+    at bucket boundaries.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        example_input: Any,
+        performance_hint: str = "LATENCY",
+        num_streams: int = 1,
+        strict: bool = False,
+        bucket_sizes: Optional[List[int]] = None,
+        dynamic_dim: int = 1,
+        clone_outputs: bool = True,
+        preprocess_config: Optional[dict] = None,
+    ):
+        super().__init__()
+        self.model = model
+        self.performance_hint = performance_hint
+        self.num_streams = num_streams
+        self.strict = strict
+        self.dynamic_dim = dynamic_dim
+        self.clone_outputs = clone_outputs
+        self.preprocess_config = preprocess_config
+
+        if bucket_sizes is None:
+            # Default to power of 2 boundaries
+            self.bucket_sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        else:
+            self.bucket_sizes = sorted(bucket_sizes)
+
+        # Pre-process initial example input and compile
+        args = (example_input,) if isinstance(example_input, torch.Tensor) else tuple(example_input)
+        S = self._get_seq_len(args)
+        if S is not None:
+            B = self._find_bucket(S)
+            padded_args = self._pad_inputs(args, S, B)
+            self.initial_compiled = compile_to_npu(
+                self.model,
+                padded_args,
+                self.performance_hint,
+                self.num_streams,
+                self.strict,
+                dynamic_buckets=False,
+                clone_outputs=self.clone_outputs,
+                preprocess_config=self.preprocess_config,
+            )
+        else:
+            self.initial_compiled = compile_to_npu(
+                self.model,
+                example_input,
+                self.performance_hint,
+                self.num_streams,
+                self.strict,
+                dynamic_buckets=False,
+                clone_outputs=self.clone_outputs,
+                preprocess_config=self.preprocess_config,
+            )
+
+    @property
+    def compiled_model(self):
+        return self.initial_compiled.compiled_model
+
+    @property
+    def input_names(self):
+        return self.initial_compiled.input_names
+
+    def _get_seq_len(self, args) -> Optional[int]:
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.dim() > abs(self.dynamic_dim):
+                return arg.shape[self.dynamic_dim]
+        return None
+
+    def _find_bucket(self, S: int) -> int:
+        for b in self.bucket_sizes:
+            if b >= S:
+                return b
+        import math
+        return int(2 ** math.ceil(math.log2(S)))
+
+    def _pad_inputs(self, args: tuple, S: int, B: int) -> tuple:
+        if S == B:
+            return args
+        padded = []
+        for arg in args:
+            if (
+                isinstance(arg, torch.Tensor)
+                and arg.dim() > abs(self.dynamic_dim)
+                and arg.shape[self.dynamic_dim] == S
+            ):
+                pad_shape = list(arg.shape)
+                pad_shape[self.dynamic_dim] = B - S
+                pad_tensor = torch.zeros(pad_shape, dtype=arg.dtype, device=arg.device)
+                padded.append(torch.cat([arg, pad_tensor], dim=self.dynamic_dim))
+            else:
+                padded.append(arg)
+        return tuple(padded)
+
+    def _slice_outputs(self, outputs: Any, S: int, B: int) -> Any:
+        if S == B:
+            return outputs
+
+        def slice_tensor(t):
+            if (
+                isinstance(t, torch.Tensor)
+                and t.dim() > abs(self.dynamic_dim)
+                and t.shape[self.dynamic_dim] == B
+            ):
+                slices = [slice(None)] * t.dim()
+                slices[self.dynamic_dim] = slice(0, S)
+                return t[tuple(slices)]
+            return t
+
+        if isinstance(outputs, tuple):
+            return tuple(slice_tensor(t) for t in outputs)
+        return slice_tensor(outputs)
+
+    def forward(self, *args):
+        args_tuple = tuple(args)
+        S = self._get_seq_len(args_tuple)
+        if S is not None:
+            B = self._find_bucket(S)
+            padded_args = self._pad_inputs(args_tuple, S, B)
+            compiled_model = compile_to_npu(
+                self.model,
+                padded_args,
+                self.performance_hint,
+                self.num_streams,
+                self.strict,
+                dynamic_buckets=False,
+                clone_outputs=self.clone_outputs,
+                preprocess_config=self.preprocess_config,
+            )
+            outputs = compiled_model(*padded_args)
+            return self._slice_outputs(outputs, S, B)
+        else:
+            return self.initial_compiled(*args)
+
+    def infer_async(self, *args) -> tuple:
+        args_tuple = tuple(args)
+        S = self._get_seq_len(args_tuple)
+        if S is not None:
+            B = self._find_bucket(S)
+            padded_args = self._pad_inputs(args_tuple, S, B)
+            compiled_model = compile_to_npu(
+                self.model,
+                padded_args,
+                self.performance_hint,
+                self.num_streams,
+                self.strict,
+                dynamic_buckets=False,
+                clone_outputs=self.clone_outputs,
+                preprocess_config=self.preprocess_config,
+            )
+            req_idx = compiled_model.infer_async(*padded_args)
+            return (compiled_model, req_idx, S, B)
+        else:
+            req_idx = self.initial_compiled.infer_async(*args)
+            return (self.initial_compiled, req_idx, None, None)
+
+    def wait_async(self, handle: tuple) -> Any:
+        compiled_model, req_idx, S, B = handle
+        outputs = compiled_model.wait_async(req_idx)
+        if S is not None and B is not None:
+            return self._slice_outputs(outputs, S, B)
+        return outputs
+
+    def reset_states(self):
+        """Reset all internal state variables (like KV-caches) in the NPU hardware."""
+        self.initial_compiled.reset_states()
 
 
 def compile(
@@ -292,6 +519,11 @@ def compile(
     performance_hint: str = "LATENCY",
     num_streams: int = 1,
     strict: bool = False,
+    dynamic_buckets: bool = False,
+    bucket_sizes: Optional[List[int]] = None,
+    dynamic_dim: int = 1,
+    clone_outputs: bool = True,
+    preprocess_config: Optional[dict] = None,
 ) -> torch.nn.Module:
     """
     Compile a PyTorch model for Intel NPU.
@@ -302,8 +534,24 @@ def compile(
         performance_hint: "LATENCY" or "THROUGHPUT".
         num_streams: Number of parallel execution streams (only for THROUGHPUT).
         strict: If True, raise NPUCompilationError on unsupported operators instead of falling back to CPU.
+        dynamic_buckets: If True, enable dynamic shape bucketing and padding.
+        bucket_sizes: Predefined boundaries for sequence length buckets.
+        dynamic_dim: The dimension to apply bucketing along.
+        clone_outputs: If True, clones outputs. If False, returns raw buffers without clones.
+        preprocess_config: Optional configuration for NPU-hardware Pre-Post Processing.
     """
-    return compile_to_npu(model, example_input, performance_hint, num_streams, strict)
+    return compile_to_npu(
+        model,
+        example_input,
+        performance_hint,
+        num_streams,
+        strict,
+        dynamic_buckets,
+        bucket_sizes,
+        dynamic_dim,
+        clone_outputs,
+        preprocess_config,
+    )
 
 
 def compile_to_npu(
@@ -312,8 +560,35 @@ def compile_to_npu(
     performance_hint: str = "LATENCY",
     num_streams: int = 1,
     strict: bool = False,
+    dynamic_buckets: bool = False,
+    bucket_sizes: Optional[List[int]] = None,
+    dynamic_dim: int = 1,
+    clone_outputs: bool = True,
+    preprocess_config: Optional[dict] = None,
 ) -> torch.nn.Module:
     global _GRAPH_CACHE
+
+    if dynamic_buckets and not isinstance(model, NPUDynamicGraphModule):
+        return NPUDynamicGraphModule(
+            model=model,
+            example_input=example_input,
+            performance_hint=performance_hint,
+            num_streams=num_streams,
+            strict=strict,
+            bucket_sizes=bucket_sizes,
+            dynamic_dim=dynamic_dim,
+            clone_outputs=clone_outputs,
+            preprocess_config=preprocess_config,
+        )
+
+    # Compiler Performance Intelligence Logging
+    if performance_hint == "LATENCY" and num_streams == 1:
+        logger.info(
+            "[NPU Intelligence] Configuration: LATENCY mode with a single stream. "
+            "Tip: For maximum NPU core saturation and throughput (up to 4x utilization boost), "
+            "compile with performance_hint='THROUGHPUT' and num_streams=2+ to enable pipelined "
+            "multi-stream parallel NPU execution!"
+        )
 
     logger.info("Starting NPU Compilation...")
     try:
@@ -458,6 +733,11 @@ def compile_to_npu(
                             performance_hint,
                             num_streams,
                             strict=True,
+                            dynamic_buckets=dynamic_buckets,
+                            bucket_sizes=bucket_sizes,
+                            dynamic_dim=dynamic_dim,
+                            clone_outputs=clone_outputs,
+                            preprocess_config=preprocess_config,
                         )
                         setattr(split_parent, name, compiled_sub)
                     except Exception as e:
@@ -488,7 +768,8 @@ def compile_to_npu(
             else:
                 input_meta.append(type(t))
 
-        key_raw = f"{graph_str}_{input_meta}"
+        # Combine preprocess config into cache key to avoid cache hits mismatch
+        key_raw = f"{graph_str}_{input_meta}_{preprocess_config}"
         key = hashlib.md5(key_raw.encode()).hexdigest()
         logger.debug(f"Generated Graph cache key: {key} from {key_raw[:100]}...")
 
@@ -499,7 +780,11 @@ def compile_to_npu(
             compiled_entry = _GRAPH_CACHE.pop(key)
             _GRAPH_CACHE[key] = compiled_entry
             return NPUGraphModule(
-                compiled_entry["model"], compiled_entry["input_names"]
+                compiled_entry["model"],
+                compiled_entry["input_names"],
+                performance_hint,
+                num_streams,
+                clone_outputs,
             )
 
         # 2. Capture Values & Build OV Graph
@@ -586,7 +871,45 @@ def compile_to_npu(
                     builder.result_nodes.append(builder.get_input(ret_vals.name))
 
         # 3. Create & Compile OV Model
-        ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
+        if hasattr(builder, "sinks") and builder.sinks:
+            # Wrap all result nodes in output ports to match signature 13 of ov.Model (which takes Sequence[Output] with sinks/variables)
+            results_outputs = [r.output(0) if hasattr(r, "output") else r for r in builder.result_nodes]
+            ov_model = ov.Model(
+                results_outputs,
+                builder.sinks,
+                builder.parameters,
+                builder.variables,
+                "NPU_Model",
+            )
+        else:
+            ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
+
+        # Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
+        if preprocess_config:
+            try:
+                from openvino.preprocess import PrePostProcessor
+                ppp = PrePostProcessor(ov_model)
+
+                if "input" in preprocess_config:
+                    inp_cfg = preprocess_config["input"]
+                    if isinstance(inp_cfg, dict) and not any(k in ["layout", "element_type", "model_layout", "mean", "scale"] for k in inp_cfg.keys()):
+                        for idx, item_cfg in inp_cfg.items():
+                            _configure_input_ppp(ppp.input(idx), item_cfg)
+                    else:
+                        _configure_input_ppp(ppp.input(0), inp_cfg)
+
+                if "output" in preprocess_config:
+                    out_cfg = preprocess_config["output"]
+                    if isinstance(out_cfg, dict) and "element_type" not in out_cfg:
+                        for idx, item_cfg in out_cfg.items():
+                            _configure_output_ppp(ppp.output(idx), item_cfg)
+                    else:
+                        _configure_output_ppp(ppp.output(0), out_cfg)
+
+                ov_model = ppp.build()
+                logger.info("Successfully offloaded Pre-Post Processing (PPP) pipeline to NPU hardware.")
+            except Exception as e:
+                logger.warning(f"Failed to apply PrePostProcessor: {e}. Proceeding with standard NPU graph.")
 
         core = _get_core()
 
@@ -640,8 +963,41 @@ def compile_to_npu(
 
         _GRAPH_CACHE[key] = {"model": compiled, "input_names": input_names}
 
-        return NPUGraphModule(compiled, input_names, performance_hint, num_streams)
+        return NPUGraphModule(compiled, input_names, performance_hint, num_streams, clone_outputs)
 
     except Exception as e:
         logger.error(f"Compilation Failed: {e}")
         raise e
+
+
+def _configure_input_ppp(inp_info, cfg):
+    if "layout" in cfg:
+        inp_info.tensor().set_layout(ov.Layout(cfg["layout"]))
+    if "element_type" in cfg:
+        t = cfg["element_type"]
+        if isinstance(t, str):
+            t = getattr(ov.Type, t) if hasattr(ov.Type, t) else ov.Type.u8
+        inp_info.tensor().set_element_type(t)
+    if "model_layout" in cfg:
+        inp_info.model().set_layout(ov.Layout(cfg["model_layout"]))
+    if "mean" in cfg or "scale" in cfg:
+        preprocess_steps = inp_info.preprocess()
+        # Automatically insert element type conversion to f32 if tensor element type is an integer type,
+        # since OpenVINO's mean and scale steps require floating-point input.
+        t_cfg = cfg.get("element_type", ov.Type.u8)
+        if isinstance(t_cfg, str):
+            t_cfg = getattr(ov.Type, t_cfg) if hasattr(ov.Type, t_cfg) else ov.Type.u8
+        if t_cfg in [ov.Type.u8, ov.Type.i8, ov.Type.u16, ov.Type.i16, ov.Type.i32, ov.Type.i64]:
+            preprocess_steps.convert_element_type(ov.Type.f32)
+        if "mean" in cfg:
+            preprocess_steps.mean(cfg["mean"])
+        if "scale" in cfg:
+            preprocess_steps.scale(cfg["scale"])
+
+
+def _configure_output_ppp(out_info, cfg):
+    if "element_type" in cfg:
+        t = cfg["element_type"]
+        if isinstance(t, str):
+            t = getattr(ov.Type, t) if hasattr(ov.Type, t) else ov.Type.f32
+        out_info.tensor().set_element_type(t)

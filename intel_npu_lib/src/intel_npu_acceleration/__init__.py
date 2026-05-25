@@ -132,6 +132,9 @@ from .functional import (  # noqa: E402
     max_pool2d,
     update_kv_cache,
     quantized_linear,
+    layer_norm,
+    hardsigmoid,
+    hardswish,
 )
 
 # --- Expose Compiler API ---
@@ -165,4 +168,7 @@ __all__ = [
     "max_pool2d",
     "update_kv_cache",
     "quantized_linear",
+    "layer_norm",
+    "hardsigmoid",
+    "hardswish",
 ]

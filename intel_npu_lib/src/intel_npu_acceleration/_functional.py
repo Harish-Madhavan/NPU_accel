@@ -186,6 +186,18 @@ def silu(a: torch.Tensor) -> torch.Tensor:
     return _C.npu_silu(a)
 
 
+def hardsigmoid(a: torch.Tensor) -> torch.Tensor:
+    if _C is None or _is_proxy(a):
+        return torch.nn.functional.hardsigmoid(a)
+    return torch.nn.functional.hardsigmoid(a)
+
+
+def hardswish(a: torch.Tensor) -> torch.Tensor:
+    if _C is None or _is_proxy(a):
+        return torch.nn.functional.hardswish(a)
+    return torch.nn.functional.hardswish(a)
+
+
 def softmax(a: torch.Tensor, dim: int = -1) -> torch.Tensor:
     if _C is None or isinstance(a, torch.fx.Proxy):
         return torch.nn.functional.softmax(a, dim=dim)

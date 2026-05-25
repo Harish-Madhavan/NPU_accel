@@ -163,6 +163,12 @@ def convert_relu(builder: OVGraphBuilder, node, args, kwargs):
     return ops.relu(inp)
 
 
+@OpRegistry.register_module(torch.nn.ReLU)
+def convert_relu_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.relu(inp)
+
+
 @OpRegistry.register_function(torch.nn.functional.gelu, npu_gelu_func)
 def convert_gelu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
@@ -171,10 +177,52 @@ def convert_gelu(builder: OVGraphBuilder, node, args, kwargs):
     return ops.gelu(inp, approximation_mode=mode)
 
 
+@OpRegistry.register_module(torch.nn.GELU)
+def convert_gelu_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    approx = submod.approximate
+    mode = "erf" if approx == "none" else "tanh"
+    return ops.gelu(inp, approximation_mode=mode)
+
+
 @OpRegistry.register_function(torch.nn.functional.silu, npu_silu_func)
 def convert_silu(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     return ops.swish(inp)
+
+
+@OpRegistry.register_module(torch.nn.SiLU)
+def convert_silu_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.swish(inp)
+
+
+@OpRegistry.register_function(torch.nn.functional.hardsigmoid)
+def convert_hardsigmoid(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    alpha = ops.constant(1.0 / 6.0, dtype=np.float32)
+    beta = ops.constant(0.5, dtype=np.float32)
+    return ops.hard_sigmoid(inp, alpha, beta)
+
+
+@OpRegistry.register_module(torch.nn.Hardsigmoid)
+def convert_hardsigmoid_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    alpha = ops.constant(1.0 / 6.0, dtype=np.float32)
+    beta = ops.constant(0.5, dtype=np.float32)
+    return ops.hard_sigmoid(inp, alpha, beta)
+
+
+@OpRegistry.register_function(torch.nn.functional.hardswish)
+def convert_hardswish(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.hswish(inp)
+
+
+@OpRegistry.register_module(torch.nn.Hardswish)
+def convert_hardswish_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    return ops.hswish(inp)
 
 
 @OpRegistry.register_function(torch.sigmoid, torch.nn.functional.sigmoid)
@@ -274,10 +322,30 @@ def convert_where(builder: OVGraphBuilder, node, args, kwargs):
 
 
 @OpRegistry.register_function(torch.clamp, torch.nn.functional.hardtanh)
+@OpRegistry.register_method("clamp")
 def convert_clamp(builder: OVGraphBuilder, node, args, kwargs):
     inp = builder.get_input_or_constant(args[0])
     min_val = kwargs.get("min", args[1] if len(args) > 1 else None)
     max_val = kwargs.get("max", args[2] if len(args) > 2 else None)
+
+    if min_val is not None:
+        min_node = builder.get_input_or_constant(min_val)
+        inp, min_node = builder.align_types(inp, min_node)
+        inp = ops.maximum(inp, min_node)
+
+    if max_val is not None:
+        max_node = builder.get_input_or_constant(max_val)
+        inp, max_node = builder.align_types(inp, max_node)
+        inp = ops.minimum(inp, max_node)
+
+    return inp
+
+
+@OpRegistry.register_module(torch.nn.Hardtanh)
+def convert_hardtanh_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    min_val = submod.min_val
+    max_val = submod.max_val
 
     if min_val is not None:
         min_node = builder.get_input_or_constant(min_val)
@@ -1666,3 +1734,65 @@ def convert_quantized_linear(builder: OVGraphBuilder, node, args, kwargs):
         bias_cast = ops.convert(bias, destination_type=inp.get_element_type())
         return ops.add(mm, bias_cast)
     return mm
+
+
+from .functional import NPUStatefulKVCache
+
+@OpRegistry.register_module(NPUStatefulKVCache)
+def convert_stateful_kv_cache(builder: OVGraphBuilder, node, submod, args, kwargs):
+    # Retrieve the new_kv input node
+    new_kv = builder.get_input_or_constant(args[0])
+
+    # 1. Create a state variable for the cache
+    ov_type = ov.Type.f32
+    if submod.dtype == torch.float16:
+        ov_type = ov.Type.f16
+
+    cache_shape = [submod.batch_size, submod.max_seq_len, submod.num_heads, submod.head_dim]
+
+    info_cache = ov.op.util.VariableInfo()
+    info_cache.data_shape = ov.PartialShape(cache_shape)
+    info_cache.data_type = ov_type
+    info_cache.variable_id = f"{node.name}_cache_state"
+
+    cache_var = ov.op.util.Variable(info_cache)
+    builder.variables.append(cache_var)
+
+    # Read the cache state
+    read_cache = ops.read_value(cache_var)
+
+    # 2. Create a state variable for the index pointer (using f32 to support native hardware state registers on NPU)
+    info_pos = ov.op.util.VariableInfo()
+    info_pos.data_shape = ov.PartialShape([])
+    info_pos.data_type = ov.Type.f32
+    info_pos.variable_id = f"{node.name}_pos_state"
+
+    pos_var = ov.op.util.Variable(info_pos)
+    builder.variables.append(pos_var)
+
+    # Read the position state (f32)
+    read_pos = ops.read_value(pos_var)
+
+    # 3. Determine the update sequence length
+    new_kv_shape = ops.shape_of(new_kv)
+    seq_len = ops.gather(new_kv_shape, ops.constant([1], dtype=np.int32), ops.constant([0], dtype=np.int32))
+    seq_len = ops.squeeze(seq_len, ops.constant([0], dtype=np.int32))
+    seq_len_i32 = ops.convert(seq_len, destination_type="i32")
+
+    # Widen indices using temporary i32 transient calculations
+    read_pos_i32 = ops.convert(read_pos, destination_type="i32")
+    indices = ops.range(read_pos_i32, ops.add(read_pos_i32, seq_len_i32), ops.constant(1, dtype=np.int32), output_type="i32")
+
+    # Update cache
+    updated_cache = ops.scatter_update(read_cache, indices, new_kv, ops.constant([1], dtype=np.int32))
+
+    # Assign new cache to variable
+    assign_cache = ops.assign(updated_cache, cache_var)
+    builder.sinks.append(assign_cache)
+
+    # Increment position and assign back (maintaining f32 state type for the variable)
+    new_pos = ops.add(read_pos, ops.convert(seq_len_i32, destination_type="f32"))
+    assign_pos = ops.assign(new_pos, pos_var)
+    builder.sinks.append(assign_pos)
+
+    return updated_cache

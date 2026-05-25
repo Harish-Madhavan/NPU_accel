@@ -8,7 +8,7 @@
 
 **Intel NPU Acceleration** is a high-performance PyTorch extension that bridges the gap between Python-based deep learning workflows and the dedicated **Neural Processing Unit (NPU)** found in modern Intel® Core™ Ultra processors.
 
-By leveraging the **OpenVINO™ Runtime** backend, this library allows developers to seamlessly offload compute-intensive operations, such as Large Language Model (LLM) inference, to the NPU, freeing up the CPU and GPU for other tasks while maintaining exceptional power efficiency.
+By leveraging the **OpenVINO™ Runtime** backend, this library allows developers to seamlessly offload compute-intensive operations, such as Large Language Model (LLM) inference and computer vision pre-processing, to the NPU, freeing up the CPU and GPU while maintaining exceptional power efficiency.
 
 ---
 
@@ -30,10 +30,12 @@ By leveraging the **OpenVINO™ Runtime** backend, this library allows developer
 
 -   **🎯 Zero-Effort Acceleration:** Compile entire `torch.nn.Module` objects with a single line of code.
 -   **⚡ Dual Execution Modes:**
-    -   **Graph Compilation:** Traces PyTorch models with `torch.fx`, optimizes the graph, and executes it as a fused OpenVINO executable.
-    -   **Eager Ops:** Optimized C++ kernels for individual operations, accessible directly from Python.
--   **🤖 LLM-First Optimization:** Specialized support for **RMSNorm**, **RoPE**, and **KV-Cache** management, enabling high-performance LLM inference on edge devices.
--   **🔄 Seamless Integration:** Works with standard PyTorch `Tensor` objects and requires no changes to your existing model definition.
+     -   **Graph Compilation:** Traces PyTorch models with `torch.fx`, optimizes the graph, and executes it as a fused OpenVINO executable.
+     -   **Eager Ops:** Optimized C++ kernels for individual operations, accessible directly from Python.
+-   **💾 Stateful NPU KV-Caches:** Offloads autoregressive LLM state and position indexing directly to NPU internal hardware registers (`ReadValue` and `Assign`), eliminating CPU-to-NPU bus latency.
+-   **🛡️ Double-Buffered Output Safety:** Alternates outputs between two pre-allocated buffers per stream, guaranteeing 100% memory safety in multi-stream or concurrent executions without allocation overhead.
+-   **🖼️ Hardware Pre-Post Processing (PPP):** Bakes layout transpositions (`NHWC` $\leftrightarrow$ `NCHW`), type casting, and mean/scale normalizations directly into the compiled graph, avoiding host CPU starvation.
+-   **🧠 Compiler Performance Intelligence:** Proactively analyzes configuration at compile-time and prints warnings/guidance to help users maximize NPU compute core utilization.
 -   **💾 Intelligent Caching:** Automatically caches compiled models to disk to ensure lightning-fast startup times.
 
 ---
@@ -108,10 +110,75 @@ npu_model = npu.compile(model, example_input)
 # High-performance inference
 with torch.no_grad():
     output = npu_model(example_input)
+```
 
-### 2. Low-Level Eager Execution
+### 2. Stateful KV-Caching (Autoregressive LLM Inference)
 
-For more granular control or for testing individual kernels, you can use NPU-accelerated operators directly on PyTorch Tensors. This mode avoids the tracer/compiler overhead for one-off operations.
+Keep LLM context memory directly inside the NPU hardware registers, avoiding high bus latency.
+
+```python
+import torch
+import torch.nn as nn
+import intel_npu_acceleration as npu
+
+class StatefulLLMDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Instantiate stateful cache: batch_size=1, max_seq_len=1024, heads=8, dim=64
+        self.kv_cache = npu.functional.NPUStatefulKVCache(
+            batch_size=1, max_seq_len=1024, num_heads=8, head_dim=64
+        )
+
+    def forward(self, new_token_kv):
+        return self.kv_cache(new_token_kv)
+
+model = StatefulLLMDecoder().eval()
+x_example = torch.randn(1, 1, 8, 64) # single token input
+
+# Compile stateful model
+npu_model = npu.compile(model, x_example, strict=True)
+
+# Autoregressive generation loop (0 CPU host-to-device cache copies!)
+for step in range(50):
+    new_token = torch.randn(1, 1, 8, 64)
+    cache_output = npu_model(new_token)
+
+# Reset hardware state registers for the next prompt/sequence
+npu_model.reset_states()
+```
+
+### 3. NPU Hardware Pre-Post Processing (PPP) Offloading
+
+Bake layout and color conversions directly into the compiled NPU model.
+
+```python
+import torch
+import intel_npu_acceleration as npu
+
+# Compile with preprocess config baked in
+preprocess_config = {
+    "input": {
+        "layout": "NHWC",          # User feeds uint8 NHWC image tensor (0..255)
+        "element_type": "u8",
+        "model_layout": "NCHW",    # NPU transposes and casts to float32 NCHW in hardware
+        "mean": [123.675, 116.28, 103.53],
+        "scale": [58.395, 57.12, 57.375],
+    }
+}
+
+# Model expects standard float32 NCHW format
+model = MyVisionModel().eval()
+x_example = torch.randn(1, 3, 224, 224)
+npu_model = npu.compile(model, x_example, preprocess_config=preprocess_config)
+
+# Raw image uint8 NHWC tensor feed (Zero CPU overhead!)
+img_tensor = torch.randint(0, 256, (1, 224, 224, 3), dtype=torch.uint8)
+output = npu_model(img_tensor)
+```
+
+### 4. Low-Level Eager Execution
+
+For more granular control, use accelerated operators directly on PyTorch Tensors.
 
 ```python
 import torch
@@ -130,21 +197,20 @@ d = npu.add(c, a)
 weight = torch.ones(10)
 e = npu.rmsnorm(d, weight, eps=1e-6)
 ```
-```
 
 ---
 
 ## 📋 Supported Operators
 
-The library supports a wide range of operators through its **Graph Compiler**. If an operator is not supported by the NPU, the compiler will raise a `NPUCompilationError` during the compilation phase.
+The library supports a wide range of operators through its **Graph Compiler**. If an operator is not supported by the NPU, the compiler will raise a `NPUCompilationError` during compilation (or cleanly fall back to CPU if `strict=False`).
 
 | Category | Operators |
 | :--- | :--- |
 | **Arithmetic** | `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Neg`, `Rsqrt`, `Mean` |
 | **Linear Algebra** | `MatMul`, `Linear`, `Transpose`, `MM` |
-| **Activations** | `ReLU`, `GELU`, `SiLU` (Swish), `Softmax` |
-| **Vision (Beta)** | `Conv2d`, `MaxPool2d`, `BatchNorm2d` |
-| **LLM Specific** | `SDPA` (Attention), `RMSNorm`, `KV-Cache Update`, `Sin/Cos` (RoPE) |
+| **Activations** | `ReLU`, `GELU`, `SiLU` (Swish), `Hardsigmoid`, `Hardswish`, `Softmax` |
+| **Vision** | `Conv2d`, `MaxPool2d`, `BatchNorm2d` |
+| **LLM Specific** | `SDPA` (Attention), `RMSNorm`, `KV-Cache Update`, `Sin/Cos` (RoPE), `StatefulKVCache` |
 | **Tensor Ops** | `Reshape` (View), `Cat`, `Stack`, `IndexSelect`, `Where`, `Triu` |
 | **Misc** | `Embedding`, `Clone`, `Full`, `Arange`, `GetItem` (Slicing) |
 
@@ -169,11 +235,11 @@ This script compares NPU performance against the standard PyTorch CPU implementa
 The library operates through three distinct layers:
 
 1.  **Frontend (Python/FX):** 
-    Uses `torch.fx.symbolic_trace` to capture the PyTorch model as a graph. It propagates shapes through the graph to ensure all tensor dimensions are resolved before compilation.
+    Uses `torch.fx.symbolic_trace` via custom `NPUTracer` to capture the PyTorch model as a graph. Overrides leaf-module tracing to compile specialized modules like `NPUStatefulKVCache` atomically.
 2.  **Bridge (Python/OpenVINO):**
-    Iterates through the FX graph nodes and translates them into **OpenVINO Opsets**. This layer handles complex transformations, such as converting PyTorch's `scaled_dot_product_attention` into an optimized sequence of OpenVINO kernels.
+    Iterates through the FX graph nodes and translates them into **OpenVINO Opsets**. Bakes pre-post processing configurations (type casts, transpositions, normalizations) directly into graph inputs.
 3.  **Backend (C++/Core):**
-    A thin, high-performance wrapper around the **OpenVINO C++ Runtime API**. It manages the singleton NPU device context, handles asynchronous execution requests, and interacts with the disk-based model cache.
+    A thin, high-performance wrapper around the **OpenVINO C++ Runtime API**. Manages the singleton NPU device context, executes asynchronous requests, coordinates zero-copy double-buffering, and interacts with the disk-based cache.
 
 ---
 
@@ -200,29 +266,18 @@ The `npu.is_available()` returns `False`.
 -   **Solution:** Ensure you are on an Intel Core Ultra processor and have the latest **Intel NPU Driver** installed from the Intel website. Virtual machines often do NOT expose the NPU to the guest OS.
 
 ### 3. `NPUCompilationError: Function ... not supported`
-You are trying to compile a model that contains an operator not yet implemented in our converter registry.
+You are trying to compile a model that contains an operator not yet implemented in our registry.
 -   **Solution:** Check the [Supported Operators](#-supported-operators) table. You can contribute a new converter in `src/intel_npu_acceleration/converters.py`.
 
 ---
 
 ## 🌟 Featured Workload: TinyLlama
 
-Want to see the library in action? Our [TinyLlama example](../examples/tiny_llama.py) demonstrates:
+Our [TinyLlama example](../examples/tiny_llama.py) demonstrates:
 -   **Flash-Attention like performance** using the `SDPA` operator.
--   **Efficient state management** with the custom `update_kv_cache` functional op.
--   **High-speed generation** on low-power NPU hardware.
-
----
-
-## 🗺️ Roadmap & Contributing
-
-We welcome contributions! If you'd like to help expand the library:
-1.  **Check the [ROADMAP.md](ROADMAP.md)** for planned features and technical debt.
-2.  **Add a new operator:** Check `registry.py` and `converters.py` for examples.
-3.  **Report bugs:** Open an issue with a reproducing script and your hardware specs.
+-   **Stateful KV-cache offloading** using `NPUStatefulKVCache`.
+-   **High-speed generation** on low-power Intel NPU hardware.
 
 ---
 
 *Intel, the Intel logo, and OpenVINO are trademarks of Intel Corporation.*
-
-

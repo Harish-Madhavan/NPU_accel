@@ -48,6 +48,7 @@ class TestIntelNPULib(unittest.TestCase):
                 self.tanh = torch.nn.Tanh()
                 self.relu6 = torch.nn.ReLU6()
                 self.leaky_relu = torch.nn.LeakyReLU(0.05)
+                self.hardtanh = torch.nn.Hardtanh(-2.0, 2.0)
 
             def forward(self, x):
                 # Test functional, method, and module versions of Sigmoid & Tanh
@@ -65,7 +66,13 @@ class TestIntelNPULib(unittest.TestCase):
 
                 l1 = self.leaky_relu(r2)
                 l2 = torch.nn.functional.leaky_relu(l1, negative_slope=0.05)
-                return l2
+
+                # Test clamp (functional & method) and Hardtanh module
+                c1 = self.hardtanh(l2)
+                c2 = torch.clamp(c1, min=-1.5, max=1.5)
+                c3 = torch.nn.functional.hardtanh(c2, min_val=-1.2, max_val=1.2)
+                c4 = c3.clamp(min=-1.0, max=1.0)
+                return c4
 
         model = ActivationsModel()
         x = torch.randn(2, 4)

@@ -26,6 +26,8 @@ class OVGraphBuilder:
         self.node_map: Dict[str, Any] = {}  # Maps fx node name to OV node output
         self.parameters: List[Any] = []
         self.result_nodes: List[Any] = []  # List of OV nodes that are outputs
+        self.sinks: List[Any] = []          # List of OV sink nodes (e.g. Assign)
+        self.variables: List[Any] = []      # List of OV variables (e.g. state registers)
         self.node_values = node_values if node_values is not None else {}
 
     def get_input(self, node_name: str) -> Any:
