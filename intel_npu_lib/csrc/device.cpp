@@ -134,6 +134,11 @@ void NPUBackend::setPerformanceHint(const std::string& hint) {
     }
 }
 
+void NPUBackend::setEagerDevice(const std::string& device) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_eager_device = device;
+}
+
 // ---------------------------------------------------------------------------
 // Model cache — double-checked locking so compilation runs outside the mutex
 // ---------------------------------------------------------------------------
@@ -155,12 +160,8 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key,
     // --- Slow path: compile outside the mutex (can take 30-40 s) ---
     if (!model) throw std::runtime_error("Model pointer is null but key not in cache: " + key);
 
-    const std::string device =
-        "CPU";  // Eager operations run on CPU to avoid Level Zero queue launch overhead and memory
-                // sync issues on individual tiny operations
-
     ov::CompiledModel compiled;
-    if (device == "NPU") {
+    if (m_eager_device == "NPU") {
         ov::AnyMap compile_props = {
             {ov::hint::performance_mode.name(), m_performance_hint},
             {ov::hint::inference_precision.name(), ov::element::f16},
@@ -176,15 +177,15 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key,
             if (m_has_context) {
                 compiled = m_core->compile_model(model, m_context, compile_props);
             } else {
-                compiled = m_core->compile_model(model, device, compile_props);
+                compiled = m_core->compile_model(model, m_eager_device, compile_props);
             }
         } catch (const std::exception& e) {
             std::cerr << "[Intel NPU] Compile with hints failed (" << e.what()
                       << "), retrying bare." << std::endl;
-            compiled = m_core->compile_model(model, device);
+            compiled = m_core->compile_model(model, m_eager_device);
         }
     } else {
-        compiled = m_core->compile_model(model, device);
+        compiled = m_core->compile_model(model, m_eager_device);
     }
 
     // --- Insert under lock (double-check: another thread may have compiled) ---
@@ -281,4 +282,7 @@ void set_npu_property(const std::string& key, const std::string& value) {
 }
 void set_npu_performance_hint(const std::string& hint) {
     NPUBackend::getInstance().setPerformanceHint(hint);
+}
+void set_npu_eager_device(const std::string& device) {
+    NPUBackend::getInstance().setEagerDevice(device);
 }

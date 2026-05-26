@@ -19,21 +19,28 @@ conv2d = F_auto.conv2d  # was F_base — now gradient-aware (groups OK)
 layer_norm = F_auto.layer_norm
 hardsigmoid = F_auto.hardsigmoid
 hardswish = F_auto.hardswish
+div = F_auto.div
+neg = F_auto.neg
+transpose = F_auto.transpose
+reshape = F_auto.reshape
+cat = F_auto.cat
+stack = F_auto.stack
+mean = F_auto.mean
+embedding = F_auto.embedding
+scaled_dot_product_attention = F_auto.scaled_dot_product_attention
 
 # Ops without explicit autograd support (NPU dispatch, no gradient tape)
-div = F_base.div
-neg = F_base.neg
-transpose = F_base.transpose
-reshape = F_base.reshape
-cat = F_base.cat
-stack = F_base.stack
-mean = F_base.mean
+squeeze = F_base.squeeze
+unsqueeze = F_base.unsqueeze
+index_select = F_base.index_select
+zeros = F_base.zeros
+ones = F_base.ones
+full = F_base.full
 max_pool2d = F_base.max_pool2d
 update_kv_cache = F_base.update_kv_cache
 quantized_linear = F_base.quantized_linear
 identity = F_base.identity
 dropout = F_base.dropout
-scaled_dot_product_attention = F_base.scaled_dot_product_attention
 
 torch.fx.wrap(quantized_linear)
 

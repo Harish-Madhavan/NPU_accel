@@ -117,6 +117,26 @@ class TestIntelNPULib(unittest.TestCase):
             torch.allclose(out_compiled, out_original, rtol=1e-2, atol=1e-2)
         )
 
+    def test_cache_management(self):
+        # 1. Test get_cache_size returns expected tuple structure
+        size, count = intel_npu_acceleration.get_cache_size()
+        self.assertIsInstance(size, int)
+        self.assertIsInstance(count, int)
+        self.assertGreaterEqual(size, 0)
+        self.assertGreaterEqual(count, 0)
+
+        # 2. Test clean_old_cache runs without error
+        intel_npu_acceleration.clean_old_cache(max_size_mb=10, max_files=5)
+
+        # 3. Test clear_cache runs without error
+        intel_npu_acceleration.clear_cache()
+        
+        # After clearing, verify no exceptions occurred and size is less than or equal to original.
+        # (Some files may be locked by active OpenVINO execution in other parallel tests on Windows)
+        new_size, new_count = intel_npu_acceleration.get_cache_size()
+        self.assertLessEqual(new_size, size)
+        self.assertLessEqual(new_count, count)
+
 
 if __name__ == "__main__":
     unittest.main()

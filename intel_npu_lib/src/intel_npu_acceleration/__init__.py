@@ -80,6 +80,103 @@ def set_cache_dir(cache_dir: str):
         _C.set_cache_dir(cache_dir)
 
 
+def clear_cache():
+    """Clear all files in the NPU cache directory."""
+    cache_dir = get_cache_dir()
+    if not cache_dir or not os.path.exists(cache_dir):
+        logger.warning("No cache directory configured or directory does not exist.")
+        return
+    logger.info(f"Clearing NPU cache directory: {cache_dir}")
+    for root, dirs, files in os.walk(cache_dir, topdown=False):
+        for name in files:
+            try:
+                os.remove(os.path.join(root, name))
+            except Exception as e:
+                logger.debug(f"Failed to remove cache file {name}: {e}")
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except Exception as e:
+                logger.debug(f"Failed to remove cache directory {name}: {e}")
+
+
+def get_cache_size() -> tuple[int, int]:
+    """
+    Get the total size in bytes and number of files in the cache directory.
+    Returns:
+        (total_size_bytes, file_count)
+    """
+    cache_dir = get_cache_dir()
+    if not cache_dir or not os.path.exists(cache_dir):
+        return 0, 0
+    total_size = 0
+    file_count = 0
+    for root, _, files in os.walk(cache_dir):
+        for name in files:
+            file_path = os.path.join(root, name)
+            try:
+                total_size += os.path.getsize(file_path)
+                file_count += 1
+            except Exception:
+                pass
+    return total_size, file_count
+
+
+def clean_old_cache(max_size_mb: int = 1024, max_files: int = 500):
+    """
+    Clean the cache directory by deleting the oldest files (based on modification time)
+    until the total size is below max_size_mb and total file count is below max_files.
+    """
+    cache_dir = get_cache_dir()
+    if not cache_dir or not os.path.exists(cache_dir):
+        return
+
+    # Gather all cache files with their modification times and sizes
+    all_files = []
+    for root, _, files in os.walk(cache_dir):
+        for name in files:
+            file_path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(file_path)
+                size = os.path.getsize(file_path)
+                all_files.append((file_path, mtime, size))
+            except Exception:
+                pass
+
+    total_size = sum(f[2] for f in all_files)
+    total_files = len(all_files)
+
+    max_size_bytes = max_size_mb * 1024 * 1024
+
+    if total_size <= max_size_bytes and total_files <= max_files:
+        return
+
+    # Sort files by modification time (oldest first)
+    all_files.sort(key=lambda x: x[1])
+
+    logger.info(
+        f"Cleaning NPU cache. Current size: {total_size / (1024*1024):.2f} MB ({total_files} files). "
+        f"Limits: {max_size_mb} MB, {max_files} files."
+    )
+
+    deleted_count = 0
+    deleted_size = 0
+
+    for file_path, _, size in all_files:
+        if total_size <= max_size_bytes and total_files <= max_files:
+            break
+        try:
+            os.remove(file_path)
+            total_size -= size
+            total_files -= 1
+            deleted_count += 1
+            deleted_size += size
+        except Exception as e:
+            logger.debug(f"Failed to delete old cache file {file_path}: {e}")
+
+    logger.info(f"Cleaned {deleted_count} old cache files ({deleted_size / (1024*1024):.2f} MB cleared).")
+
+
 def is_available() -> bool:
     if _C is None:
         return False
@@ -100,6 +197,14 @@ def set_performance_hint(hint: str):
         _C.set_performance_hint(hint)
     else:
         logger.warning("NPU C++ extension not loaded. Cannot set performance hint.")
+
+
+def set_eager_device(device: str):
+    """Set device for eager operations (CPU, NPU)."""
+    if _C is not None:
+        _C.set_eager_device(device)
+    else:
+        logger.warning("NPU C++ extension not loaded. Cannot set eager device.")
 
 
 def enable_turbo():
@@ -128,6 +233,15 @@ from .functional import (  # noqa: E402
     rmsnorm,
     transpose,
     reshape,
+    squeeze,
+    unsqueeze,
+    cat,
+    stack,
+    mean,
+    index_select,
+    zeros,
+    ones,
+    full,
     conv2d,
     max_pool2d,
     update_kv_cache,
@@ -135,6 +249,8 @@ from .functional import (  # noqa: E402
     layer_norm,
     hardsigmoid,
     hardswish,
+    embedding,
+    scaled_dot_product_attention,
 )
 
 # --- Expose Compiler API ---
@@ -150,6 +266,10 @@ __all__ = [
     "compile_to_npu",
     "get_cache_dir",
     "set_cache_dir",
+    "clear_cache",
+    "get_cache_size",
+    "clean_old_cache",
+    "set_eager_device",
     "add",
     "sub",
     "mul",
@@ -164,6 +284,15 @@ __all__ = [
     "rmsnorm",
     "transpose",
     "reshape",
+    "squeeze",
+    "unsqueeze",
+    "cat",
+    "stack",
+    "mean",
+    "index_select",
+    "zeros",
+    "ones",
+    "full",
     "conv2d",
     "max_pool2d",
     "update_kv_cache",
@@ -171,4 +300,6 @@ __all__ = [
     "layer_norm",
     "hardsigmoid",
     "hardswish",
+    "embedding",
+    "scaled_dot_product_attention",
 ]

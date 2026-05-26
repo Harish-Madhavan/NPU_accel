@@ -6,6 +6,7 @@ import math
 import time
 import intel_npu_acceleration.functional as n_f
 import intel_npu_acceleration as npu_compiler
+from intel_npu_acceleration.functional import NPUStatefulKVCache
 
 
 @dataclass
@@ -62,6 +63,10 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+
+# =====================================================================
+#             1. Standard Functional KV Cache LLaMA Model
+# =====================================================================
 
 class Attention(nn.Module):
     def __init__(self, args: LlamaConfig):
@@ -241,6 +246,136 @@ class Llama(nn.Module):
         return output, new_kv_cache
 
 
+# =====================================================================
+#             2. Hardware-Offloaded Stateful KV Cache LLaMA Model
+# =====================================================================
+
+class StatefulAttention(nn.Module):
+    def __init__(self, args: LlamaConfig):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_local_heads = args.n_heads
+        self.n_local_kv_heads = self.n_kv_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        # Stateful KV Cache modules embedded directly inside the attention block
+        self.cache_k = NPUStatefulKVCache(1, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        self.cache_v = NPUStatefulKVCache(1, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # Apply RoPE
+        xq = apply_rotary_emb(xq, freqs_cos, freqs_sin)
+        xk = apply_rotary_emb(xk, freqs_cos, freqs_sin)
+
+        # Update and read cache state registers directly in hardware
+        keys = self.cache_k(xk)
+        values = self.cache_v(xv)
+
+        # Repeat KV heads to match Q heads (GQA)
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
+
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+
+        # Causal attention using hardware-based mask
+        output = n_f.scaled_dot_product_attention(
+            xq, keys, values, attn_mask=mask, is_causal=False
+        )
+        
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
+
+
+class StatefulTransformerBlock(nn.Module):
+    def __init__(self, layer_id: int, args: LlamaConfig):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = StatefulAttention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+        )
+        self.layer_id = layer_id
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        att_out = self.attention(
+            self.attention_norm(x),
+            freqs_cos,
+            freqs_sin,
+            mask,
+        )
+        h = x + att_out
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+class StatefulLlama(nn.Module):
+    def __init__(self, params: LlamaConfig):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(StatefulTransformerBlock(layer_id, params))
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        h = self.tok_embeddings(tokens)
+
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin, mask)
+
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
+
+# =====================================================================
+#                        Quantization & Helper
+# =====================================================================
+
 def quantize_to_int8(model: nn.Module):
     """
     Simulate weight-only INT8 quantization by casting linear weights to int8.
@@ -257,6 +392,10 @@ def quantize_to_int8(model: nn.Module):
                 setattr(module, "weight_scale", scale)
     return model
 
+
+# =====================================================================
+#                      Text Generation Runners
+# =====================================================================
 
 def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig):
     # Convert characters to ASCII integers
@@ -278,13 +417,11 @@ def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaCon
 
     t_start = time.time()
     
-    # 1. Prefill Phase (fed token-by-token to maintain static shape [1, 1])
-    # Feed prompt tokens one-by-one to populate KV cache
+    # 1. Prefill Phase
     for start_pos, tok_id in enumerate(tokens[:-1]):
         input_t = torch.tensor([[tok_id]], dtype=torch.long)
         _, kv_cache = npu_model(input_t, start_pos, kv_cache)
         
-    # The last token of the prompt will produce the first generated token
     next_token = tokens[-1]
     start_pos = len(tokens) - 1
     
@@ -308,7 +445,80 @@ def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaCon
         # Safe ASCII decode
         char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
         print(char, end="", flush=True)
-        time.sleep(0.015)  # Fast typing effect
+        time.sleep(0.015)
+
+    t_total = time.time() - t_start
+    avg_step = sum(latencies) / len(latencies) if latencies else 0
+    print(f"'\n  [Metrics] Generation finished in {t_total:.2f}s | Avg decode step: {avg_step:.2f} ms")
+    return avg_step
+
+
+def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig, raw_model: StatefulLlama):
+    # Convert characters to ASCII integers
+    tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
+    if not tokens:
+        tokens = [32]
+        
+    print(f"  Prompt tokens: {tokens}")
+    print(f"  Generated Text : '{prompt}", end="", flush=True)
+
+    # Reset both compiler execution streams and python fallback cache buffers
+    npu_model.reset_states()
+    for layer in raw_model.layers:
+        layer.attention.cache_k.reset()
+        layer.attention.cache_v.reset()
+
+    # Precompute RoPE cos/sin freqs
+    freqs_cos, freqs_sin = precompute_freqs_cis(
+        conf.dim // conf.n_heads, conf.max_seq_len * 2
+    )
+
+    t_start = time.time()
+    
+    # 1. Prefill Phase
+    for start_pos, tok_id in enumerate(tokens[:-1]):
+        input_t = torch.tensor([[tok_id]], dtype=torch.long)
+        
+        idx = torch.tensor([start_pos])
+        cos = freqs_cos[idx]  # shape: (1, 8)
+        sin = freqs_sin[idx]  # shape: (1, 8)
+        
+        # Causal mask: 1 for active positions, -inf for futures
+        mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
+        mask[0, 0, 0, : start_pos + 1] = 0.0
+        
+        npu_model(input_t, cos, sin, mask)
+        
+    next_token = tokens[-1]
+    start_pos = len(tokens) - 1
+    
+    # 2. Decode Phase
+    latencies = []
+    for step in range(max_gen_len):
+        current_pos = start_pos + step
+        if current_pos >= conf.max_seq_len:
+            break
+            
+        input_t = torch.tensor([[next_token]], dtype=torch.long)
+        
+        idx = torch.tensor([current_pos])
+        cos = freqs_cos[idx]  # shape: (1, 8)
+        sin = freqs_sin[idx]  # shape: (1, 8)
+        
+        mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
+        mask[0, 0, 0, : current_pos + 1] = 0.0
+        
+        t0 = time.time()
+        logits = npu_model(input_t, cos, sin, mask)
+        t1 = time.time()
+        latencies.append((t1 - t0) * 1000.0)
+
+        # Greedy decoding
+        next_token = torch.argmax(logits[0, -1]).item()
+        
+        char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
+        print(char, end="", flush=True)
+        time.sleep(0.015)
 
     t_total = time.time() - t_start
     avg_step = sum(latencies) / len(latencies) if latencies else 0
@@ -332,7 +542,9 @@ def main():
     prompt = "Intel NPU:"
     max_gen_len = 30
 
-    # We compile the graph using a static shape (1, 1)
+    # -------------------------------------------------------------
+    # PART A: Standard FP16 Model (Functional KV Cache)
+    # -------------------------------------------------------------
     compile_input_token = torch.tensor([[65]], dtype=torch.long)
     compile_start_pos = 0
     compile_cache = torch.zeros(
@@ -343,38 +555,84 @@ def main():
         conf.dim // conf.n_heads,
     )
 
-    # Compile FP16 model
-    print("\n[Step 1] Compiling Tiny LLaMA FP16 model for NPU...")
+    print("\n[Step 1] Compiling Tiny LLaMA FP16 model (Functional Cache) for NPU...")
     t0 = time.time()
     npu_model_fp16 = npu_compiler.compile_to_npu(model, (compile_input_token, compile_start_pos, compile_cache))
     print(f"Compilation finished in {time.time() - t0:.2f}s.")
 
-    print("\n[Step 2] Executing Autoregressive Text Generation (NPU FP16):")
+    print("\n[Step 2] Executing Autoregressive Text Generation (NPU FP16 - Functional):")
     fp16_latency = run_text_generation(npu_model_fp16, prompt, max_gen_len, conf)
 
-    # Compile INT8 quantized model
+    # -------------------------------------------------------------
+    # PART B: Standard INT8 Model (Functional KV Cache)
+    # -------------------------------------------------------------
     print("\n[Step 3] Simulating Weight-Only INT8 Quantization...")
     model_int8 = quantize_to_int8(model)
 
-    print("\n[Step 4] Compiling Tiny LLaMA INT8 model for NPU...")
+    print("\n[Step 4] Compiling Tiny LLaMA INT8 model (Functional Cache) for NPU...")
     t0 = time.time()
     npu_model_int8 = npu_compiler.compile_to_npu(model_int8, (compile_input_token, compile_start_pos, compile_cache))
     print(f"Compilation finished in {time.time() - t0:.2f}s.")
 
-    print("\n[Step 5] Executing Autoregressive Text Generation (NPU INT8):")
+    print("\n[Step 5] Executing Autoregressive Text Generation (NPU INT8 - Functional):")
     int8_latency = run_text_generation(npu_model_int8, prompt, max_gen_len, conf)
 
+    # -------------------------------------------------------------
+    # PART C: Stateful LLaMA Model (Hardware-Offloaded Cache)
+    # -------------------------------------------------------------
+    print("\n[Step 6] Initializing Stateful LLaMA Model (Phase 4 Stateful Decoders)...")
+    stateful_model = StatefulLlama(conf)
+    stateful_model.eval()
+
+    # Load weights from the non-quantized model for identical outputs
+    stateful_model.tok_embeddings.weight.data.copy_(model.tok_embeddings.weight.data)
+    stateful_model.output.weight.data.copy_(model.output.weight.data)
+    for i in range(conf.n_layers):
+        stateful_model.layers[i].attention.wq.weight.data.copy_(model.layers[i].attention.wq.weight.data)
+        stateful_model.layers[i].attention.wk.weight.data.copy_(model.layers[i].attention.wk.weight.data)
+        stateful_model.layers[i].attention.wv.weight.data.copy_(model.layers[i].attention.wv.weight.data)
+        stateful_model.layers[i].attention.wo.weight.data.copy_(model.layers[i].attention.wo.weight.data)
+        stateful_model.layers[i].feed_forward.w1.weight.data.copy_(model.layers[i].feed_forward.w1.weight.data)
+        stateful_model.layers[i].feed_forward.w2.weight.data.copy_(model.layers[i].feed_forward.w2.weight.data)
+        stateful_model.layers[i].feed_forward.w3.weight.data.copy_(model.layers[i].feed_forward.w3.weight.data)
+        stateful_model.layers[i].attention_norm.weight.data.copy_(model.layers[i].attention_norm.weight.data)
+        stateful_model.layers[i].ffn_norm.weight.data.copy_(model.layers[i].ffn_norm.weight.data)
+
+    compile_cos = torch.zeros(1, conf.dim // (2 * conf.n_heads))
+    compile_sin = torch.zeros(1, conf.dim // (2 * conf.n_heads))
+    compile_mask = torch.zeros(1, 1, 1, conf.max_seq_len)
+
+    print("\n[Step 7] Compiling Stateful Tiny LLaMA (Zero-Transfer Registers) for NPU...")
+    t0 = time.time()
+    npu_model_stateful = npu_compiler.compile_to_npu(
+        stateful_model,
+        (compile_input_token, compile_cos, compile_sin, compile_mask),
+        strict=True
+    )
+    print(f"Compilation finished in {time.time() - t0:.2f}s.")
+
+    print("\n[Step 8] Executing Autoregressive Text Generation (NPU FP16 - Stateful Registers):")
+    stateful_latency = run_stateful_text_generation(
+        npu_model_stateful, prompt, max_gen_len, conf, stateful_model
+    )
+
+    # -------------------------------------------------------------
     # Comparison summary
-    print("\n" + "=" * 60)
+    # -------------------------------------------------------------
+    print("\n" + "=" * 67)
     print("                LLaMA GENERATION LATENCY SUMMARY                ")
-    print("=" * 60)
-    print(f"| Precision Target         | Avg Decode Latency (per Token)  |")
-    print("-" * 60)
-    print(f"| NPU FP16                 | {fp16_latency:25.2f} ms |")
-    print(f"| NPU INT8 (Weight-Only)   | {int8_latency:25.2f} ms |")
-    print("=" * 60)
-    speedup = fp16_latency / int8_latency if int8_latency > 0 else 0
-    print(f"INT8 speedup factor: {speedup:.2f}x\n")
+    print("=" * 67)
+    print(f"| Precision Target         | Cache Model | Avg Decode Latency (per Token)  |")
+    print("-" * 67)
+    print(f"| NPU FP16                 | Functional  | {fp16_latency:25.2f} ms |")
+    print(f"| NPU INT8 (Weight-Only)   | Functional  | {int8_latency:25.2f} ms |")
+    print(f"| NPU FP16 (Stateful)      | Hardware    | {stateful_latency:25.2f} ms |")
+    print("=" * 67)
+    
+    speedup_stateful = fp16_latency / stateful_latency if stateful_latency > 0 else 0
+    print(f"Stateful (Hardware Cache) speedup factor over FP16: {speedup_stateful:.2f}x")
+    speedup_int8 = fp16_latency / int8_latency if int8_latency > 0 else 0
+    print(f"INT8 speedup factor: {speedup_int8:.2f}x\n")
 
 
 if __name__ == "__main__":

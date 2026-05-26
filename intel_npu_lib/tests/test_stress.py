@@ -29,11 +29,14 @@ class TestNPUStress(unittest.TestCase):
         y = torch.randn(2, 4)
         npu_model = compile_to_npu(model, (x, y))
 
-        # 2. Continuous execution loop (1,000 iterations)
-        for i in range(1000):
+        # 2. Continuous execution loop (10,000 iterations for memory leak audit)
+        print("Running 10,000 iterations for memory leak audit...")
+        for i in range(10000):
             out = npu_model(x, y)
-            expected = x + y
-            self.assertTrue(torch.allclose(out, expected, atol=1e-3, rtol=1e-3))
+            if i % 1000 == 0:
+                expected = x + y
+                self.assertTrue(torch.allclose(out, expected, atol=1e-3, rtol=1e-3))
+        print("Completed 10,000 iterations successfully.")
 
     def test_context_switching(self):
         # Compile two different models
@@ -83,6 +86,50 @@ class TestNPUStress(unittest.TestCase):
         self.assertEqual(
             len(errors), 0, f"Multi-threaded stress test failed with errors: {errors}"
         )
+
+    def test_leased_buffer_pool_concurrency(self):
+        import gc
+        model = AdditionModel()
+        x = torch.randn(2, 2)
+        y = torch.randn(2, 2)
+        
+        # Compile with clone_outputs=False to test weakref buffer recycling
+        npu_model = compile_to_npu(model, (x, y), num_streams=5, clone_outputs=False)
+        
+        pool = npu_model.output_pools[0]
+        self.assertEqual(len(pool.active_buffers), 0)
+        
+        def run_inferences():
+            # Launch 5 overlapping async inferences
+            handles = []
+            for i in range(5):
+                h = npu_model.infer_async(x + i, y)
+                handles.append(h)
+                
+            # Active buffers should now be 5
+            self.assertEqual(len(pool.active_buffers), 5)
+            
+            # Wait and collect outputs
+            outputs = []
+            for i, h in enumerate(handles):
+                out = npu_model.wait_async(h)
+                self.assertTrue(torch.allclose(out, x + i + y, atol=1e-3, rtol=1e-3))
+                outputs.append(out)
+                
+            # Tensors are still held in local scope `outputs`, so they must not be recycled yet
+            self.assertEqual(len(pool.active_buffers), 5)
+            return len(pool.active_buffers)
+
+        # Execute in nested scope
+        active_before = run_inferences()
+        self.assertEqual(active_before, 5)
+        
+        # After returning, the local scope variables are completely destroyed. Force garbage collection!
+        gc.collect()
+        
+        # Active buffers should drop back to 0, and all 5 should be returned to idle!
+        self.assertEqual(len(pool.active_buffers), 0)
+        self.assertEqual(len(pool.idle_buffers), 5)
 
 
 if __name__ == "__main__":

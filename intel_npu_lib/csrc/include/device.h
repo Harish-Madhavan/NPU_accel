@@ -33,6 +33,7 @@ public:
     void setCacheDir(const std::string& path);
     void setProperty(const std::string& key, const std::string& value);
     void setPerformanceHint(const std::string& hint);
+    void setEagerDevice(const std::string& device);
 
     // Property probing
     bool isPropertySupported(const std::string& key) const;
@@ -75,15 +76,17 @@ private:
     std::mutex m_mutex;
     bool m_is_available;
     bool m_has_context = false;               // True when RemoteContext init succeeded
+    std::string m_eager_device = "CPU";       // Default to CPU for tiny ops
     std::set<std::string> m_supported_props;  // Populated by probeProperties()
     ov::hint::PerformanceMode m_performance_hint = ov::hint::PerformanceMode::LATENCY;
 
     void probeProperties();  // Queries ov::supported_properties at init
-};
+    };
 
-// C-API wrappers for Python bindings
-bool is_npu_available();
-void initialize_npu();
-void set_npu_cache_dir(const std::string& path);
-void set_npu_property(const std::string& key, const std::string& value);
-void set_npu_performance_hint(const std::string& hint);
+    // C-API wrappers for Python bindings
+    bool is_npu_available();
+    void initialize_npu();
+    void set_npu_cache_dir(const std::string& path);
+    void set_npu_property(const std::string& key, const std::string& value);
+    void set_npu_performance_hint(const std::string& hint);
+    void set_npu_eager_device(const std::string& device);

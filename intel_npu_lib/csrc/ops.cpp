@@ -411,6 +411,40 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
     return execute_op(key, model, {input});
 }
 
+torch::Tensor npu_squeeze(torch::Tensor input, std::vector<int64_t> dims) {
+    std::stringstream ss;
+    ss << "squeeze_";
+    for (auto d : dims) ss << d << ",";
+    std::string key = get_key("squeeze", {input}, ss.str());
+    auto arg_input =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
+
+    std::shared_ptr<ov::Node> op;
+    if (dims.empty()) {
+        op = std::make_shared<ov::opset1::Squeeze>(arg_input);
+    } else {
+        auto axes_const =
+            ov::opset1::Constant::create(ov::element::i64, ov::Shape{dims.size()}, dims);
+        op = std::make_shared<ov::opset1::Squeeze>(arg_input, axes_const);
+    }
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input});
+    return execute_op(key, model, {input});
+}
+
+torch::Tensor npu_unsqueeze(torch::Tensor input, std::vector<int64_t> dims) {
+    std::stringstream ss;
+    ss << "unsqueeze_";
+    for (auto d : dims) ss << d << ",";
+    std::string key = get_key("unsqueeze", {input}, ss.str());
+    auto arg_input =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
+    auto axes_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{dims.size()}, dims);
+    auto op = std::make_shared<ov::opset1::Unsqueeze>(arg_input, axes_const);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input});
+    return execute_op(key, model, {input});
+}
+
 torch::Tensor npu_cat(std::vector<torch::Tensor> tensors, int64_t dim) {
     if (tensors.empty()) throw std::runtime_error("npu_cat expects at least one tensor");
     if (dim < 0) dim += tensors[0].dim();
@@ -473,6 +507,19 @@ torch::Tensor npu_mean(torch::Tensor input, std::vector<int64_t> dim, bool keepd
     auto model =
         std::make_shared<ov::Model>(ov::OutputVector{reduce}, ov::ParameterVector{arg_input});
     return execute_op(key, model, {input});
+}
+
+torch::Tensor npu_index_select(torch::Tensor input, int64_t dim, torch::Tensor index) {
+    std::string key = get_key("index_select", {input, index}, std::to_string(dim));
+    auto arg_input =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
+    auto arg_index =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(index), get_ov_shape(index));
+    auto axis_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {dim});
+    auto op = std::make_shared<ov::opset1::Gather>(arg_input, arg_index, axis_const);
+    auto model =
+        std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_input, arg_index});
+    return execute_op(key, model, {input, index});
 }
 
 torch::Tensor npu_scaled_dot_product_attention(torch::Tensor query, torch::Tensor key,

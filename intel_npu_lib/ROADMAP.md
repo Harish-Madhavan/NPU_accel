@@ -51,14 +51,14 @@ This document outlines the engineering roadmap and strategic milestones to trans
 *Goal: Guarantee production-grade reliability under complex topologies and strict mathematical testing.*
 
 - [ ] **Test Infrastructure**:
-    - [ ] **Parametrized Multi-Dimension Tests**: Build parameterized matrix tests validating input shapes from 1D up to 5D across dynamic types (FP32, FP16, INT8, UINT8) to verify precision auto-casting.
-    - [ ] **Boundary Conditions**: Add QA testing for extreme boundaries, including zero-sized inputs, unaligned arrays, and u8 image boundary clamping.
+    - [x] **Parametrized Multi-Dimension Tests**: Build parameterized matrix tests validating input shapes from 1D up to 5D across dynamic types (FP32, FP16, INT8, UINT8) to verify precision auto-casting.
+    - [x] **Boundary Conditions**: Add QA testing for extreme boundaries, including zero-sized inputs, unaligned arrays, and u8 image boundary clamping.
 - [x] **Diversified Model Workloads**:
     - [x] **Computer Vision (CNNs)**: Fully verified compiling and executing standard CNN blocks (ResNet, Conv2D, MaxPool2d, BatchNorm2d) on NPU hardware.
     - [x] **Transformer Encoders**: Successfully compiled and verified BERT-style self-attention modules under `strict=True` compilation mode.
 - [ ] **Stress and Lifecycle Testing**:
-    - [ ] **Memory Leak Audits**: Run continuous inference loops for 10,000+ generations, logging NPU virtual memory parameters to verify stable hardware state lifetimes.
-    - [ ] **Context-Switching Stability**: Assert correct outputs and stable memory footprints when dynamically interleaving execution between multiple distinct compiled NPU models.
+    - [x] **Memory Leak Audits**: Run continuous inference loops for 10,000+ generations, logging NPU virtual memory parameters to verify stable hardware state lifetimes.
+    - [x] **Context-Switching Stability**: Assert correct outputs and stable memory footprints when dynamically interleaving execution between multiple distinct compiled NPU models.
 
 ---
 
@@ -72,7 +72,7 @@ This document outlines the engineering roadmap and strategic milestones to trans
 - [x] **Asynchronous Execution Streams**:
     - [x] **Multi-Request Buffering**: Exposed OpenVINO's async infer queue to Python, enabling multi-request buffering to overlap CPU pre-processing with NPU execution.
     - [x] **Round-Robin Output Double-Buffering**: Built automatic double-buffering per execution stream to ensure 100% memory safety for concurrent inferences.
-    - [ ] **Weak-Reference Output Leases**: Transition output double-buffering to a scalable leased buffer pool using weak references for arbitrary concurrent execution bounds.
+    - [x] **Weak-Reference Output Leases**: Transition output double-buffering to a scalable leased buffer pool using weak references for arbitrary concurrent execution bounds.
 - [ ] **INT8 Post-Training Quantization (PTQ)**:
     - [ ] **NNCF Compression Integration**: Integrate OpenVINO's Neural Network Compression Framework (NNCF) to compile model weights into native Intel NPU low-precision matrix arithmetic (DP4A/VNNI) representations, yielding **up to a 2x speedup** over FP16.
 - [x] **Hardware Pre-Post Processing (PPP) Offloading**:

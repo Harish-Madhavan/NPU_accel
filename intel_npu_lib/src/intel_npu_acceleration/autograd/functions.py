@@ -1,7 +1,6 @@
 import torch
-import torch.fx
 import math
-from . import _functional as F_npu
+from .. import _functional as F_npu
 
 
 def _unbroadcast(grad, target_shape):
@@ -109,7 +108,6 @@ class NPUSoftmax(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (out,) = ctx.saved_tensors
-        # softmax gradient: s * (g - (g * s).sum(dim, keepdim=True))
         sum_grad_out_s = (grad_output * out).sum(ctx.dim, keepdim=True)
         grad_a = out * (grad_output - sum_grad_out_s)
         return grad_a, None
@@ -134,11 +132,6 @@ class NPULinear(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias
 
 
-# ---------------------------------------------------------------------------
-# GeLU  —  d/dx GeLU(x) = 0.5*(1 + erf(x/√2)) + x·exp(-x²/2)/√(2π)
-# ---------------------------------------------------------------------------
-
-
 class NPUGeLU(torch.autograd.Function):
     """NPU-accelerated GeLU with Autograd support."""
 
@@ -157,11 +150,6 @@ class NPUGeLU(torch.autograd.Function):
         return grad_a
 
 
-# ---------------------------------------------------------------------------
-# SiLU (Swish)  —  d/dx SiLU(x) = σ(x)·(1 + x·(1 − σ(x)))
-# ---------------------------------------------------------------------------
-
-
 class NPUSiLU(torch.autograd.Function):
     """NPU-accelerated SiLU (Swish) with Autograd support."""
 
@@ -178,11 +166,6 @@ class NPUSiLU(torch.autograd.Function):
             grad_output.dtype
         ) * grad_output
         return grad_a
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm  —  y = (x / rms(x)) * w,   rms(x) = sqrt(mean(x²) + ε)
-# ---------------------------------------------------------------------------
 
 
 class NPURMSNorm(torch.autograd.Function):
@@ -213,11 +196,6 @@ class NPURMSNorm(torch.autograd.Function):
         grad_input = ((dL_dxn - xn * correction) / rms).to(grad_output.dtype)
 
         return grad_input, grad_weight, None
-
-
-# ---------------------------------------------------------------------------
-# Conv2d
-# ---------------------------------------------------------------------------
 
 
 class NPUConv2d(torch.autograd.Function):
@@ -268,11 +246,6 @@ class NPUConv2d(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
-# ---------------------------------------------------------------------------
-# LayerNorm  —  y = (x - mean(x)) / sqrt(var(x) + ε) * w + b
-# ---------------------------------------------------------------------------
-
-
 class NPULayerNorm(torch.autograd.Function):
     """NPU-accelerated LayerNorm with Autograd support."""
 
@@ -280,8 +253,6 @@ class NPULayerNorm(torch.autograd.Function):
     def forward(ctx, input, normalized_shape, weight=None, bias=None, eps=1e-5):
         out = F_npu.layer_norm(input, normalized_shape, weight, bias, eps)
 
-        # Calculate mean and variance to save for backward
-        # Normalized dimensions are the last k dimensions
         rank = input.dim()
         k = len(normalized_shape)
         axes = tuple(range(rank - k, rank))
@@ -307,8 +278,6 @@ class NPULayerNorm(torch.autograd.Function):
         go = grad_output.float()
         xn = x_norm.float()
 
-        # Sum gradients over all batch dimensions for weight/bias
-        # The non-normalized dimensions are all dimensions except the last k
         non_norm_dims = tuple(range(go.dim() - len(normalized_shape)))
 
         grad_weight = None
@@ -324,7 +293,6 @@ class NPULayerNorm(torch.autograd.Function):
             w = weight.float() if weight is not None else 1.0
             dL_dxn = go * w
 
-            # LayerNorm derivative terms
             N = math.prod(normalized_shape)
             mean_dL_dxn = dL_dxn.sum(dim=axes, keepdim=True) / N
             mean_dL_dxn_xn = (dL_dxn * xn).sum(dim=axes, keepdim=True) / N
@@ -332,11 +300,6 @@ class NPULayerNorm(torch.autograd.Function):
             grad_input = ((dL_dxn - mean_dL_dxn - xn * mean_dL_dxn_xn) / rms).to(grad_output.dtype)
 
         return grad_input, None, grad_weight, grad_bias, None
-
-
-# ---------------------------------------------------------------------------
-# HardSigmoid  —  y = clamp(x + 3, 0, 6) / 6
-# ---------------------------------------------------------------------------
 
 
 class NPUHardSigmoid(torch.autograd.Function):
@@ -352,11 +315,6 @@ class NPUHardSigmoid(torch.autograd.Function):
         (a,) = ctx.saved_tensors
         grad_a = torch.where((-3.0 < a) & (a < 3.0), grad_output / 6.0, 0.0)
         return grad_a
-
-
-# ---------------------------------------------------------------------------
-# HardSwish  —  y = x * clamp(x + 3, 0, 6) / 6
-# ---------------------------------------------------------------------------
 
 
 class NPUHardSwish(torch.autograd.Function):
@@ -376,125 +334,233 @@ class NPUHardSwish(torch.autograd.Function):
         return grad_a
 
 
-# ---------------------------------------------------------------------------
-# Public autograd-aware wrappers
-# Routes to the Function class only when gradients are actually required,
-# so there is zero autograd overhead during pure inference.
-# ---------------------------------------------------------------------------
+class NPUNeg(torch.autograd.Function):
+    """NPU-accelerated Negation with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a):
+        return F_npu.neg(a)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -grad_output
 
 
-def matmul(a, b):
-    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
-        return NPUMatMul.apply(a, b)
-    return F_npu.matmul(a, b)
+class NPUDiv(torch.autograd.Function):
+    """NPU-accelerated Division with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a, b):
+        ctx.save_for_backward(a, b)
+        return F_npu.div(a, b)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        a, b = ctx.saved_tensors
+        grad_a = grad_output / b
+        grad_b = -grad_output * a / (b * b)
+        return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
 
 
-def add(a, b):
-    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
-        return NPUAdd.apply(a, b)
-    return F_npu.add(a, b)
+class NPUTranspose(torch.autograd.Function):
+    """NPU-accelerated Transpose with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, dim0, dim1):
+        ctx.dim0 = dim0
+        ctx.dim1 = dim1
+        return F_npu.transpose(input, dim0, dim1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.transpose(ctx.dim0, ctx.dim1), None, None
 
 
-def sub(a, b):
-    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
-        return NPUSub.apply(a, b)
-    return F_npu.sub(a, b)
+class NPUReshape(torch.autograd.Function):
+    """NPU-accelerated Reshape with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, shape):
+        ctx.input_shape = input.shape
+        return F_npu.reshape(input, shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.reshape(ctx.input_shape), None
 
 
-def mul(a, b):
-    if not isinstance(a, torch.fx.Proxy) and (a.requires_grad or b.requires_grad):
-        return NPUMul.apply(a, b)
-    return F_npu.mul(a, b)
+class NPUCat(torch.autograd.Function):
+    """NPU-accelerated Concatenate with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, dim, *tensors):
+        ctx.dim = dim
+        ctx.tensor_sizes = [t.shape[dim] for t in tensors]
+        return F_npu.cat(list(tensors), dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grads = torch.split(grad_output, ctx.tensor_sizes, dim=ctx.dim)
+        return (None,) + tuple(grads)
 
 
-def relu(a):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUReLU.apply(a)
-    return F_npu.relu(a)
+class NPUStack(torch.autograd.Function):
+    """NPU-accelerated Stack with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, dim, *tensors):
+        ctx.dim = dim
+        return F_npu.stack(list(tensors), dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grads = torch.unbind(grad_output, dim=ctx.dim)
+        return (None,) + tuple(grads)
 
 
-def gelu(a):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUGeLU.apply(a)
-    return F_npu.gelu(a)
+class NPUMean(torch.autograd.Function):
+    """NPU-accelerated Mean with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, dim=None, keepdim=False):
+        ctx.input_shape = input.shape
+        ctx.dim = dim
+        ctx.keepdim = keepdim
+        return F_npu.mean(input, dim, keepdim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_shape = ctx.input_shape
+        dim = ctx.dim
+        keepdim = ctx.keepdim
+
+        if dim is None or (isinstance(dim, (list, tuple)) and len(dim) == 0):
+            numel = math.prod(input_shape)
+            grad_input = grad_output.expand(input_shape) / numel
+        else:
+            if isinstance(dim, int):
+                dims = [dim]
+            else:
+                dims = list(dim)
+
+            rank = len(input_shape)
+            dims = [d + rank if d < 0 else d for d in dims]
+
+            reduced_elements = 1
+            for d in dims:
+                reduced_elements *= input_shape[d]
+
+            if not keepdim:
+                grad_reshape = list(grad_output.shape)
+                for d in sorted(dims):
+                    grad_reshape.insert(d, 1)
+                grad_output = grad_output.reshape(grad_reshape)
+
+            grad_input = grad_output.expand(input_shape) / reduced_elements
+
+        return grad_input, None, None
 
 
-def silu(a):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUSiLU.apply(a)
-    return F_npu.silu(a)
+class NPUEmbedding(torch.autograd.Function):
+    """NPU-accelerated Embedding with Autograd support."""
 
-
-def rmsnorm(input, weight, eps=1e-6):
-    if not isinstance(input, torch.fx.Proxy) and (
-        input.requires_grad or weight.requires_grad
+    @staticmethod
+    def forward(
+        ctx,
+        input,
+        weight,
+        padding_idx=None,
+        max_norm=None,
+        norm_type=2.0,
+        scale_grad_by_freq=False,
+        sparse=False,
     ):
-        return NPURMSNorm.apply(input, weight, eps)
-    return F_npu.rmsnorm(input, weight, eps)
+        ctx.save_for_backward(input, weight)
+        ctx.padding_idx = padding_idx
+        ctx.max_norm = max_norm
+        ctx.norm_type = norm_type
+        ctx.scale_grad_by_freq = scale_grad_by_freq
+        ctx.sparse = sparse
+        return torch.nn.functional.embedding(
+            input,
+            weight,
+            padding_idx=padding_idx,
+            max_norm=max_norm,
+            norm_type=norm_type,
+            scale_grad_by_freq=scale_grad_by_freq,
+            sparse=sparse,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight = ctx.saved_tensors
+        num_embeddings = weight.shape[0]
+        padding_idx = ctx.padding_idx if ctx.padding_idx is not None else -1
+        grad_weight = torch.ops.aten.embedding_backward(
+            grad_output,
+            input,
+            num_embeddings,
+            padding_idx,
+            ctx.scale_grad_by_freq,
+            ctx.sparse,
+        )
+        return None, grad_weight, None, None, None, None, None
 
 
-def softmax(a, dim=-1):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUSoftmax.apply(a, dim)
-    return F_npu.softmax(a, dim)
+class NPUScaledDotProductAttention(torch.autograd.Function):
+    """NPU-accelerated Scaled Dot Product Attention with Autograd support."""
 
-
-def linear(input, weight, bias=None):
-    if not isinstance(input, torch.fx.Proxy) and (
-        input.requires_grad
-        or weight.requires_grad
-        or (bias is not None and bias.requires_grad)
+    @staticmethod
+    def forward(
+        ctx,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
     ):
-        return NPULinear.apply(input, weight, bias)
-    return F_npu.linear(input, weight, bias)
+        ctx.dropout_p = dropout_p
+        ctx.is_causal = is_causal
+        ctx.scale = scale
 
+        out = F_npu.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale if scale is not None else 0.0,
+        )
 
-def conv2d(
-    input, weight, bias=None, stride=(1, 1), padding=(0, 0), dilation=(1, 1), groups=1
-):
-    if not isinstance(input, torch.fx.Proxy) and (
-        input.requires_grad
-        or weight.requires_grad
-        or (bias is not None and bias.requires_grad)
-    ):
-        return NPUConv2d.apply(input, weight, bias, stride, padding, dilation, groups)
-    return F_npu.conv2d(input, weight, bias, stride, padding, dilation, groups)
+        ctx.save_for_backward(query, key, value, attn_mask, out)
+        return out
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key, value, attn_mask, out = ctx.saved_tensors
 
-def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
-    if not isinstance(input, torch.fx.Proxy) and (
-        input.requires_grad
-        or (weight is not None and weight.requires_grad)
-        or (bias is not None and bias.requires_grad)
-    ):
-        return NPULayerNorm.apply(input, normalized_shape, weight, bias, eps)
-    return F_npu.layer_norm(input, normalized_shape, weight, bias, eps)
+        with torch.enable_grad():
+            q = query.detach().requires_grad_(True)
+            k = key.detach().requires_grad_(True)
+            v = value.detach().requires_grad_(True)
 
+            out_cpu = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=ctx.dropout_p,
+                is_causal=ctx.is_causal,
+                scale=ctx.scale,
+            )
 
-def hardsigmoid(a):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUHardSigmoid.apply(a)
-    return F_npu.hardsigmoid(a)
+            out_cpu.backward(grad_output)
 
+            grad_query = q.grad
+            grad_key = k.grad
+            grad_value = v.grad
 
-def hardswish(a):
-    if not isinstance(a, torch.fx.Proxy) and a.requires_grad:
-        return NPUHardSwish.apply(a)
-    return F_npu.hardswish(a)
-
-
-# Wrap public functions to prevent FX tracing into requires_grad checks
-torch.fx.wrap(matmul)
-torch.fx.wrap(add)
-torch.fx.wrap(sub)
-torch.fx.wrap(mul)
-torch.fx.wrap(relu)
-torch.fx.wrap(gelu)
-torch.fx.wrap(silu)
-torch.fx.wrap(rmsnorm)
-torch.fx.wrap(softmax)
-torch.fx.wrap(linear)
-torch.fx.wrap(conv2d)
-torch.fx.wrap(layer_norm)
-torch.fx.wrap(hardsigmoid)
-torch.fx.wrap(hardswish)
+        return grad_query, grad_key, grad_value, None, None, None, None

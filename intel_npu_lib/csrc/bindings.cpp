@@ -20,9 +20,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_linear", &npu_linear, "NPU accelerated Linear (MatMul + Bias)");
     m.def("npu_transpose", &npu_transpose, "NPU accelerated Transpose");
     m.def("npu_reshape", &npu_reshape, "NPU accelerated Reshape");
+    m.def("npu_squeeze", &npu_squeeze, "NPU accelerated Squeeze");
+    m.def("npu_unsqueeze", &npu_unsqueeze, "NPU accelerated Unsqueeze");
     m.def("npu_cat", &npu_cat, "NPU accelerated Concat");
     m.def("npu_stack", &npu_stack, "NPU accelerated Stack");
     m.def("npu_mean", &npu_mean, "NPU accelerated Mean");
+    m.def("npu_index_select", &npu_index_select, "NPU accelerated Index Select");
     m.def("npu_scaled_dot_product_attention", &npu_scaled_dot_product_attention,
           "NPU Scaled Dot Product Attention");
     m.def("npu_conv2d", &npu_conv2d, "NPU accelerated Conv2d");
@@ -34,4 +37,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_property", &set_npu_property, "Set global NPU property (Level Zero optimizations)");
     m.def("set_performance_hint", &set_npu_performance_hint,
           "Set performance hint (LATENCY, THROUGHPUT)");
+    m.def("set_eager_device", &set_npu_eager_device, "Set device for eager operations (CPU, NPU)");
 }
