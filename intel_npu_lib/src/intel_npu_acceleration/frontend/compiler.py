@@ -9,7 +9,7 @@ import openvino.properties.hint as ov_hints
 from typing import Any, Optional, List
 import numpy as np
 
-import intel_npu_acceleration as npu
+import intel_npu_acceleration as npu_lib
 from ..registry import OpRegistry
 from ..graph_builder import OVGraphBuilder, ValueCapturingInterpreter
 from .graph_module import NPUGraphModule, NPUDynamicGraphModule
@@ -29,7 +29,7 @@ def _get_core():
         _OV_CORE = ov.Core()
 
         # Disk model cache
-        cache_dir = npu.get_cache_dir()
+        cache_dir = npu_lib.get_cache_dir()
         if cache_dir:
             logger.debug(f"Configuring Graph-mode cache dir: {cache_dir}")
             try:
@@ -55,6 +55,7 @@ def compile(
     dynamic_dim: int = 1,
     clone_outputs: bool = True,
     preprocess_config: Optional[dict] = None,
+    stateful: bool = False,
 ) -> torch.nn.Module:
     """
     Compile a PyTorch model for Intel NPU.
@@ -70,6 +71,7 @@ def compile(
         dynamic_dim,
         clone_outputs,
         preprocess_config,
+        stateful,
     )
 
 
@@ -84,6 +86,7 @@ def compile_to_npu(
     dynamic_dim: int = 1,
     clone_outputs: bool = True,
     preprocess_config: Optional[dict] = None,
+    stateful: bool = False,
 ) -> torch.nn.Module:
     global _GRAPH_CACHE
 
@@ -112,7 +115,10 @@ def compile_to_npu(
     logger.info("Starting NPU Compilation...")
     try:
         # Trace the model into GraphModule first
-        traced = torch.fx.GraphModule(model, NPUTracer().trace(model))
+        if isinstance(model, torch.fx.GraphModule):
+            traced = model
+        else:
+            traced = torch.fx.GraphModule(model, NPUTracer().trace(model))
 
         # Check for unsupported operators in the graph
         has_unsupported = False
@@ -178,7 +184,7 @@ def compile_to_npu(
                 preprocess_config=preprocess_config,
             )
 
-        # 1. Generate Cache Key
+        # 1. Generate Cache Key (Include stateful in the cache key)
         graph_str = str(traced.graph)
 
         # Capture input shapes/dtypes for key
@@ -189,12 +195,13 @@ def compile_to_npu(
             else:
                 input_meta.append(type(t))
 
-        # Combine preprocess config into cache key to avoid cache hits mismatch
-        key_raw = f"{graph_str}_{input_meta}_{preprocess_config}"
+        key_raw = f"{graph_str}_{input_meta}_{preprocess_config}_{stateful}"
         key = hashlib.md5(key_raw.encode()).hexdigest()
         logger.debug(f"Generated Graph cache key: {key} from {key_raw[:100]}...")
 
         # Check Cache
+        all_placeholder_names = [node.name for node in traced.graph.nodes if node.op == "placeholder"]
+
         if key in _GRAPH_CACHE:
             logger.info("Cache hit! Using pre-compiled graph model.")
             # Move to end (most recent)
@@ -206,103 +213,199 @@ def compile_to_npu(
                 performance_hint,
                 num_streams,
                 clone_outputs,
+                all_placeholder_names=all_placeholder_names,
             )
 
-        # 2. Capture Values & Build OV Graph
-        interpreter = ValueCapturingInterpreter(traced)
-        interpreter.run(*example_input_tuple)
-
-        builder = OVGraphBuilder(interpreter.node_values)
-
-        from torch.fx.passes.shape_prop import ShapeProp
-        ShapeProp(traced).propagate(*example_input_tuple)
-
-        input_iter = iter(example_input_tuple)
-
-        for node in traced.graph.nodes:
-            if node.op == "placeholder":
-                try:
-                    val = next(input_iter)
-                except StopIteration:
-                    raise NPUCompilationError(
-                        f"Not enough example inputs for placeholders starting at {node.name}"
-                    )
-
-                if "tensor_meta" in node.meta:
-                    shape = node.meta["tensor_meta"].shape
-                    dtype = node.meta["tensor_meta"].dtype
-                else:
-                    if isinstance(val, torch.Tensor):
-                        shape = list(val.shape)
-                        dtype = val.dtype
-                    elif isinstance(val, int):
-                        shape = []
-                        dtype = torch.int64
-                    elif isinstance(val, float):
-                        shape = []
-                        dtype = torch.float32
+        # Identify cache placeholders used in functional update_kv_cache calls for auto-mapping
+        cache_placeholders = set()
+        parent_cache_placeholders = set()
+        from .._functional import update_kv_cache as npu_update_kv_cache_func
+        if stateful:
+            import operator
+            def trace_to_placeholder(n):
+                curr = n
+                while isinstance(curr, torch.fx.Node) and curr.op == "call_function" and curr.target in [operator.getitem, getattr]:
+                    if len(curr.args) > 0:
+                        curr = curr.args[0]
                     else:
-                        shape = [1]
-                        dtype = torch.float32
+                        break
+                if isinstance(curr, torch.fx.Node) and curr.op == "placeholder":
+                    return curr
+                return None
 
-                builder.add_parameter(node.name, list(shape), dtype)
+            for node in traced.graph.nodes:
+                if node.op == "call_function" and node.target == npu_update_kv_cache_func:
+                    cache_node = node.args[0]
+                    placeholder_node = trace_to_placeholder(cache_node)
+                    if placeholder_node is not None:
+                        cache_placeholders.add(cache_node.name)
+                        parent_cache_placeholders.add(placeholder_node.name)
 
-            elif node.op == "call_function":
-                converter = OpRegistry.get_function(node.target)
-                if converter:
-                    res = converter(builder, node, node.args, node.kwargs)
-                    builder.register_output(node.name, res)
-                else:
-                    raise NPUCompilationError(f"Function {node.target} not supported.")
+        # Temporarily dequantize Linear weights for compilation (Interpreter & ShapeProp)
+        quantized_weights = {}
+        for name, submod in traced.named_modules():
+            if isinstance(submod, torch.nn.Linear):
+                weight = submod._parameters.get("weight", None)
+                if weight is not None and getattr(weight, "data", None) is not None:
+                    if weight.data.dtype in [torch.int8, torch.uint8]:
+                        quantized_weights[submod] = weight.data
+                        submod.weight.data = weight.data.float()
 
-            elif node.op == "call_method":
-                converter = OpRegistry.get_method(node.target)
-                if converter:
-                    res = converter(builder, node, node.args, node.kwargs)
-                    builder.register_output(node.name, res)
-                else:
-                    raise NPUCompilationError(f"Method {node.target} not supported.")
+        try:
+            # 2. Capture Values & Build OV Graph
+            interpreter = ValueCapturingInterpreter(traced)
+            interpreter.run(*example_input_tuple)
 
-            elif node.op == "call_module":
-                submod = model
-                for atom in node.target.split("."):
-                    submod = getattr(submod, atom)
-                converter = OpRegistry.get_module(type(submod))
-                if converter:
-                    res = converter(builder, node, submod, node.args, node.kwargs)
-                    builder.register_output(node.name, res)
-                else:
-                    raise NPUCompilationError(
-                        f"Module type {type(submod)} not supported."
-                    )
+            builder = OVGraphBuilder(interpreter.node_values)
+            builder.stateful = stateful
+            builder.cache_placeholders = cache_placeholders
 
-            elif node.op == "get_attr":
-                atom = model
-                for atom_name in node.target.split("."):
-                    atom = getattr(atom, atom_name)
-                builder.add_constant(node.name, atom)
+            from torch.fx.passes.shape_prop import ShapeProp
+            ShapeProp(traced).propagate(*example_input_tuple)
 
-            elif node.op == "output":
-                ret_vals = node.args[0]
-                if isinstance(ret_vals, tuple):
-                    for ret_val in ret_vals:
-                        builder.result_nodes.append(builder.get_input(ret_val.name))
-                else:
-                    builder.result_nodes.append(builder.get_input(ret_vals.name))
+            # Restore original quantized weights immediately after eager/ShapeProp phases
+            for submod, w_data in quantized_weights.items():
+                submod.weight.data = w_data
 
-        # 3. Create & Compile OV Model
-        if hasattr(builder, "sinks") and builder.sinks:
-            # Wrap all result nodes in output ports to match signature 13 of ov.Model (which takes Sequence[Output] with sinks/variables)
-            results_outputs = [r.output(0) if hasattr(r, "output") else r for r in builder.result_nodes]
-            ov_model = ov.Model(
-                results_outputs,
-                builder.sinks,
-                builder.parameters,
-                builder.variables,
-                "NPU_Model",
-            )
-        else:
-            ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
+            input_iter = iter(example_input_tuple)
+
+            for node in traced.graph.nodes:
+                if node.op == "placeholder":
+                    try:
+                        val = next(input_iter)
+                    except StopIteration:
+                        raise NPUCompilationError(
+                            f"Not enough example inputs for placeholders starting at {node.name}"
+                        )
+
+                    if "tensor_meta" in node.meta:
+                        shape = node.meta["tensor_meta"].shape
+                        dtype = node.meta["tensor_meta"].dtype
+                    else:
+                        if isinstance(val, torch.Tensor):
+                            shape = list(val.shape)
+                            dtype = val.dtype
+                        elif isinstance(val, int):
+                            shape = []
+                            dtype = torch.int64
+                        elif isinstance(val, float):
+                            shape = []
+                            dtype = torch.float32
+                        else:
+                            shape = [1]
+                            dtype = torch.float32
+
+                    if stateful and node.name in parent_cache_placeholders and node.name not in cache_placeholders:
+                        # Skip this top-level placeholder, as its individual sliced sub-graphs
+                        # are directly backed by native stateful variables.
+                        pass
+                    elif stateful and node.name in cache_placeholders:
+                        import openvino.opset13 as ops
+                        ov_type = ov.Type.f32
+                        if dtype == torch.float16:
+                            ov_type = ov.Type.f16
+                        elif dtype == torch.int32:
+                            ov_type = ov.Type.i32
+                        
+                        info = ov.op.util.VariableInfo()
+                        info.data_shape = ov.PartialShape(list(shape))
+                        info.data_type = ov_type
+                        info.variable_id = f"auto_cache_{node.name}"
+                        
+                        var = ov.op.util.Variable(info)
+                        builder.variables.append(var)
+                        
+                        read_node = ops.read_value(var)
+                        builder.register_output(node.name, read_node)
+                    else:
+                        builder.add_parameter(node.name, list(shape), dtype)
+
+                elif node.op == "call_function":
+                    if stateful and node.name in cache_placeholders:
+                        import openvino.opset13 as ops
+                        if "tensor_meta" in node.meta:
+                            shape = node.meta["tensor_meta"].shape
+                            dtype = node.meta["tensor_meta"].dtype
+                        else:
+                            shape = [1, 128, 4, 16]  # default fallback
+                            dtype = torch.float32
+
+                        ov_type = ov.Type.f32
+                        if dtype == torch.float16:
+                            ov_type = ov.Type.f16
+                        elif dtype == torch.int32:
+                            ov_type = ov.Type.i32
+                        
+                        info = ov.op.util.VariableInfo()
+                        info.data_shape = ov.PartialShape(list(shape))
+                        info.data_type = ov_type
+                        info.variable_id = f"auto_cache_{node.name}"
+                        
+                        var = ov.op.util.Variable(info)
+                        builder.variables.append(var)
+                        
+                        read_node = ops.read_value(var)
+                        builder.register_output(node.name, read_node)
+                    else:
+                        converter = OpRegistry.get_function(node.target)
+                        if converter:
+                            res = converter(builder, node, node.args, node.kwargs)
+                            builder.register_output(node.name, res)
+                        else:
+                            raise NPUCompilationError(f"Function {node.target} not supported.")
+
+                elif node.op == "call_method":
+                    converter = OpRegistry.get_method(node.target)
+                    if converter:
+                        res = converter(builder, node, node.args, node.kwargs)
+                        builder.register_output(node.name, res)
+                    else:
+                        raise NPUCompilationError(f"Method {node.target} not supported.")
+
+                elif node.op == "call_module":
+                    submod = model
+                    for atom in node.target.split("."):
+                        submod = getattr(submod, atom)
+                    converter = OpRegistry.get_module(type(submod))
+                    if converter:
+                        res = converter(builder, node, submod, node.args, node.kwargs)
+                        builder.register_output(node.name, res)
+                    else:
+                        raise NPUCompilationError(
+                            f"Module type {type(submod)} not supported."
+                        )
+
+                elif node.op == "get_attr":
+                    atom = model
+                    for atom_name in node.target.split("."):
+                        atom = getattr(atom, atom_name)
+                    builder.add_constant(node.name, atom)
+
+                elif node.op == "output":
+                    ret_vals = node.args[0]
+                    if isinstance(ret_vals, tuple):
+                        for ret_val in ret_vals:
+                            builder.result_nodes.append(builder.get_input(ret_val.name))
+                    else:
+                        builder.result_nodes.append(builder.get_input(ret_vals.name))
+
+            # 3. Create & Compile OV Model
+            if hasattr(builder, "sinks") and builder.sinks:
+                # Wrap all result nodes in output ports to match signature 13 of ov.Model (which takes Sequence[Output] with sinks/variables)
+                results_outputs = [r.output(0) if hasattr(r, "output") else r for r in builder.result_nodes]
+                ov_model = ov.Model(
+                    results_outputs,
+                    builder.sinks,
+                    builder.parameters,
+                    builder.variables,
+                    "NPU_Model",
+                )
+            else:
+                ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
+        finally:
+            # Restore original quantized weights
+            for submod, w_data in quantized_weights.items():
+                submod.weight.data = w_data
 
         # Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
         if preprocess_config:
@@ -350,6 +453,7 @@ def compile_to_npu(
                 config = {
                     ov_hints.performance_mode(): hint,
                     ov_hints.inference_precision(): ov_props.element.f16,
+                    "NPU_COMPILATION_MODE_PARAMS": "optimization-level=2",
                 }
 
                 # Apply streams for throughput
@@ -361,6 +465,7 @@ def compile_to_npu(
                 config = {
                     "PERFORMANCE_HINT": performance_hint,
                     "INFERENCE_PRECISION_HINT": "f16",
+                    "NPU_COMPILATION_MODE_PARAMS": "optimization-level=2",
                 }
 
         logger.info(f"Compiling model for {target_device}...")
@@ -384,11 +489,18 @@ def compile_to_npu(
 
         # Auto-clean old disk-cache blobs to keep size under 1GB / 500 files
         try:
-            npu.clean_old_cache(max_size_mb=1024, max_files=500)
+            npu_lib.clean_old_cache(max_size_mb=1024, max_files=500)
         except Exception as e:
             logger.debug(f"Failed to auto-clean old disk cache: {e}")
 
-        return NPUGraphModule(compiled, input_names, performance_hint, num_streams, clone_outputs)
+        return NPUGraphModule(
+            compiled,
+            input_names,
+            performance_hint,
+            num_streams,
+            clone_outputs,
+            all_placeholder_names=all_placeholder_names,
+        )
 
     except Exception as e:
         logger.error(f"Compilation Failed: {e}")
@@ -396,6 +508,8 @@ def compile_to_npu(
 
 
 def _configure_input_ppp(inp_info, cfg):
+    if "shape" in cfg:
+        inp_info.tensor().set_shape(list(cfg["shape"]))
     if "layout" in cfg:
         inp_info.tensor().set_layout(ov.Layout(cfg["layout"]))
     if "element_type" in cfg:
@@ -405,17 +519,40 @@ def _configure_input_ppp(inp_info, cfg):
         inp_info.tensor().set_element_type(t)
     if "model_layout" in cfg:
         inp_info.model().set_layout(ov.Layout(cfg["model_layout"]))
-    if "mean" in cfg or "scale" in cfg:
+
+    if "color_format" in cfg:
+        from openvino.preprocess import ColorFormat
+        cf_name = cfg["color_format"]
+        cf = getattr(ColorFormat, cf_name) if hasattr(ColorFormat, cf_name) else ColorFormat.BGR
+        inp_info.tensor().set_color_format(cf)
+
+    if "model_color_format" in cfg:
+        from openvino.preprocess import ColorFormat
+        cf_name = cfg["model_color_format"]
+        cf = getattr(ColorFormat, cf_name) if hasattr(ColorFormat, cf_name) else ColorFormat.RGB
+        inp_info.preprocess().convert_color(cf)
+
+    if "mean" in cfg or "scale" in cfg or "resize" in cfg:
         preprocess_steps = inp_info.preprocess()
+
         t_cfg = cfg.get("element_type", ov.Type.u8)
         if isinstance(t_cfg, str):
             t_cfg = getattr(ov.Type, t_cfg) if hasattr(ov.Type, t_cfg) else ov.Type.u8
         if t_cfg in [ov.Type.u8, ov.Type.i8, ov.Type.u16, ov.Type.i16, ov.Type.i32, ov.Type.i64]:
             preprocess_steps.convert_element_type(ov.Type.f32)
+
+        if "resize" in cfg:
+            from openvino.preprocess import ResizeAlgorithm
+            h_target, w_target = cfg["resize"]
+            preprocess_steps.resize(ResizeAlgorithm.RESIZE_LINEAR, h_target, w_target)
+
         if "mean" in cfg:
             preprocess_steps.mean(cfg["mean"])
         if "scale" in cfg:
             preprocess_steps.scale(cfg["scale"])
+
+    if "layout" in cfg and "model_layout" in cfg:
+        inp_info.preprocess().convert_layout(ov.Layout(cfg["model_layout"]))
 
 
 def _configure_output_ppp(out_info, cfg):
@@ -424,3 +561,58 @@ def _configure_output_ppp(out_info, cfg):
         if isinstance(t, str):
             t = getattr(ov.Type, t) if hasattr(ov.Type, t) else ov.Type.f32
         out_info.tensor().set_element_type(t)
+
+
+# --- TorchDynamo Backend Registration ---
+try:
+    from torch._dynamo import register_backend
+
+    @register_backend
+    def npu(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor], **kwargs):
+        """
+        Dynamo backend for compiling PyTorch models natively via torch.compile(model, backend='npu')
+        """
+        if "options" in kwargs:
+            opts = kwargs.pop("options")
+            if isinstance(opts, dict):
+                kwargs.update(opts)
+
+        compiled = compile_to_npu(gm, tuple(example_inputs), **kwargs)
+
+        output_node = None
+        for node in gm.graph.nodes:
+            if node.op == "output":
+                output_node = node
+                break
+
+        if output_node is not None:
+            ret_vals = output_node.args[0]
+            is_tuple = isinstance(ret_vals, tuple)
+            is_list = isinstance(ret_vals, list)
+
+            if is_tuple:
+                num_outputs = len(ret_vals)
+                def tuple_wrapper(*args, **wrapper_kwargs):
+                    res = compiled(*args, **wrapper_kwargs)
+                    if num_outputs == 1:
+                        if isinstance(res, tuple):
+                            return res
+                        return (res,)
+                    return tuple(res) if isinstance(res, (list, tuple)) else (res,)
+                return tuple_wrapper
+            elif is_list:
+                num_outputs = len(ret_vals)
+                def list_wrapper(*args, **wrapper_kwargs):
+                    res = compiled(*args, **wrapper_kwargs)
+                    if num_outputs == 1:
+                        if isinstance(res, list):
+                            return res
+                        return [res]
+                    return list(res) if isinstance(res, (list, tuple)) else [res]
+                return list_wrapper
+
+        return compiled
+except Exception:
+    pass
+
+

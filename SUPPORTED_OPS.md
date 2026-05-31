@@ -6,7 +6,7 @@ The `intel_npu_lib` is a custom PyTorch extension designed to accelerate tensor 
 
 The library operates on two primary levels:
 1. **Eager Mode Execution (`functional.py` & `csrc/ops.cpp`)**: Overrides basic PyTorch functions to execute directly on the NPU via C++ bindings. This uses OpenVINO's `Core::compile_model` with `LATENCY` and `f16` hints. It features true zero-copy outputs where OpenVINO writes results directly to pre-allocated `torch::Tensor` memory.
-2. **Graph Compilation Mode (`frontend.py` & `converters.py`)**: Uses `torch.fx` to trace entire models (like LLMs or Vision models). It builds a holistic OpenVINO graph, avoiding Python dispatch overhead and enabling massive operator fusion.
+2. **Graph Compilation Mode (`frontend.py` & `converters.py`)**: Uses `torch.fx` to trace entire models (like LLMs or Vision models) or leverages TorchDynamo under PyTorch 2.x via register_backend. It builds a holistic OpenVINO graph, avoiding Python dispatch overhead and enabling massive operator fusion. Custom options are supported through options dict propagation.
 3. **Level Zero Backend Optimizations**: The library explicitly utilizes the Intel Level Zero (OneCompute) interface for low-level NPU communication. This includes hardware turbo-boost, multi-tiling compilation, and persistent InferRequest caching to minimize synchronization overhead between CPU and NPU.
 
 ---

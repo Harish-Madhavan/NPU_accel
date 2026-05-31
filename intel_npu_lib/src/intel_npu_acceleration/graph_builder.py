@@ -20,6 +20,23 @@ class ValueCapturingInterpreter(Interpreter):
         self.node_values[n] = val
         return val
 
+    def call_module(self, target: str, args: tuple, kwargs: dict) -> Any:
+        submod = self.fetch_attr(target)
+        if isinstance(submod, torch.nn.Linear):
+            weight = submod._parameters.get("weight", None)
+            if weight is not None and getattr(weight, "data", None) is not None:
+                if weight.data.dtype in [torch.int8, torch.uint8]:
+                    w_float = weight.data.float()
+                    if hasattr(submod, "weight_scale"):
+                        scale = getattr(submod, "weight_scale")
+                        if isinstance(scale, torch.Tensor):
+                            scale = scale.item()
+                        w_float = w_float * float(scale)
+                    
+                    bias = getattr(submod, "bias", None)
+                    return torch.nn.functional.linear(args[0], w_float, bias)
+        return super().call_module(target, args, kwargs)
+
 
 class OVGraphBuilder:
     def __init__(self, node_values: Optional[Dict[torch.fx.Node, Any]] = None):

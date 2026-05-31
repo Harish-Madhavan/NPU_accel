@@ -146,14 +146,17 @@ def convert_softmax_module(builder: OVGraphBuilder, node, submod, args, kwargs):
 
 
 @OpRegistry.register_function(torch.nn.functional.log_softmax)
-@OpRegistry.register_module(torch.nn.LogSoftmax)
-def convert_log_softmax(builder: OVGraphBuilder, node, *args, **kwargs):
-    if isinstance(args[0], torch.nn.Module):
-        inp = builder.get_input_or_constant(args[1][0])
-        dim = args[0].dim if args[0].dim is not None else -1
-    else:
-        inp = builder.get_input_or_constant(args[0])
-        dim = kwargs.get("dim", args[1] if len(args) > 1 else -1)
-
+def convert_log_softmax(builder: OVGraphBuilder, node, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    dim = kwargs.get("dim", args[1] if len(args) > 1 else -1)
     softmax = ops.softmax(inp, axis=dim)
     return ops.log(softmax)
+
+
+@OpRegistry.register_module(torch.nn.LogSoftmax)
+def convert_log_softmax_module(builder: OVGraphBuilder, node, submod, args, kwargs):
+    inp = builder.get_input_or_constant(args[0])
+    dim = submod.dim if submod.dim is not None else -1
+    softmax = ops.softmax(inp, axis=dim)
+    return ops.log(softmax)
+

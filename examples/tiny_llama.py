@@ -373,27 +373,6 @@ class StatefulLlama(nn.Module):
 
 
 # =====================================================================
-#                        Quantization & Helper
-# =====================================================================
-
-def quantize_to_int8(model: nn.Module):
-    """
-    Simulate weight-only INT8 quantization by casting linear weights to int8.
-    """
-    with torch.no_grad():
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                w = module.weight.data
-                scale = w.abs().max() / 127.0
-                quantized_w = (w / scale).round().clamp(-128, 127).to(torch.int8)
-                
-                module.weight.requires_grad = False
-                module.weight.data = quantized_w
-                setattr(module, "weight_scale", scale)
-    return model
-
-
-# =====================================================================
 #                      Text Generation Runners
 # =====================================================================
 
@@ -566,8 +545,8 @@ def main():
     # -------------------------------------------------------------
     # PART B: Standard INT8 Model (Functional KV Cache)
     # -------------------------------------------------------------
-    print("\n[Step 3] Simulating Weight-Only INT8 Quantization...")
-    model_int8 = quantize_to_int8(model)
+    print("\n[Step 3] Applying Weight-Only INT8 Quantization...")
+    model_int8 = npu_compiler.quantize(model)
 
     print("\n[Step 4] Compiling Tiny LLaMA INT8 model (Functional Cache) for NPU...")
     t0 = time.time()

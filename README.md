@@ -83,9 +83,42 @@ print(f"Intel NPU Available: {npu.is_available()}")
 
 ## 🚀 Quick Start
 
-### 1. Model Compilation (Recommended)
+### 1. PyTorch Native Compilation (PyTorch 2.0+ torch.compile)
 
-The `compile` API is the most powerful way to use the library. It analyzes your model's computational graph and fuses operations for the NPU.
+The library integrates natively with PyTorch 2.x. You can compile your models using standard `torch.compile` by setting the backend to `"npu"`:
+
+```python
+import torch
+import intel_npu_acceleration as npu_lib
+
+class MyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(128, 64)
+        self.act = torch.nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.fc(x))
+
+model = MyModel().eval()
+x = torch.randn(1, 128)
+
+# Natively compile model
+compiled_model = torch.compile(model, backend="npu")
+output = compiled_model(x)
+
+# Pass compiler options dynamically via options dict
+compiled_opt = torch.compile(
+    model,
+    backend="npu",
+    options={"clone_outputs": False, "performance_hint": "THROUGHPUT"},
+)
+output_opt = compiled_opt(x)
+```
+
+### 2. Frontend Compiler API
+
+You can also compile your models explicitly using the library's `compile` API. This traces the computational graph under a specified example input and maps fused operators directly to the NPU:
 
 ```python
 import torch
@@ -103,11 +136,9 @@ class MyModel(torch.nn.Module):
 model = MyModel().eval()
 example_input = torch.randn(1, 128)
 
-# Compile the model
-# The example_input is used to infer tensor shapes and data types
+# Compile using frontend API
 npu_model = npu.compile(model, example_input)
 
-# High-performance inference
 with torch.no_grad():
     output = npu_model(example_input)
 ```

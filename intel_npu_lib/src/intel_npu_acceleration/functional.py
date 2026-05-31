@@ -43,6 +43,8 @@ identity = F_base.identity
 dropout = F_base.dropout
 
 torch.fx.wrap(quantized_linear)
+torch.fx.wrap(update_kv_cache)
+
 
 class NPUStatefulKVCache(torch.nn.Module):
     """

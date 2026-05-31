@@ -2,6 +2,7 @@ import os
 import sys
 import platform
 import logging
+import torch
 
 # --- Logging Setup ---
 logger = logging.getLogger("intel_npu_acceleration")
@@ -31,6 +32,7 @@ except ImportError as e:
     logger.warning(f"Could not load C++ extension 'intel_npu_acceleration._C': {e}")
     _C = None
 _CACHE_DIR = None
+_LAST_CLEANUP_TIME = 0.0
 
 # --- Cache Initialization ---
 if _C is not None:
@@ -126,10 +128,20 @@ def clean_old_cache(max_size_mb: int = 1024, max_files: int = 500):
     """
     Clean the cache directory by deleting the oldest files (based on modification time)
     until the total size is below max_size_mb and total file count is below max_files.
+    Throttled to run at most once every 60 seconds to prevent heavy disk I/O scans.
     """
+    import time
+    global _LAST_CLEANUP_TIME
+    
+    current_time = time.time()
+    if current_time - _LAST_CLEANUP_TIME < 60.0:
+        return
+
     cache_dir = get_cache_dir()
     if not cache_dir or not os.path.exists(cache_dir):
         return
+
+    _LAST_CLEANUP_TIME = current_time
 
     # Gather all cache files with their modification times and sizes
     all_files = []
@@ -175,6 +187,25 @@ def clean_old_cache(max_size_mb: int = 1024, max_files: int = 500):
             logger.debug(f"Failed to delete old cache file {file_path}: {e}")
 
     logger.info(f"Cleaned {deleted_count} old cache files ({deleted_size / (1024*1024):.2f} MB cleared).")
+
+
+def quantize(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Quantize the weights of all `torch.nn.Linear` layers in the model to INT8 precision.
+    Compresses model footprint by up to 2x and prepares weights for fast NPU execution.
+    """
+    import torch
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                w = module.weight.data
+                scale = w.abs().max() / 127.0
+                quantized_w = (w / scale).round().clamp(-128, 127).to(torch.int8)
+                
+                module.weight.requires_grad = False
+                module.weight.data = quantized_w
+                setattr(module, "weight_scale", scale)
+    return model
 
 
 def is_available() -> bool:
@@ -264,6 +295,7 @@ __all__ = [
     "enable_sda",
     "compile",
     "compile_to_npu",
+    "quantize",
     "get_cache_dir",
     "set_cache_dir",
     "clear_cache",

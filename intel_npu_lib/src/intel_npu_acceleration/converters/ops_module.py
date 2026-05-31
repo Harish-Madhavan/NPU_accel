@@ -28,7 +28,7 @@ def convert_linear_module(builder: OVGraphBuilder, node, submod, args, kwargs):
                 scale_val = scale.detach().cpu().numpy()
             else:
                 scale_val = float(scale)
-            scale_node = ops.constant(scale_val, dtype=np.float32)
+            scale_node = ops.constant(scale_val, dtype=np.float16)
             w_const = ops.multiply(w_const, scale_node)
 
     inp, w_const = builder.align_types(inp, w_const)
@@ -390,6 +390,10 @@ def convert_update_kv_cache(builder: OVGraphBuilder, node, args, kwargs):
     new_kv = builder.get_input_or_constant(args[1])
     position = builder.get_input_or_constant(args[2])
 
+    is_stateful = False
+    if getattr(builder, "stateful", False) and hasattr(args[0], "name") and args[0].name in builder.cache_placeholders:
+        is_stateful = True
+
     cache, new_kv = builder.align_types(cache, new_kv)
 
     if not isinstance(position, ov.Node):
@@ -407,9 +411,23 @@ def convert_update_kv_cache(builder: OVGraphBuilder, node, args, kwargs):
     seq_len_i32 = ops.convert(seq_len, destination_type="i32")
 
     pos_i32 = ops.convert(position, destination_type="i32")
-    indices = ops.range(pos_i32, ops.add(pos_i32, seq_len_i32), ops.constant(1, dtype=np.int32), output_type="i32")
+    pos_i32_scalar = ops.squeeze(pos_i32, ops.constant([0], dtype=np.int32))
+    indices = ops.range(pos_i32_scalar, ops.add(pos_i32_scalar, seq_len_i32), ops.constant(1, dtype=np.int32), output_type="i32")
 
-    return ops.scatter_update(cache, indices, new_kv, ops.constant([1], dtype=np.int32))
+    updated_cache = ops.scatter_update(cache, indices, new_kv, ops.constant([1], dtype=np.int32))
+
+    if is_stateful:
+        var_id = f"auto_cache_{args[0].name}"
+        var = None
+        for v in builder.variables:
+            if v.get_info().variable_id == var_id:
+                var = v
+                break
+        if var is not None:
+            assign_node = ops.assign(updated_cache, var)
+            builder.sinks.append(assign_node)
+
+    return updated_cache
 
 
 # Break circular dependency dynamically

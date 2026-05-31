@@ -137,6 +137,111 @@ class TestIntelNPULib(unittest.TestCase):
         self.assertLessEqual(new_size, size)
         self.assertLessEqual(new_count, count)
 
+    def test_quantize_api(self):
+        class SimpleLinearModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = torch.nn.Linear(8, 4)
+            def forward(self, x):
+                return self.fc(x)
+
+        model = SimpleLinearModel()
+        model.eval()
+
+        # Let's quantize the model weights
+        from intel_npu_acceleration import quantize
+        quantized_model = quantize(model)
+
+        # Assert weight was converted to int8
+        self.assertEqual(quantized_model.fc.weight.dtype, torch.int8)
+        self.assertTrue(hasattr(quantized_model.fc, "weight_scale"))
+        self.assertGreater(quantized_model.fc.weight_scale, 0.0)
+
+        # Confirm compilation compiles it successfully
+        x = torch.randn(2, 8)
+        try:
+            compiled = intel_npu_acceleration.compile(quantized_model, x)
+            out_compiled = compiled(x)
+            # Reference float computation: dequant_w = weight.float() * scale
+            w_float = quantized_model.fc.weight.float() * quantized_model.fc.weight_scale
+            out_expected = torch.nn.functional.linear(x, w_float, quantized_model.fc.bias)
+            self.assertTrue(torch.allclose(out_compiled, out_expected, rtol=1e-2, atol=1e-2))
+        except Exception as e:
+            self.fail(f"Compilation of quantized model failed: {e}")
+
+    def test_ppp_advanced(self):
+        # Clear NPU disk cache to guarantee fresh compilation of shape-altered models
+        intel_npu_acceleration.clear_cache()
+
+        class ImageModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 3, kernel_size=1, bias=False)
+                torch.nn.init.ones_(self.conv.weight)
+
+            def forward(self, x):
+                return self.conv(x)
+
+        model = ImageModel()
+        model.eval()
+
+        # Model expects NCHW float32 tensor of shape [1, 3, 224, 224]
+        x_traced = torch.randn(1, 3, 224, 224)
+
+        # Raw NHWC uint8 color image of shape [1, 256, 256, 3] fed at runtime
+        x_runtime = torch.randint(0, 256, (1, 256, 256, 3), dtype=torch.uint8)
+
+        preprocess_config = {
+            "input": {
+                "shape": (1, 256, 256, 3),
+                "layout": "NHWC",
+                "element_type": "u8",
+                "model_layout": "NCHW",
+                "color_format": "BGR",
+                "model_color_format": "RGB",
+                "resize": (224, 224),
+            }
+        }
+
+        try:
+            compiled = intel_npu_acceleration.compile(
+                model, x_traced, preprocess_config=preprocess_config
+            )
+            # Run inference passing the raw runtime image!
+            out = compiled(x_runtime)
+            self.assertEqual(list(out.shape), [1, 3, 224, 224])
+            self.assertEqual(out.dtype, torch.float32)
+        except Exception as e:
+            self.fail(f"Compilation of PPP advanced config failed: {e}")
+
+    def test_pytorch_compile(self):
+        class StandardModel(torch.nn.Module):
+            def forward(self, x, y):
+                return torch.matmul(x, y) + 1.0
+
+        model = StandardModel()
+        x = torch.randn(4, 4)
+        y = torch.randn(4, 4)
+
+        try:
+            # Test compiling standard model with torch.compile using our backend
+            compiled = torch.compile(model, backend="npu")
+            out_compiled = compiled(x, y)
+            out_expected = model(x, y)
+            self.assertTrue(torch.allclose(out_compiled, out_expected, rtol=1e-2, atol=1e-2))
+
+            # Test passing custom options through torch.compile
+            compiled_opt = torch.compile(
+                model,
+                backend="npu",
+                options={"clone_outputs": False, "performance_hint": "THROUGHPUT"},
+            )
+            out_opt = compiled_opt(x, y)
+            self.assertTrue(torch.allclose(out_opt, out_expected, rtol=1e-2, atol=1e-2))
+        except Exception as e:
+            self.fail(f"torch.compile alignment with 'npu' backend failed: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
