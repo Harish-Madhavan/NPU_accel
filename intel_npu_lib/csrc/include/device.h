@@ -1,5 +1,6 @@
 #pragma once
 #include <torch/extension.h>
+#include <atomic>
 
 #include <iostream>
 #include <list>
@@ -31,6 +32,7 @@ public:
     ov::CompiledModel getOrCompileModel(const std::string& key, std::shared_ptr<ov::Model> model);
     ov::InferRequest getOrCachedInferRequest(const std::string& key);
     void setCacheDir(const std::string& path);
+    void clearCache();
     void setProperty(const std::string& key, const std::string& value);
     void setPerformanceHint(const std::string& hint);
     void setEagerDevice(const std::string& device);
@@ -38,6 +40,7 @@ public:
     // Property probing
     bool isPropertySupported(const std::string& key) const;
     std::string getSupportedPropertiesList() const;
+    uint64_t getCacheVersion() const;
 
     // Logging
     template <typename... Args>
@@ -79,6 +82,7 @@ private:
     std::string m_eager_device = "CPU";       // Default to CPU for tiny ops
     std::set<std::string> m_supported_props;  // Populated by probeProperties()
     ov::hint::PerformanceMode m_performance_hint = ov::hint::PerformanceMode::LATENCY;
+    std::atomic<uint64_t> m_cache_version{0};
 
     void probeProperties();  // Queries ov::supported_properties at init
     };
@@ -90,3 +94,4 @@ private:
     void set_npu_property(const std::string& key, const std::string& value);
     void set_npu_performance_hint(const std::string& hint);
     void set_npu_eager_device(const std::string& device);
+    void clear_cpp_model_cache();

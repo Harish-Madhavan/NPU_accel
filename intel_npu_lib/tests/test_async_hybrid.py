@@ -144,6 +144,64 @@ class TestAsyncAndHybrid(unittest.TestCase):
             torch.allclose(out_compiled, out_expected, rtol=1e-2, atol=1e-2)
         )
 
+    def test_npu_async_future_submit(self):
+        """
+        Verify that compiled_model.submit() returns a functional NPUAsyncFuture handle.
+        """
+        class FutureTestModel(torch.nn.Module):
+            def forward(self, x):
+                return torch.relu(x) * 2.0
+
+        model = FutureTestModel()
+        x = torch.randn(8, 8)
+        compiled = intel_npu_acceleration.compile(model, x, num_streams=2)
+        self.assertTrue(isinstance(compiled, NPUGraphModule))
+
+        future = compiled.submit(x)
+        self.assertTrue(hasattr(future, "result"))
+        self.assertTrue(hasattr(future, "is_ready"))
+        res = future.result()
+        expected = model(x)
+        self.assertTrue(torch.allclose(res.float(), expected.float(), atol=1e-2, rtol=1e-2))
+        self.assertTrue(future.is_ready())
+
+    def test_batch_infer_pipeline(self):
+        """
+        Verify that compiled_model.batch_infer() accurately pipelines a list of inputs.
+        """
+        class BatchPipelineModel(torch.nn.Module):
+            def forward(self, a, b):
+                return torch.matmul(a, b)
+
+        model = BatchPipelineModel()
+        a_list = [torch.randn(4, 4) for _ in range(6)]
+        b_list = [torch.randn(4, 4) for _ in range(6)]
+        inputs_list = [(a_list[i], b_list[i]) for i in range(6)]
+
+        compiled = intel_npu_acceleration.compile(model, inputs_list[0], num_streams=3)
+        results = compiled.batch_infer(inputs_list)
+
+        self.assertEqual(len(results), 6)
+        for i in range(6):
+            expected = model(a_list[i], b_list[i])
+            self.assertTrue(torch.allclose(results[i].float(), expected.float(), atol=1e-2, rtol=1e-2))
+
+    def test_fp16_precision_optimization(self):
+        """
+        Verify that precision='fp16' compiles and runs successfully with OpenVINO ConvertFP32ToFP16 pass.
+        """
+        class FP16PrecisionModel(torch.nn.Module):
+            def forward(self, x):
+                return torch.nn.functional.gelu(x) + 1.0
+
+        model = FP16PrecisionModel()
+        x = torch.randn(16, 16)
+        compiled = intel_npu_acceleration.compile(model, x, precision="fp16")
+        res = compiled(x)
+        expected = model(x)
+        self.assertEqual(res.dtype, torch.float16)
+        self.assertTrue(torch.allclose(res.float(), expected.float(), atol=1e-2, rtol=1e-2))
+
 
 if __name__ == "__main__":
     unittest.main()

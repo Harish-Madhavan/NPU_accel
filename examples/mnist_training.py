@@ -1,11 +1,17 @@
+import os
+import sys
+
+# Ensure library is importable when run directly from repository
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
+
+import time
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import datasets, transforms
+from torch.utils.data import TensorDataset, DataLoader
 import intel_npu_acceleration as npu
-import time
-import argparse
 
 # --- Model Definition ---
 
@@ -107,7 +113,7 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
     CPU runs with large batch size (highly parallelized).
     NPU runs with multi-stream asynchronous pipelining for maximum VPU core saturation.
     """
-    print(f"\nRunning Throughput Benchmark...")
+    print("\nRunning Throughput Benchmark...")
     
     # 1. CPU Throughput
     model.eval()
@@ -243,6 +249,11 @@ def main():
         action="store_true",
         help="Enable Shared Device Address (SDA) zero-copy transfers",
     )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Use synthetic dataset for fast offline benchmarking",
+    )
     args = parser.parse_args()
 
     # Set seed
@@ -252,14 +263,32 @@ def main():
     print("==========================================================")
     print("   Intel NPU Acceleration: MNIST Hybrid Compiler Demo   ")
     print("==========================================================")
-    
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-    )
 
-    print("\n[Step 1] Loading MNIST dataset...")
-    train_set = datasets.MNIST("../data", train=True, download=True, transform=transform)
-    test_set = datasets.MNIST("../data", train=False, transform=transform)
+    print("\n[Step 1] Preparing dataset...")
+    use_synthetic = args.synthetic
+    if not use_synthetic:
+        try:
+            from torchvision import datasets, transforms
+
+            transform = transforms.Compose(
+                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+            )
+            train_set = datasets.MNIST("../data", train=True, download=True, transform=transform)
+            test_set = datasets.MNIST("../data", train=False, transform=transform)
+            print("Loaded real MNIST dataset via torchvision.")
+        except Exception as e:
+            print(f"Could not load MNIST from torchvision ({e}). Falling back to synthetic dataset.")
+            use_synthetic = True
+
+    if use_synthetic:
+        train_data = torch.randn(1000, 1, 28, 28)
+        train_targets = torch.randint(0, 10, (1000,))
+        train_set = TensorDataset(train_data, train_targets)
+
+        test_data = torch.randn(200, 1, 28, 28)
+        test_targets = torch.randint(0, 10, (200,))
+        test_set = TensorDataset(test_data, test_targets)
+        print("Initialized synthetic image dataset.")
 
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
     # CPU accuracy/throughput test loader
@@ -324,11 +353,13 @@ def main():
     print(f"Compilation succeeded in {t_comp_end - t_comp_start:.2f}s (Cache-optimized).")
 
     # Run benchmarks
-    cpu_lat, npu_lat = run_latency_benchmark(model, npu_model, test_set, num_samples=100)
+    num_samples = min(100, len(test_set))
+    cpu_lat, npu_lat = run_latency_benchmark(model, npu_model, test_set, num_samples=num_samples)
     cpu_thr, npu_thr = run_throughput_benchmark(model, npu_model, test_loader_cpu, test_loader_npu, max_batches=5)
     
-    # Evaluate accuracy on a subset to keep execution time fast (e.g. 500 images)
-    subset_indices = torch.arange(500)
+    # Evaluate accuracy on a subset to keep execution time fast (e.g. up to 500 images)
+    subset_size = min(500, len(test_set))
+    subset_indices = torch.arange(subset_size)
     test_subset = torch.utils.data.Subset(test_set, subset_indices)
     subset_loader = torch.utils.data.DataLoader(test_subset, batch_size=50)
     cpu_acc, npu_acc = evaluate_accuracy(model, npu_model, subset_loader)

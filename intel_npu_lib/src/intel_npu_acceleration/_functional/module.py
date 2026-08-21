@@ -1,6 +1,7 @@
+import warnings
 import torch
 from typing import Optional, List
-from .utils import _C, _is_proxy, _promote_binary, _restore_dtype
+from .utils import _C, _is_proxy, _promote_binary, _restore_dtype, _to_pair
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -17,8 +18,7 @@ def linear(
 ) -> torch.Tensor:
     if (
         _C is None
-        or isinstance(input, torch.fx.Proxy)
-        or isinstance(weight, torch.fx.Proxy)
+        or _is_proxy(input, weight, bias)
     ):
         return torch.nn.functional.linear(input, weight, bias)
     if bias is None:
@@ -89,16 +89,14 @@ def update_kv_cache(
 ) -> torch.Tensor:
     if (
         _C is None
-        or isinstance(cache, torch.fx.Proxy)
-        or isinstance(new_kv, torch.fx.Proxy)
-        or isinstance(position, torch.fx.Proxy)
+        or _is_proxy(cache, new_kv, position)
     ):
         seq_len = new_kv.shape[1]
         if isinstance(position, (int, float)):
             indices = torch.arange(position, position + seq_len, dtype=torch.long)
         elif isinstance(position, torch.Tensor) and not isinstance(
             position, torch.fx.Proxy
-        ):
+        ) and not torch.jit.is_tracing():
             indices = torch.arange(
                 position.item(), position.item() + seq_len, dtype=torch.long
             )
@@ -126,26 +124,38 @@ def quantized_linear(
     zero_point: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    is_int4 = (
-        weight.dtype == torch.uint8
-        and len(weight.shape) == 2
-        and weight.shape[1] == input.shape[-1] // 2
-    )
+    if any(isinstance(arg, torch.fx.Proxy) for arg in (input, weight, scale, zero_point, bias)):
+        out_features = weight.shape[0]
+        out_shape = input.shape[:-1] + (out_features,)
+        return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
-    if _C is None:
-        if is_int4:
-            w_odd = torch.floor_divide(weight, 16)
-            w_even = weight - w_odd * 16
-            w_unpacked = torch.stack([w_even, w_odd], dim=-1).view(weight.shape[0], -1)
-            w_float = w_unpacked.float()
-        else:
-            w_float = weight.float()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
 
-        if zero_point is not None and zero_point.numel() > 0:
-            w_float = w_float - zero_point.float()
-        w_float = w_float * scale.float()
-        w_float = w_float.to(input.dtype)
-        return torch.nn.functional.linear(input, w_float, bias)
+        is_int4 = (
+            weight.dtype == torch.uint8
+            and len(weight.shape) == 2
+            and weight.shape[1] == input.shape[-1] // 2
+        )
+
+        if _C is None or _is_proxy(input, weight, scale, zero_point, bias):
+            if is_int4:
+                # Cast weight to int32 to satisfy NPU Floor op element type requirements (no unsigned types)
+                weight_s32 = weight.to(torch.int32)
+                w_odd = torch.floor_divide(weight_s32, 16)
+                w_even = weight_s32 - w_odd * 16
+                w_even_u = w_even.unsqueeze(1)
+                w_odd_u = w_odd.unsqueeze(1)
+                w_unpacked = torch.cat([w_even_u, w_odd_u], dim=1).transpose(1, 2).reshape(weight.shape[0], -1)
+                w_float = w_unpacked.float()
+            else:
+                w_float = weight.float()
+
+            if zero_point is not None and zero_point.numel() > 0:
+                w_float = w_float - zero_point.float()
+            w_float = w_float * scale.float()
+            w_float = w_float.to(input.dtype)
+            return torch.nn.functional.linear(input, w_float, bias)
 
     if zero_point is None:
         zero_point = torch.empty(0, dtype=input.dtype, device=input.device)
@@ -174,9 +184,6 @@ def conv2d(
             dilation=dilation,
             groups=groups,
         )
-
-    def _to_pair(v):
-        return [v, v] if isinstance(v, int) else list(v)
 
     if bias is None:
         bias = torch.empty(0, dtype=input.dtype)
@@ -209,9 +216,6 @@ def max_pool2d(
             dilation=dilation,
             ceil_mode=ceil_mode,
         )
-
-    def _to_pair(v):
-        return [v, v] if isinstance(v, int) else list(v)
 
     if stride is None:
         stride = kernel_size

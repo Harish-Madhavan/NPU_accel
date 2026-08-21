@@ -6,6 +6,45 @@ import weakref
 from typing import Any, Optional, List
 
 
+class NPUAsyncFuture:
+    """
+    Object-oriented Future handle for asynchronous Intel NPU execution.
+    Provides non-blocking submission and pipelined result retrieval.
+    """
+    def __init__(self, module: 'NPUGraphModule', handle: int):
+        self._module = module
+        self._handle = handle
+        self._result = None
+        self._completed = False
+
+    def wait(self) -> None:
+        """Block until the inference execution finishes on the NPU."""
+        if not self._completed:
+            self._result = self._module.wait_async(self._handle)
+            self._completed = True
+
+    def result(self) -> Any:
+        """Block and return the computed output tensor(s)."""
+        self.wait()
+        return self._result
+
+    def is_ready(self) -> bool:
+        """Check without blocking if the inference execution has finished."""
+        if self._completed:
+            return True
+        req = self._module.infer_requests[self._handle]
+        if hasattr(req, "wait_for"):
+            try:
+                ready = req.wait_for(0)
+                if ready:
+                    self._result = self._module.wait_async(self._handle)
+                    self._completed = True
+                return ready
+            except Exception:
+                pass
+        return self._completed
+
+
 class LeasedBufferPool:
     """
     Manages a pool of pre-allocated PyTorch tensors of a specific static shape and dtype.
@@ -55,11 +94,21 @@ class NPUGraphModule(torch.nn.Module):
         # Build mapping from compiled input index to original args index
         self.arg_indices = []
         if all_placeholder_names is not None:
+            exact_mapping = {p.lower(): idx for idx, p in enumerate(all_placeholder_names)}
+            import re
+            def clean_name(n):
+                return re.sub(r'[\d._]+$', '', n).lower()
+            cleaned_placeholders = [clean_name(p) for p in all_placeholder_names]
             for name in input_names:
-                if name in all_placeholder_names:
-                    self.arg_indices.append(all_placeholder_names.index(name))
+                name_lower = name.lower()
+                if name_lower in exact_mapping:
+                    self.arg_indices.append(exact_mapping[name_lower])
                 else:
-                    self.arg_indices.append(len(self.arg_indices))
+                    cleaned_n = clean_name(name)
+                    if cleaned_n in cleaned_placeholders:
+                        self.arg_indices.append(cleaned_placeholders.index(cleaned_n))
+                    else:
+                        self.arg_indices.append(len(self.arg_indices))
         else:
             self.arg_indices = list(range(len(input_names)))
 
@@ -151,6 +200,31 @@ class NPUGraphModule(torch.nn.Module):
             self.input_sizes
         ))
 
+    def _get_numpy_view(self, val, target_dtype, target_tdtype):
+        if isinstance(val, torch.Tensor):
+            if (
+                val.device == self.cpu_device
+                and val.dtype == target_tdtype
+                and val.is_contiguous()
+            ):
+                return val.detach().numpy(), val
+            else:
+                cpu_val = val.detach()
+                if cpu_val.device != self.cpu_device:
+                    cpu_val = cpu_val.cpu()
+                if cpu_val.dtype != target_tdtype:
+                    cpu_val = cpu_val.to(target_tdtype)
+                if not cpu_val.is_contiguous():
+                    cpu_val = cpu_val.contiguous()
+                return cpu_val.numpy(), cpu_val
+        else:
+            np_view = np.array(val)
+            if np_view.dtype != target_dtype:
+                np_view = np_view.astype(target_dtype)
+            if not np_view.flags["C_CONTIGUOUS"]:
+                np_view = np.ascontiguousarray(np_view)
+            return np_view, np_view
+
     def forward(self, *args):
         with self._lock:
             # Use round-robin for infer requests
@@ -161,33 +235,11 @@ class NPUGraphModule(torch.nn.Module):
 
             for i, (arg_idx, target_dtype, target_tdtype, is_static, target_size) in enumerate(self.input_meta):
                 val = args[arg_idx]
+                np_view, _ = self._get_numpy_view(val, target_dtype, target_tdtype)
 
                 # Fast Path: pre-allocated tensor copying for small/medium static inputs
                 if is_static and target_size < 2000000:
                     ov_tensor = self.input_tensors[idx][i]
-                    if isinstance(val, torch.Tensor):
-                        if (
-                            val.device == self.cpu_device
-                            and val.dtype == target_tdtype
-                            and val.is_contiguous()
-                        ):
-                            np_view = val.detach().numpy()
-                        else:
-                            cpu_val = val.detach()
-                            if cpu_val.device != self.cpu_device:
-                                cpu_val = cpu_val.cpu()
-                            if cpu_val.dtype != target_tdtype:
-                                cpu_val = cpu_val.to(target_tdtype)
-                            if not cpu_val.is_contiguous():
-                                cpu_val = cpu_val.contiguous()
-                            np_view = cpu_val.numpy()
-                    else:
-                        np_view = np.array(val)
-                        if np_view.dtype != target_dtype:
-                            np_view = np_view.astype(target_dtype)
-                        if not np_view.flags["C_CONTIGUOUS"]:
-                            np_view = np.ascontiguousarray(np_view)
-
                     if np_view.shape != ov_tensor.shape:
                         if np_view.ndim == 0 and len(ov_tensor.shape) == 1:
                             np_view = np_view.reshape(1)
@@ -197,29 +249,6 @@ class NPUGraphModule(torch.nn.Module):
                     np.copyto(ov_tensor.data, np_view)
                 else:
                     # Fallback Path: zero-copy pointer binding for large/dynamic inputs
-                    if isinstance(val, torch.Tensor):
-                        if (
-                            val.device == self.cpu_device
-                            and val.dtype == target_tdtype
-                            and val.is_contiguous()
-                        ):
-                            np_view = val.detach().numpy()
-                        else:
-                            cpu_val = val.detach()
-                            if cpu_val.device != self.cpu_device:
-                                cpu_val = cpu_val.cpu()
-                            if cpu_val.dtype != target_tdtype:
-                                cpu_val = cpu_val.to(target_tdtype)
-                            if not cpu_val.is_contiguous():
-                                cpu_val = cpu_val.contiguous()
-                            np_view = cpu_val.numpy()
-                    else:
-                        np_view = np.array(val)
-                        if np_view.dtype != target_dtype:
-                            np_view = np_view.astype(target_dtype)
-                        if not np_view.flags["C_CONTIGUOUS"]:
-                            np_view = np.ascontiguousarray(np_view)
-
                     try:
                         infer_request.set_input_tensor(
                             i, ov.Tensor(np_view, shared_memory=True)
@@ -296,36 +325,12 @@ class NPUGraphModule(torch.nn.Module):
             keep_alive = []
             for i, (arg_idx, target_dtype, target_tdtype, is_static, target_size) in enumerate(self.input_meta):
                 val = args[arg_idx]
+                np_view, keep_obj = self._get_numpy_view(val, target_dtype, target_tdtype)
+                keep_alive.append(keep_obj)
 
                 # Fast Path: pre-allocated tensor copying for small/medium static inputs
                 if is_static and target_size < 2000000:
                     ov_tensor = self.input_tensors[idx][i]
-                    if isinstance(val, torch.Tensor):
-                        if (
-                            val.device == self.cpu_device
-                            and val.dtype == target_tdtype
-                            and val.is_contiguous()
-                        ):
-                            np_view = val.detach().numpy()
-                            keep_alive.append(val)
-                        else:
-                            cpu_val = val.detach()
-                            if cpu_val.device != self.cpu_device:
-                                cpu_val = cpu_val.cpu()
-                            if cpu_val.dtype != target_tdtype:
-                                cpu_val = cpu_val.to(target_tdtype)
-                            if not cpu_val.is_contiguous():
-                                cpu_val = cpu_val.contiguous()
-                            np_view = cpu_val.numpy()
-                            keep_alive.append(cpu_val)
-                    else:
-                        np_view = np.array(val)
-                        if np_view.dtype != target_dtype:
-                            np_view = np_view.astype(target_dtype)
-                        if not np_view.flags["C_CONTIGUOUS"]:
-                            np_view = np.ascontiguousarray(np_view)
-                        keep_alive.append(np_view)
-
                     if np_view.shape != ov_tensor.shape:
                         if np_view.ndim == 0 and len(ov_tensor.shape) == 1:
                             np_view = np_view.reshape(1)
@@ -335,32 +340,6 @@ class NPUGraphModule(torch.nn.Module):
                     np.copyto(ov_tensor.data, np_view)
                 else:
                     # Fallback Path: zero-copy pointer binding for large/dynamic inputs
-                    if isinstance(val, torch.Tensor):
-                        if (
-                            val.device == self.cpu_device
-                            and val.dtype == target_tdtype
-                            and val.is_contiguous()
-                        ):
-                            np_view = val.detach().numpy()
-                            keep_alive.append(val)
-                        else:
-                            cpu_val = val.detach()
-                            if cpu_val.device != self.cpu_device:
-                                cpu_val = cpu_val.cpu()
-                            if cpu_val.dtype != target_tdtype:
-                                cpu_val = cpu_val.to(target_tdtype)
-                            if not cpu_val.is_contiguous():
-                                cpu_val = cpu_val.contiguous()
-                            np_view = cpu_val.numpy()
-                            keep_alive.append(cpu_val)
-                    else:
-                        np_view = np.array(val)
-                        if np_view.dtype != target_dtype:
-                            np_view = np_view.astype(target_dtype)
-                        if not np_view.flags["C_CONTIGUOUS"]:
-                            np_view = np.ascontiguousarray(np_view)
-                        keep_alive.append(np_view)
-
                     try:
                         infer_request.set_input_tensor(
                             i, ov.Tensor(np_view, shared_memory=True)
@@ -439,11 +418,57 @@ class NPUGraphModule(torch.nn.Module):
             return outputs[0]
         return tuple(outputs)
 
+    def submit(self, *args) -> NPUAsyncFuture:
+        """
+        Submit an asynchronous inference request and return an NPUAsyncFuture handle.
+        Allows non-blocking pipelined execution across multiple streams.
+        """
+        handle = self.infer_async(*args)
+        return NPUAsyncFuture(self, handle)
+
+    def batch_infer(self, inputs_list: List[tuple]) -> List[Any]:
+        """
+        High-throughput asynchronous batch inference pipelined across all available streams.
+        Maximizes NPU core saturation by overlapping host dispatch and device compute.
+        """
+        if not inputs_list:
+            return []
+
+        results = [None] * len(inputs_list)
+        active_futures = []
+
+        for i, inp_args in enumerate(inputs_list):
+            if not isinstance(inp_args, tuple):
+                inp_args = (inp_args,)
+            while len(active_futures) >= self.num_streams:
+                idx, fut = active_futures.pop(0)
+                results[idx] = fut.result()
+
+            future = self.submit(*inp_args)
+            active_futures.append((i, future))
+
+        for idx, fut in active_futures:
+            results[idx] = fut.result()
+
+        return results
+
     def reset_states(self):
         """Reset all internal state variables (like KV-caches) in the NPU hardware."""
         for request in self.infer_requests:
             for state in request.query_state():
                 state.reset()
+
+    def get_profiling_info(self, request_idx: int = 0) -> List[Any]:
+        """
+        Retrieve OpenVINO profiling metrics (execution status, execution time, real/CPU time,
+        and layer node types) for the specified infer request.
+        """
+        if 0 <= request_idx < len(self.infer_requests):
+            try:
+                return self.infer_requests[request_idx].get_profiling_info()
+            except Exception as e:
+                return [{"error": str(e)}]
+        return []
 
 
 class NPUDynamicGraphModule(torch.nn.Module):
@@ -572,25 +597,28 @@ class NPUDynamicGraphModule(torch.nn.Module):
             return tuple(slice_tensor(t) for t in outputs)
         return slice_tensor(outputs)
 
+    def _get_or_compile_bucket(self, S: int, args_tuple: tuple):
+        B = self._find_bucket(S)
+        if B not in self._compiled_buckets:
+            padded_args = self._pad_inputs(args_tuple, S, B)
+            from .compiler import compile_to_npu  # Delay-import to avoid circular dependency
+            self._compiled_buckets[B] = compile_to_npu(
+                self.model,
+                padded_args,
+                self.performance_hint,
+                self.num_streams,
+                self.strict,
+                dynamic_buckets=False,
+                clone_outputs=self.clone_outputs,
+                preprocess_config=self.preprocess_config,
+            )
+        return B, self._compiled_buckets[B]
+
     def forward(self, *args):
         args_tuple = tuple(args)
         S = self._get_seq_len(args_tuple)
         if S is not None:
-            B = self._find_bucket(S)
-            if B not in self._compiled_buckets:
-                padded_args = self._pad_inputs(args_tuple, S, B)
-                from .compiler import compile_to_npu  # Delay-import to avoid circular dependency
-                self._compiled_buckets[B] = compile_to_npu(
-                    self.model,
-                    padded_args,
-                    self.performance_hint,
-                    self.num_streams,
-                    self.strict,
-                    dynamic_buckets=False,
-                    clone_outputs=self.clone_outputs,
-                    preprocess_config=self.preprocess_config,
-                )
-            compiled_model = self._compiled_buckets[B]
+            B, compiled_model = self._get_or_compile_bucket(S, args_tuple)
             padded_args = self._pad_inputs(args_tuple, S, B)
             outputs = compiled_model(*padded_args)
             return self._slice_outputs(outputs, S, B)
@@ -601,21 +629,7 @@ class NPUDynamicGraphModule(torch.nn.Module):
         args_tuple = tuple(args)
         S = self._get_seq_len(args_tuple)
         if S is not None:
-            B = self._find_bucket(S)
-            if B not in self._compiled_buckets:
-                padded_args = self._pad_inputs(args_tuple, S, B)
-                from .compiler import compile_to_npu  # Delay-import to avoid circular dependency
-                self._compiled_buckets[B] = compile_to_npu(
-                    self.model,
-                    padded_args,
-                    self.performance_hint,
-                    self.num_streams,
-                    self.strict,
-                    dynamic_buckets=False,
-                    clone_outputs=self.clone_outputs,
-                    preprocess_config=self.preprocess_config,
-                )
-            compiled_model = self._compiled_buckets[B]
+            B, compiled_model = self._get_or_compile_bucket(S, args_tuple)
             padded_args = self._pad_inputs(args_tuple, S, B)
             req_idx = compiled_model.infer_async(*padded_args)
             return (compiled_model, req_idx, S, B)

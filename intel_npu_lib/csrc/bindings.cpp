@@ -38,4 +38,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_performance_hint", &set_npu_performance_hint,
           "Set performance hint (LATENCY, THROUGHPUT)");
     m.def("set_eager_device", &set_npu_eager_device, "Set device for eager operations (CPU, NPU)");
+    m.def("clear_cpp_model_cache", &clear_cpp_model_cache, "Clear in-memory C++ model cache");
+    m.def("get_cache_version", []() {
+        return NPUBackend::getInstance().getCacheVersion();
+    }, "Get model cache version counter");
 }

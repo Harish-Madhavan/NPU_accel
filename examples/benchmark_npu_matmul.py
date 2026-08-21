@@ -1,8 +1,14 @@
-import torch
+import os
+import sys
+
+# Ensure library is importable when run directly from repository
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
+
 import time
 import math
-import intel_npu_acceleration as npu_compiler
 import argparse
+import torch
+import intel_npu_acceleration as npu_compiler
 
 
 class MatMulModel(torch.nn.Module):
@@ -142,20 +148,21 @@ def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="f
     # CPU Comparison (if float32 or float16)
     if dtype_str != "int8":
         print("\nRunning CPU Comparison (PyTorch FP32/FP16 native)...")
-        # CPU Warmup
-        print(f"Warming up CPU ({min(5, warmup)} iterations)...")
-        for _ in range(min(5, warmup)):
-            torch.matmul(a, b)
+        # CPU Warmup (1 iteration to avoid long CPU delays)
+        print("Warming up CPU (1 iteration)...")
+        torch.matmul(a, b)
 
-        # CPU Benchmark
-        cpu_iters = min(10, iterations)
+        # CPU Benchmark (2 iterations)
+        cpu_iters = 2
         print(f"Running CPU test ({cpu_iters} iterations)...")
         cpu_latencies = []
-        for _ in range(cpu_iters):
+        for i in range(cpu_iters):
             t_start = time.time()
             torch.matmul(a, b)
             t_end = time.time()
-            cpu_latencies.append((t_end - t_start) * 1000.0)
+            lat = (t_end - t_start) * 1000.0
+            print(f"  CPU Iteration {i+1}/{cpu_iters}: {lat:.2f} ms")
+            cpu_latencies.append(lat)
 
         avg_cpu = sum(cpu_latencies) / cpu_iters
         min_cpu = min(cpu_latencies)

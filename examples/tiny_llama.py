@@ -1,12 +1,17 @@
+import os
+import sys
+
+# Ensure library is importable when run directly from repository
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
+
+import time
+from typing import Optional
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from typing import Optional, List
-from dataclasses import dataclass
-import math
-import time
-import intel_npu_acceleration.functional as n_f
 import intel_npu_acceleration as npu_compiler
-from intel_npu_acceleration.functional import NPUStatefulKVCache
+import intel_npu_acceleration.functional as n_f
+from intel_npu_acceleration.nn import NPUStatefulKVCache
 
 
 @dataclass
@@ -29,7 +34,8 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return n_f.rmsnorm(x, self.weight, self.eps)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -50,7 +56,7 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     out1 = x1 * cos - x2 * sin
     out2 = x1 * sin + x2 * cos
 
-    return torch.cat([out1, out2], dim=-1).type_as(x)
+    return torch.cat([out1, out2], dim=-1)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -143,7 +149,7 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        return self.w2(n_f.silu(self.w1(x)) * self.w3(x))
+        return self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
@@ -221,7 +227,7 @@ class Llama(nn.Module):
         freqs_sin = freqs_sin[idx]
 
         mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
-        mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+        mask = torch.triu(mask, diagonal=start_pos + 1).to(dtype=h.dtype)
 
         new_kvs_flat = []
         for i, layer in enumerate(self.layers):
@@ -299,7 +305,7 @@ class StatefulAttention(nn.Module):
         values = values.transpose(1, 2)
 
         # Causal attention using hardware-based mask
-        output = n_f.scaled_dot_product_attention(
+        output = torch.nn.functional.scaled_dot_product_attention(
             xq, keys, values, attn_mask=mask, is_causal=False
         )
         
@@ -368,8 +374,7 @@ class StatefulLlama(nn.Module):
             h = layer(h, freqs_cos, freqs_sin, mask)
 
         h = self.norm(h)
-        output = self.output(h).float()
-        return output
+        return self.output(h)
 
 
 # =====================================================================
@@ -543,27 +548,13 @@ def main():
     fp16_latency = run_text_generation(npu_model_fp16, prompt, max_gen_len, conf)
 
     # -------------------------------------------------------------
-    # PART B: Standard INT8 Model (Functional KV Cache)
+    # PART B: Stateful LLaMA Model (Hardware-Offloaded Cache)
     # -------------------------------------------------------------
-    print("\n[Step 3] Applying Weight-Only INT8 Quantization...")
-    model_int8 = npu_compiler.quantize(model)
-
-    print("\n[Step 4] Compiling Tiny LLaMA INT8 model (Functional Cache) for NPU...")
-    t0 = time.time()
-    npu_model_int8 = npu_compiler.compile_to_npu(model_int8, (compile_input_token, compile_start_pos, compile_cache))
-    print(f"Compilation finished in {time.time() - t0:.2f}s.")
-
-    print("\n[Step 5] Executing Autoregressive Text Generation (NPU INT8 - Functional):")
-    int8_latency = run_text_generation(npu_model_int8, prompt, max_gen_len, conf)
-
-    # -------------------------------------------------------------
-    # PART C: Stateful LLaMA Model (Hardware-Offloaded Cache)
-    # -------------------------------------------------------------
-    print("\n[Step 6] Initializing Stateful LLaMA Model (Phase 4 Stateful Decoders)...")
+    print("\n[Step 3] Initializing Stateful LLaMA Model (Hardware-Offloaded State Registers)...")
     stateful_model = StatefulLlama(conf)
     stateful_model.eval()
 
-    # Load weights from the non-quantized model for identical outputs
+    # Load weights from the base model for identical outputs
     stateful_model.tok_embeddings.weight.data.copy_(model.tok_embeddings.weight.data)
     stateful_model.output.weight.data.copy_(model.output.weight.data)
     for i in range(conf.n_layers):
@@ -581,16 +572,16 @@ def main():
     compile_sin = torch.zeros(1, conf.dim // (2 * conf.n_heads))
     compile_mask = torch.zeros(1, 1, 1, conf.max_seq_len)
 
-    print("\n[Step 7] Compiling Stateful Tiny LLaMA (Zero-Transfer Registers) for NPU...")
+    print("\n[Step 4] Compiling Stateful Tiny LLaMA (Zero-Transfer Registers) for NPU...")
     t0 = time.time()
     npu_model_stateful = npu_compiler.compile_to_npu(
         stateful_model,
         (compile_input_token, compile_cos, compile_sin, compile_mask),
-        strict=True
+        strict=True,
     )
     print(f"Compilation finished in {time.time() - t0:.2f}s.")
 
-    print("\n[Step 8] Executing Autoregressive Text Generation (NPU FP16 - Stateful Registers):")
+    print("\n[Step 5] Executing Autoregressive Text Generation (NPU FP16 - Stateful Registers):")
     stateful_latency = run_stateful_text_generation(
         npu_model_stateful, prompt, max_gen_len, conf, stateful_model
     )
@@ -601,17 +592,14 @@ def main():
     print("\n" + "=" * 67)
     print("                LLaMA GENERATION LATENCY SUMMARY                ")
     print("=" * 67)
-    print(f"| Precision Target         | Cache Model | Avg Decode Latency (per Token)  |")
+    print("| Execution Mode           | Cache Strategy | Avg Decode Latency (per Token)  |")
     print("-" * 67)
-    print(f"| NPU FP16                 | Functional  | {fp16_latency:25.2f} ms |")
-    print(f"| NPU INT8 (Weight-Only)   | Functional  | {int8_latency:25.2f} ms |")
-    print(f"| NPU FP16 (Stateful)      | Hardware    | {stateful_latency:25.2f} ms |")
+    print(f"| NPU FP16 (Functional)    | Host-Tensor    | {fp16_latency:25.2f} ms |")
+    print(f"| NPU FP16 (Stateful)      | Hardware-Reg   | {stateful_latency:25.2f} ms |")
     print("=" * 67)
     
     speedup_stateful = fp16_latency / stateful_latency if stateful_latency > 0 else 0
-    print(f"Stateful (Hardware Cache) speedup factor over FP16: {speedup_stateful:.2f}x")
-    speedup_int8 = fp16_latency / int8_latency if int8_latency > 0 else 0
-    print(f"INT8 speedup factor: {speedup_int8:.2f}x\n")
+    print(f"Stateful (Zero-Transfer Hardware Cache) speedup: {speedup_stateful:.2f}x\n")
 
 
 if __name__ == "__main__":

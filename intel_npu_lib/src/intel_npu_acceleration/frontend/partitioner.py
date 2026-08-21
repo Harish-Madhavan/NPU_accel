@@ -1,9 +1,24 @@
+from typing import Optional, List, Dict, Any
 import torch
 import torch.fx
 import logging
 from ..registry import OpRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _is_node_supported(node: torch.fx.Node, root_model: torch.nn.Module) -> bool:
+    """Check if an FX graph node is supported by the OpRegistry."""
+    if node.op == "call_function":
+        return OpRegistry.get_function(node.target) is not None
+    if node.op == "call_method":
+        return OpRegistry.get_method(node.target) is not None
+    if node.op == "call_module":
+        target_sub = root_model
+        for atom in str(node.target).split("."):
+            target_sub = getattr(target_sub, atom)
+        return OpRegistry.get_module(type(target_sub)) is not None
+    return True
 
 
 def partition_and_compile_hybrid(
@@ -13,10 +28,10 @@ def partition_and_compile_hybrid(
     performance_hint: str,
     num_streams: int,
     dynamic_buckets: bool,
-    bucket_sizes: list,
+    bucket_sizes: Optional[List[int]],
     dynamic_dim: int,
     clone_outputs: bool,
-    preprocess_config: dict,
+    preprocess_config: Optional[dict],
 ) -> torch.nn.Module:
     """
     Automated Hybrid Graph Partitioning & CPU Fallback.
@@ -37,17 +52,7 @@ def partition_and_compile_hybrid(
             partition_map[node] = current_partition
             continue
 
-        # Determine if the node itself is supported
-        is_supported = True
-        if node.op == "call_function":
-            is_supported = OpRegistry.get_function(node.target) is not None
-        elif node.op == "call_method":
-            is_supported = OpRegistry.get_method(node.target) is not None
-        elif node.op == "call_module":
-            target_sub = model
-            for atom in node.target.split("."):
-                target_sub = getattr(target_sub, atom)
-            is_supported = OpRegistry.get_module(type(target_sub)) is not None
+        is_supported = _is_node_supported(node, model)
 
         if prev_is_supported is None:
             prev_is_supported = is_supported
@@ -95,33 +100,11 @@ def partition_and_compile_hybrid(
         
         # Check if the child module is a GraphModule before checking graph.nodes
         if not hasattr(child, "graph"):
-            # This is an original leaf module copied directly to the split parent.
-            # Check if it has a registered converter.
-            if OpRegistry.get_module(type(child)) is not None:
-                is_supported = True
-            else:
-                is_supported = False
+            is_supported = OpRegistry.get_module(type(child)) is not None
         else:
             for n in child.graph.nodes:
-                if n.op in ["placeholder", "output", "get_attr"]:
-                    continue
-                if (
-                    n.op == "call_function"
-                    and OpRegistry.get_function(n.target) is None
-                ):
-                    is_supported = False
-                    break
-                elif (
-                    n.op == "call_method"
-                    and OpRegistry.get_method(n.target) is None
-                ):
-                    is_supported = False
-                    break
-                elif n.op == "call_module":
-                    target_sub = child
-                    for atom in n.target.split("."):
-                        target_sub = getattr(target_sub, atom)
-                    if OpRegistry.get_module(type(target_sub)) is None:
+                if n.op not in ["placeholder", "output", "get_attr"]:
+                    if not _is_node_supported(n, child):
                         is_supported = False
                         break
 
@@ -152,5 +135,20 @@ def partition_and_compile_hybrid(
             logger.info(
                 f"Partition: Leaving unsupported submodule '{name}' on CPU."
             )
+
+    def reset_states():
+        for child in split_parent.children():
+            if hasattr(child, "reset_states"):
+                child.reset_states()
+
+    def infer_async(*args):
+        return split_parent(*args)
+
+    def wait_async(handle):
+        return handle
+
+    split_parent.reset_states = reset_states
+    split_parent.infer_async = infer_async
+    split_parent.wait_async = wait_async
 
     return split_parent

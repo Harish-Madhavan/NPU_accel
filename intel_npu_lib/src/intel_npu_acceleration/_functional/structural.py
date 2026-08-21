@@ -36,6 +36,8 @@ def unsqueeze(input: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    if dim < 0 and len(tensors) > 0:
+        dim = dim + len(tensors[0].shape)
     if (
         _C is None
         or _is_proxy(*tensors)
@@ -46,6 +48,8 @@ def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
 
 
 def stack(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    if dim < 0 and len(tensors) > 0:
+        dim = dim + len(tensors[0].shape) + 1
     if (
         _C is None
         or _is_proxy(*tensors)

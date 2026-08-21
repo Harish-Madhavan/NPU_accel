@@ -49,7 +49,7 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     sin = sin.view(1, sin.shape[0], 1, sin.shape[1])
     out1 = x1 * cos - x2 * sin
     out2 = x1 * sin + x2 * cos
-    return torch.cat([out1, out2], dim=-1).type_as(x)
+    return torch.cat([out1, out2], dim=3).type_as(x)
 
 
 class Attention(nn.Module):
@@ -197,10 +197,15 @@ class TestLlamaModel(unittest.TestCase):
             conf.dim // conf.n_heads,
         )
 
-        try:
-            npu_model = compile_to_npu(model, (x, start_pos, kv_cache))
-        except Exception as e:
-            self.fail(f"Compilation failed: {e}")
+        import warnings
+        from torch.jit import TracerWarning
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=TracerWarning)
+            try:
+                npu_model = compile_to_npu(model, (x, start_pos, kv_cache))
+            except Exception as e:
+                self.fail(f"Compilation failed: {e}")
 
         out_npu, cache_npu = npu_model(x, start_pos, kv_cache)
         out_cpu, cache_cpu = model(x, start_pos, kv_cache)

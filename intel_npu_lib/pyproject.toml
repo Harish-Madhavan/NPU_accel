@@ -5,8 +5,15 @@ build-backend = "setuptools.build_meta"
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-v --tb=short"
+pythonpath = [
+    "src",
+]
 testpaths = [
     "tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::torch.jit.TracerWarning",
 ]
 
 [tool.ruff]

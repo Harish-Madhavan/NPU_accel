@@ -9,8 +9,8 @@
 // ---------------------------------------------------------------------------
 
 NPUBackend& NPUBackend::getInstance() {
-    static NPUBackend* instance = new NPUBackend();
-    return *instance;
+    static NPUBackend instance;
+    return instance;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +199,7 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key,
         if (m_model_cache.size() >= m_max_cache_size) {
             m_model_cache.erase(m_access_order.back());
             m_access_order.pop_back();
+            m_cache_version.fetch_add(1, std::memory_order_relaxed);
         }
         m_access_order.push_front(key);
         m_model_cache[key] = {compiled, m_access_order.begin()};
@@ -216,6 +217,13 @@ ov::InferRequest NPUBackend::getOrCachedInferRequest(const std::string& key) {
     // Thread-local storage gives us zero-overhead reuse for the common
     // single-threaded case, and full isolation for concurrent callers.
     thread_local std::unordered_map<std::string, ov::InferRequest> tl_requests;
+    thread_local uint64_t tl_cache_version = 0;
+
+    uint64_t current_version = m_cache_version.load(std::memory_order_relaxed);
+    if (tl_cache_version != current_version) {
+        tl_requests.clear();
+        tl_cache_version = current_version;
+    }
 
     auto tl_it = tl_requests.find(key);
     if (tl_it != tl_requests.end()) {
@@ -264,9 +272,20 @@ void NPUBackend::setProperty(const std::string& key, const std::string& value) {
     }
 }
 
+void NPUBackend::clearCache() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_model_cache.clear();
+    m_access_order.clear();
+    m_cache_version.fetch_add(1, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // C-API wrappers
 // ---------------------------------------------------------------------------
+
+uint64_t NPUBackend::getCacheVersion() const {
+    return m_cache_version.load(std::memory_order_relaxed);
+}
 
 bool is_npu_available() {
     return NPUBackend::getInstance().isAvailable();
@@ -285,4 +304,7 @@ void set_npu_performance_hint(const std::string& hint) {
 }
 void set_npu_eager_device(const std::string& device) {
     NPUBackend::getInstance().setEagerDevice(device);
+}
+void clear_cpp_model_cache() {
+    NPUBackend::getInstance().clearCache();
 }

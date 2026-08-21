@@ -4,23 +4,64 @@ import hashlib
 import logging
 from collections import OrderedDict
 import openvino as ov
+import openvino.opset13 as ops
 import openvino.properties as ov_props
 import openvino.properties.hint as ov_hints
 from typing import Any, Optional, List
 import numpy as np
 
 import intel_npu_acceleration as npu_lib
-from ..registry import OpRegistry
-from ..graph_builder import OVGraphBuilder, ValueCapturingInterpreter
+from ..exceptions import NPUCompilationError
 from .graph_module import NPUGraphModule, NPUDynamicGraphModule
-from .tracer import NPUTracer
+from .transformations import (
+    fold_scalar_parameter_inputs,
+    reshape_model_inputs_to_static,
+    transform_stateful_kv_cache,
+    apply_pre_post_processing,
+    optimize_ov_model,
+    serialize_openvino_model,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class NPUTracer(torch.fx.Tracer):
+    """Custom FX Tracer for Intel NPU."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from ..functional import quantized_linear, NPUStatefulKVCache
+        self._autowrap_function_ids.add(id(quantized_linear))
+        self._stateful_kv_type = NPUStatefulKVCache
+
+    def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+        if isinstance(m, self._stateful_kv_type):
+            return True
+        if isinstance(m, torch.nn.Linear):
+            weight = m._parameters.get("weight", None)
+            if weight is not None and not isinstance(weight, torch.fx.Proxy):
+                weight_data = getattr(weight, "data", None)
+                if weight_data is not None and hasattr(weight_data, "dtype"):
+                    if weight_data.dtype in [torch.int8, torch.uint8]:
+                        return True
+        return super().is_leaf_module(m, module_qualified_name)
+
 
 # --- Global Cache for Compiled Graphs ---
 _OV_CORE = None
 _GRAPH_CACHE = OrderedDict()
 _MAX_GRAPH_CACHE_SIZE = 100
+
+
+def clear_graph_cache():
+    """Clear all in-memory compiled model graphs from both Python and C++ backend caches."""
+    global _GRAPH_CACHE
+    _GRAPH_CACHE.clear()
+    if npu_lib._C is not None and hasattr(npu_lib._C, "clear_cpp_model_cache"):
+        try:
+            npu_lib._C.clear_cpp_model_cache()
+        except Exception:
+            pass
+    logger.info("In-memory NPU graph cache cleared.")
 
 
 def _get_core():
@@ -39,40 +80,9 @@ def _get_core():
     return _OV_CORE
 
 
-class NPUCompilationError(Exception):
-    """Exception raised for errors during NPU compilation."""
-    pass
-
-
-def compile(
-    model: torch.nn.Module,
-    example_input: Any,
-    performance_hint: str = "LATENCY",
-    num_streams: int = 1,
-    strict: bool = False,
-    dynamic_buckets: bool = False,
-    bucket_sizes: Optional[List[int]] = None,
-    dynamic_dim: int = 1,
-    clone_outputs: bool = True,
-    preprocess_config: Optional[dict] = None,
-    stateful: bool = False,
-) -> torch.nn.Module:
-    """
-    Compile a PyTorch model for Intel NPU.
-    """
-    return compile_to_npu(
-        model,
-        example_input,
-        performance_hint,
-        num_streams,
-        strict,
-        dynamic_buckets,
-        bucket_sizes,
-        dynamic_dim,
-        clone_outputs,
-        preprocess_config,
-        stateful,
-    )
+def compile(model: torch.nn.Module, example_input: Any, *args, **kwargs) -> torch.nn.Module:
+    """Compile a PyTorch model for Intel NPU."""
+    return compile_to_npu(model, example_input, *args, **kwargs)
 
 
 def compile_to_npu(
@@ -87,6 +97,7 @@ def compile_to_npu(
     clone_outputs: bool = True,
     preprocess_config: Optional[dict] = None,
     stateful: bool = False,
+    precision: str = "auto",
 ) -> torch.nn.Module:
     global _GRAPH_CACHE
 
@@ -103,6 +114,25 @@ def compile_to_npu(
             preprocess_config=preprocess_config,
         )
 
+    # Automatic dtype inspection from standard PyTorch model and tensors
+    if precision == "auto":
+        is_fp16 = False
+        if isinstance(example_input, torch.Tensor) and example_input.dtype in [torch.float16, torch.bfloat16]:
+            is_fp16 = True
+        elif isinstance(example_input, (tuple, list)):
+            if any(isinstance(x, torch.Tensor) and x.dtype in [torch.float16, torch.bfloat16] for x in example_input):
+                is_fp16 = True
+        if not is_fp16 and hasattr(model, "parameters"):
+            try:
+                for p in model.parameters():
+                    if p.dtype in [torch.float16, torch.bfloat16]:
+                        is_fp16 = True
+                        break
+            except Exception:
+                pass
+        if is_fp16:
+            precision = "fp16"
+
     # Compiler Performance Intelligence Logging
     if performance_hint == "LATENCY" and num_streams == 1:
         logger.info(
@@ -114,62 +144,59 @@ def compile_to_npu(
 
     logger.info("Starting NPU Compilation...")
     try:
-        # Trace the model into GraphModule first
+        # Trace the model into GraphModule first (solely for cache key generation and topological analysis)
         if isinstance(model, torch.fx.GraphModule):
             traced = model
         else:
             traced = torch.fx.GraphModule(model, NPUTracer().trace(model))
 
-        # Check for unsupported operators in the graph
-        has_unsupported = False
+        if isinstance(example_input, torch.Tensor):
+            example_input_tuple = (example_input,)
+        elif isinstance(example_input, (tuple, list)):
+            example_input_tuple = tuple(example_input)
+        else:
+            example_input_tuple = (example_input,)
+
+        # Sanitize SymInt / SymFloat / SymBool from PyTorch Dynamo dynamic shapes
+        clean_inputs = []
+        for val in example_input_tuple:
+            if hasattr(val, "node") and not isinstance(val, torch.Tensor):
+                try:
+                    clean_inputs.append(int(val))
+                except Exception:
+                    try:
+                        clean_inputs.append(float(val))
+                    except Exception:
+                        clean_inputs.append(1)
+            else:
+                clean_inputs.append(val)
+        example_input_tuple = tuple(clean_inputs)
+
+        # Check for unsupported nodes to enable hybrid partitioning fallback
+        from intel_npu_acceleration.registry import OpRegistry
+        unsupported_nodes = []
         for node in traced.graph.nodes:
             if node.op in ["placeholder", "output", "get_attr"]:
                 continue
-            if node.op == "call_function":
-                if OpRegistry.get_function(node.target) is None:
-                    has_unsupported = True
-                    break
-            elif node.op == "call_method":
-                if OpRegistry.get_method(node.target) is None:
-                    has_unsupported = True
-                    break
+            if node.op == "call_function" and OpRegistry.get_function(node.target) is None:
+                unsupported_nodes.append(f"{node.name} (call_function: {node.target})")
+            elif node.op == "call_method" and OpRegistry.get_method(node.target) is None:
+                unsupported_nodes.append(f"{node.name} (call_method: {node.target})")
             elif node.op == "call_module":
                 submod = model
                 for atom in node.target.split("."):
                     submod = getattr(submod, atom)
                 if OpRegistry.get_module(type(submod)) is None:
-                    has_unsupported = True
-                    break
+                    unsupported_nodes.append(f"{node.name} (call_module: {type(submod)})")
 
-        if isinstance(example_input, torch.Tensor):
-            example_input_tuple = (example_input,)
-        else:
-            example_input_tuple = example_input
-
-        if has_unsupported:
-            unsupported_nodes = []
-            for node in traced.graph.nodes:
-                if node.op in ["placeholder", "output", "get_attr"]:
-                    continue
-                if node.op == "call_function" and OpRegistry.get_function(node.target) is None:
-                    unsupported_nodes.append(f"{node.name} (call_function: {node.target})")
-                elif node.op == "call_method" and OpRegistry.get_method(node.target) is None:
-                    unsupported_nodes.append(f"{node.name} (call_method: {node.target})")
-                elif node.op == "call_module":
-                    submod = model
-                    for atom in node.target.split("."):
-                        submod = getattr(submod, atom)
-                    if OpRegistry.get_module(type(submod)) is None:
-                        unsupported_nodes.append(f"{node.name} (call_module: {type(submod)})")
+        if len(unsupported_nodes) > 0:
             if strict:
                 raise NPUCompilationError(
                     f"Unsupported operators detected in strict compilation mode: {', '.join(unsupported_nodes)}"
                 )
-
             logger.info(
                 "Unsupported operators detected. Enabling Automated Hybrid Graph Partitioning & CPU Fallback..."
             )
-
             from .partitioner import partition_and_compile_hybrid
             return partition_and_compile_hybrid(
                 model=model,
@@ -183,6 +210,19 @@ def compile_to_npu(
                 clone_outputs=clone_outputs,
                 preprocess_config=preprocess_config,
             )
+
+        # Convert non-Tensor scalars (int/float) to Tensors so that torch.jit.trace works natively
+        converted_inputs = []
+        for val in example_input_tuple:
+            if isinstance(val, torch.Tensor):
+                converted_inputs.append(val)
+            elif isinstance(val, int):
+                converted_inputs.append(torch.tensor(val, dtype=torch.int64))
+            elif isinstance(val, float):
+                converted_inputs.append(torch.tensor(val, dtype=torch.float32))
+            else:
+                converted_inputs.append(val)
+        example_input_tuple_converted = tuple(converted_inputs)
 
         # 1. Generate Cache Key (Include stateful in the cache key)
         graph_str = str(traced.graph)
@@ -216,32 +256,7 @@ def compile_to_npu(
                 all_placeholder_names=all_placeholder_names,
             )
 
-        # Identify cache placeholders used in functional update_kv_cache calls for auto-mapping
-        cache_placeholders = set()
-        parent_cache_placeholders = set()
-        from .._functional import update_kv_cache as npu_update_kv_cache_func
-        if stateful:
-            import operator
-            def trace_to_placeholder(n):
-                curr = n
-                while isinstance(curr, torch.fx.Node) and curr.op == "call_function" and curr.target in [operator.getitem, getattr]:
-                    if len(curr.args) > 0:
-                        curr = curr.args[0]
-                    else:
-                        break
-                if isinstance(curr, torch.fx.Node) and curr.op == "placeholder":
-                    return curr
-                return None
-
-            for node in traced.graph.nodes:
-                if node.op == "call_function" and node.target == npu_update_kv_cache_func:
-                    cache_node = node.args[0]
-                    placeholder_node = trace_to_placeholder(cache_node)
-                    if placeholder_node is not None:
-                        cache_placeholders.add(cache_node.name)
-                        parent_cache_placeholders.add(placeholder_node.name)
-
-        # Temporarily dequantize Linear weights for compilation (Interpreter & ShapeProp)
+        # Temporarily dequantize Linear weights for compilation
         quantized_weights = {}
         for name, submod in traced.named_modules():
             if isinstance(submod, torch.nn.Linear):
@@ -249,187 +264,52 @@ def compile_to_npu(
                 if weight is not None and getattr(weight, "data", None) is not None:
                     if weight.data.dtype in [torch.int8, torch.uint8]:
                         quantized_weights[submod] = weight.data
-                        submod.weight.data = weight.data.float()
+                        scale = getattr(submod, "weight_scale", 1.0)
+                        submod.weight.data = weight.data.float() * scale
 
         try:
-            # 2. Capture Values & Build OV Graph
-            interpreter = ValueCapturingInterpreter(traced)
-            interpreter.run(*example_input_tuple)
-
-            builder = OVGraphBuilder(interpreter.node_values)
-            builder.stateful = stateful
-            builder.cache_placeholders = cache_placeholders
-
-            from torch.fx.passes.shape_prop import ShapeProp
-            ShapeProp(traced).propagate(*example_input_tuple)
-
-            # Restore original quantized weights immediately after eager/ShapeProp phases
-            for submod, w_data in quantized_weights.items():
-                submod.weight.data = w_data
-
-            input_iter = iter(example_input_tuple)
-
-            for node in traced.graph.nodes:
-                if node.op == "placeholder":
-                    try:
-                        val = next(input_iter)
-                    except StopIteration:
-                        raise NPUCompilationError(
-                            f"Not enough example inputs for placeholders starting at {node.name}"
-                        )
-
-                    if "tensor_meta" in node.meta:
-                        shape = node.meta["tensor_meta"].shape
-                        dtype = node.meta["tensor_meta"].dtype
-                    else:
-                        if isinstance(val, torch.Tensor):
-                            shape = list(val.shape)
-                            dtype = val.dtype
-                        elif isinstance(val, int):
-                            shape = []
-                            dtype = torch.int64
-                        elif isinstance(val, float):
-                            shape = []
-                            dtype = torch.float32
-                        else:
-                            shape = [1]
-                            dtype = torch.float32
-
-                    if stateful and node.name in parent_cache_placeholders and node.name not in cache_placeholders:
-                        # Skip this top-level placeholder, as its individual sliced sub-graphs
-                        # are directly backed by native stateful variables.
-                        pass
-                    elif stateful and node.name in cache_placeholders:
-                        import openvino.opset13 as ops
-                        ov_type = ov.Type.f32
-                        if dtype == torch.float16:
-                            ov_type = ov.Type.f16
-                        elif dtype == torch.int32:
-                            ov_type = ov.Type.i32
-                        
-                        info = ov.op.util.VariableInfo()
-                        info.data_shape = ov.PartialShape(list(shape))
-                        info.data_type = ov_type
-                        info.variable_id = f"auto_cache_{node.name}"
-                        
-                        var = ov.op.util.Variable(info)
-                        builder.variables.append(var)
-                        
-                        read_node = ops.read_value(var)
-                        builder.register_output(node.name, read_node)
-                    else:
-                        builder.add_parameter(node.name, list(shape), dtype)
-
-                elif node.op == "call_function":
-                    if stateful and node.name in cache_placeholders:
-                        import openvino.opset13 as ops
-                        if "tensor_meta" in node.meta:
-                            shape = node.meta["tensor_meta"].shape
-                            dtype = node.meta["tensor_meta"].dtype
-                        else:
-                            shape = [1, 128, 4, 16]  # default fallback
-                            dtype = torch.float32
-
-                        ov_type = ov.Type.f32
-                        if dtype == torch.float16:
-                            ov_type = ov.Type.f16
-                        elif dtype == torch.int32:
-                            ov_type = ov.Type.i32
-                        
-                        info = ov.op.util.VariableInfo()
-                        info.data_shape = ov.PartialShape(list(shape))
-                        info.data_type = ov_type
-                        info.variable_id = f"auto_cache_{node.name}"
-                        
-                        var = ov.op.util.Variable(info)
-                        builder.variables.append(var)
-                        
-                        read_node = ops.read_value(var)
-                        builder.register_output(node.name, read_node)
-                    else:
-                        converter = OpRegistry.get_function(node.target)
-                        if converter:
-                            res = converter(builder, node, node.args, node.kwargs)
-                            builder.register_output(node.name, res)
-                        else:
-                            raise NPUCompilationError(f"Function {node.target} not supported.")
-
-                elif node.op == "call_method":
-                    converter = OpRegistry.get_method(node.target)
-                    if converter:
-                        res = converter(builder, node, node.args, node.kwargs)
-                        builder.register_output(node.name, res)
-                    else:
-                        raise NPUCompilationError(f"Method {node.target} not supported.")
-
-                elif node.op == "call_module":
-                    submod = model
-                    for atom in node.target.split("."):
-                        submod = getattr(submod, atom)
-                    converter = OpRegistry.get_module(type(submod))
-                    if converter:
-                        res = converter(builder, node, submod, node.args, node.kwargs)
-                        builder.register_output(node.name, res)
-                    else:
-                        raise NPUCompilationError(
-                            f"Module type {type(submod)} not supported."
-                        )
-
-                elif node.op == "get_attr":
-                    atom = model
-                    for atom_name in node.target.split("."):
-                        atom = getattr(atom, atom_name)
-                    builder.add_constant(node.name, atom)
-
-                elif node.op == "output":
-                    ret_vals = node.args[0]
-                    if isinstance(ret_vals, tuple):
-                        for ret_val in ret_vals:
-                            builder.result_nodes.append(builder.get_input(ret_val.name))
-                    else:
-                        builder.result_nodes.append(builder.get_input(ret_vals.name))
-
-            # 3. Create & Compile OV Model
-            if hasattr(builder, "sinks") and builder.sinks:
-                # Wrap all result nodes in output ports to match signature 13 of ov.Model (which takes Sequence[Output] with sinks/variables)
-                results_outputs = [r.output(0) if hasattr(r, "output") else r for r in builder.result_nodes]
-                ov_model = ov.Model(
-                    results_outputs,
-                    builder.sinks,
-                    builder.parameters,
-                    builder.variables,
-                    "NPU_Model",
+            # 2. Capture Values & Natively Convert Model using OpenVINO PyTorch Frontend
+            import intel_npu_acceleration.functional as npu_func
+            npu_func._IS_COMPILING = True
+            try:
+                ov_model = ov.convert_model(model, example_input=example_input_tuple_converted)
+                ov_model = fold_scalar_parameter_inputs(
+                    ov_model, example_input_tuple, all_placeholder_names
                 )
-            else:
-                ov_model = ov.Model(builder.result_nodes, builder.parameters, "NPU_Model")
+                reshape_model_inputs_to_static(
+                    ov_model, example_input_tuple, all_placeholder_names
+                )
+            except Exception as e:
+                raise NPUCompilationError(f"Failed to natively convert PyTorch model: {e}")
+            finally:
+                npu_func._IS_COMPILING = False
+
         finally:
-            # Restore original quantized weights
+            # Restore original quantized weights immediately after conversion phase
             for submod, w_data in quantized_weights.items():
                 submod.weight.data = w_data
 
-        # Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
+        # Find all NPUStatefulKVCache submodules in chronological/topological order
+        stateful_modules = []
+        for node in traced.graph.nodes:
+            if node.op == "call_module":
+                submod = model
+                for atom in node.target.split("."):
+                    submod = getattr(submod, atom)
+                from intel_npu_acceleration.functional import NPUStatefulKVCache
+                if isinstance(submod, NPUStatefulKVCache):
+                    stateful_modules.append(submod)
+
+        # 3. Post-process Stateful KV Cache nodes if requested
+        ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
+
+        # 4. OpenVINO Built-in Model Graph Optimizations (Constant Folding + Validation + Precision Conversion)
+        ov_model = optimize_ov_model(ov_model, precision=precision)
+
+        # 5. Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
         if preprocess_config:
             try:
-                from openvino.preprocess import PrePostProcessor
-                ppp = PrePostProcessor(ov_model)
-
-                if "input" in preprocess_config:
-                    inp_cfg = preprocess_config["input"]
-                    if isinstance(inp_cfg, dict) and not any(k in ["layout", "element_type", "model_layout", "mean", "scale"] for k in inp_cfg.keys()):
-                        for idx, item_cfg in inp_cfg.items():
-                            _configure_input_ppp(ppp.input(idx), item_cfg)
-                    else:
-                        _configure_input_ppp(ppp.input(0), inp_cfg)
-
-                if "output" in preprocess_config:
-                    out_cfg = preprocess_config["output"]
-                    if isinstance(out_cfg, dict) and "element_type" not in out_cfg:
-                        for idx, item_cfg in out_cfg.items():
-                            _configure_output_ppp(ppp.output(idx), item_cfg)
-                    else:
-                        _configure_output_ppp(ppp.output(0), out_cfg)
-
-                ov_model = ppp.build()
+                ov_model = apply_pre_post_processing(ov_model, preprocess_config)
                 logger.info("Successfully offloaded Pre-Post Processing (PPP) pipeline to NPU hardware.")
             except Exception as e:
                 logger.warning(f"Failed to apply PrePostProcessor: {e}. Proceeding with standard NPU graph.")
@@ -480,8 +360,8 @@ def compile_to_npu(
             else:
                 raise
 
-        # 4. Cache Management
-        input_names = [p.friendly_name for p in builder.parameters]
+        # 5. Cache Management
+        input_names = [p.any_name for p in ov_model.inputs]
         if len(_GRAPH_CACHE) >= _MAX_GRAPH_CACHE_SIZE:
             _GRAPH_CACHE.popitem(last=False)  # Evict oldest
 
@@ -507,112 +387,81 @@ def compile_to_npu(
         raise e
 
 
-def _configure_input_ppp(inp_info, cfg):
-    if "shape" in cfg:
-        inp_info.tensor().set_shape(list(cfg["shape"]))
-    if "layout" in cfg:
-        inp_info.tensor().set_layout(ov.Layout(cfg["layout"]))
-    if "element_type" in cfg:
-        t = cfg["element_type"]
-        if isinstance(t, str):
-            t = getattr(ov.Type, t) if hasattr(ov.Type, t) else ov.Type.u8
-        inp_info.tensor().set_element_type(t)
-    if "model_layout" in cfg:
-        inp_info.model().set_layout(ov.Layout(cfg["model_layout"]))
+def export_openvino_ir(
+    model: torch.nn.Module,
+    example_input: Any,
+    output_xml_path: str,
+    output_bin_path: Optional[str] = None,
+    preprocess_config: Optional[dict] = None,
+    stateful: bool = False,
+) -> str:
+    """
+    Export a PyTorch model directly to OpenVINO Intermediate Representation (IR) format (.xml / .bin).
+    Allows visualizing the compiled NPU model topology in Netron or running via OpenVINO C++ / Python engines.
+    """
+    if isinstance(example_input, torch.Tensor):
+        example_input_tuple = (example_input,)
+    else:
+        example_input_tuple = example_input
 
-    if "color_format" in cfg:
-        from openvino.preprocess import ColorFormat
-        cf_name = cfg["color_format"]
-        cf = getattr(ColorFormat, cf_name) if hasattr(ColorFormat, cf_name) else ColorFormat.BGR
-        inp_info.tensor().set_color_format(cf)
+    converted_inputs = []
+    for val in example_input_tuple:
+        if isinstance(val, torch.Tensor):
+            converted_inputs.append(val)
+        elif isinstance(val, int):
+            converted_inputs.append(torch.tensor(val, dtype=torch.int64))
+        elif isinstance(val, float):
+            converted_inputs.append(torch.tensor(val, dtype=torch.float32))
+        else:
+            converted_inputs.append(val)
 
-    if "model_color_format" in cfg:
-        from openvino.preprocess import ColorFormat
-        cf_name = cfg["model_color_format"]
-        cf = getattr(ColorFormat, cf_name) if hasattr(ColorFormat, cf_name) else ColorFormat.RGB
-        inp_info.preprocess().convert_color(cf)
+    if isinstance(model, torch.fx.GraphModule):
+        traced = model
+    else:
+        traced = torch.fx.GraphModule(model, NPUTracer().trace(model))
 
-    if "mean" in cfg or "scale" in cfg or "resize" in cfg:
-        preprocess_steps = inp_info.preprocess()
+    all_placeholder_names = [
+        node.name for node in traced.graph.nodes if node.op == "placeholder"
+    ]
 
-        t_cfg = cfg.get("element_type", ov.Type.u8)
-        if isinstance(t_cfg, str):
-            t_cfg = getattr(ov.Type, t_cfg) if hasattr(ov.Type, t_cfg) else ov.Type.u8
-        if t_cfg in [ov.Type.u8, ov.Type.i8, ov.Type.u16, ov.Type.i16, ov.Type.i32, ov.Type.i64]:
-            preprocess_steps.convert_element_type(ov.Type.f32)
+    import intel_npu_acceleration.functional as npu_func
 
-        if "resize" in cfg:
-            from openvino.preprocess import ResizeAlgorithm
-            h_target, w_target = cfg["resize"]
-            preprocess_steps.resize(ResizeAlgorithm.RESIZE_LINEAR, h_target, w_target)
+    npu_func._IS_COMPILING = True
+    try:
+        ov_model = ov.convert_model(model, example_input=tuple(converted_inputs))
+        ov_model = fold_scalar_parameter_inputs(
+            ov_model, example_input_tuple, all_placeholder_names
+        )
+        reshape_model_inputs_to_static(
+            ov_model, example_input_tuple, all_placeholder_names
+        )
+    finally:
+        npu_func._IS_COMPILING = False
 
-        if "mean" in cfg:
-            preprocess_steps.mean(cfg["mean"])
-        if "scale" in cfg:
-            preprocess_steps.scale(cfg["scale"])
+    stateful_modules = []
+    for node in traced.graph.nodes:
+        if node.op == "call_module":
+            submod = model
+            for atom in node.target.split("."):
+                submod = getattr(submod, atom)
+            from intel_npu_acceleration.functional import NPUStatefulKVCache
 
-    if "layout" in cfg and "model_layout" in cfg:
-        inp_info.preprocess().convert_layout(ov.Layout(cfg["model_layout"]))
+            if isinstance(submod, NPUStatefulKVCache):
+                stateful_modules.append(submod)
+
+    ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
+    ov_model = optimize_ov_model(ov_model)
+
+    if preprocess_config:
+        ov_model = apply_pre_post_processing(ov_model, preprocess_config)
+
+    serialize_openvino_model(ov_model, output_xml_path, output_bin_path)
+    logger.info(f"Successfully exported OpenVINO IR model to '{output_xml_path}'")
+    return output_xml_path
 
 
-def _configure_output_ppp(out_info, cfg):
-    if "element_type" in cfg:
-        t = cfg["element_type"]
-        if isinstance(t, str):
-            t = getattr(ov.Type, t) if hasattr(ov.Type, t) else ov.Type.f32
-        out_info.tensor().set_element_type(t)
+# --- Import TorchDynamo Backend Submodule ---
+from . import dynamo  # noqa: F401, E402
 
-
-# --- TorchDynamo Backend Registration ---
-try:
-    from torch._dynamo import register_backend
-
-    @register_backend
-    def npu(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor], **kwargs):
-        """
-        Dynamo backend for compiling PyTorch models natively via torch.compile(model, backend='npu')
-        """
-        if "options" in kwargs:
-            opts = kwargs.pop("options")
-            if isinstance(opts, dict):
-                kwargs.update(opts)
-
-        compiled = compile_to_npu(gm, tuple(example_inputs), **kwargs)
-
-        output_node = None
-        for node in gm.graph.nodes:
-            if node.op == "output":
-                output_node = node
-                break
-
-        if output_node is not None:
-            ret_vals = output_node.args[0]
-            is_tuple = isinstance(ret_vals, tuple)
-            is_list = isinstance(ret_vals, list)
-
-            if is_tuple:
-                num_outputs = len(ret_vals)
-                def tuple_wrapper(*args, **wrapper_kwargs):
-                    res = compiled(*args, **wrapper_kwargs)
-                    if num_outputs == 1:
-                        if isinstance(res, tuple):
-                            return res
-                        return (res,)
-                    return tuple(res) if isinstance(res, (list, tuple)) else (res,)
-                return tuple_wrapper
-            elif is_list:
-                num_outputs = len(ret_vals)
-                def list_wrapper(*args, **wrapper_kwargs):
-                    res = compiled(*args, **wrapper_kwargs)
-                    if num_outputs == 1:
-                        if isinstance(res, list):
-                            return res
-                        return [res]
-                    return list(res) if isinstance(res, (list, tuple)) else [res]
-                return list_wrapper
-
-        return compiled
-except Exception:
-    pass
 
 

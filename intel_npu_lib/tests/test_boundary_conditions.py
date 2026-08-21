@@ -1,7 +1,6 @@
 import unittest
 import torch
 import intel_npu_acceleration as npu
-import numpy as np
 
 class TestBoundaryConditions(unittest.TestCase):
     def test_zero_sized_tensors(self):

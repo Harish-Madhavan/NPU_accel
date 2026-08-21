@@ -1,254 +1,74 @@
-import os
+"""
+Intel NPU Acceleration Library for PyTorch.
+Hardware-accelerated deep learning execution on Intel Core Ultra Neural Processing Units.
+"""
+
 import sys
-import platform
 import logging
-import torch
+
+# --- Package Version ---
+__version__ = "0.2.0"
 
 # --- Logging Setup ---
 logger = logging.getLogger("intel_npu_acceleration")
-handler = logging.StreamHandler(sys.stderr)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
+_handler = logging.StreamHandler(sys.stderr)
+_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_handler.setFormatter(_formatter)
 if not logger.handlers:
-    logger.addHandler(handler)
-logging.getLogger().setLevel(logging.DEBUG)
-logger.setLevel(logging.DEBUG)
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
-# --- DLL Loading (Windows) ---
-if platform.system() == "Windows":
-    try:
-        import openvino
+# --- Exceptions ---
+from .exceptions import (  # noqa: E402
+    NPUError,
+    NPURuntimeError,
+    NPUDeviceError,
+    NPUCompilationError,
+    NPUUnsupportedOpError,
+)
 
-        libs_dir = os.path.join(os.path.dirname(openvino.__file__), "libs")
-        if os.path.exists(libs_dir):
-            os.add_dll_directory(libs_dir)
-    except (ImportError, AttributeError):
-        pass
+# --- Device Management & Properties ---
+from .device import (  # noqa: E402
+    _C,
+    is_available,
+    set_property,
+    set_performance_hint,
+    enable_turbo,
+    enable_sda,
+    set_eager_device,
+    get_eager_device,
+)
 
-# --- Import Core ---
-try:
-    from . import _C
-except ImportError as e:
-    logger.warning(f"Could not load C++ extension 'intel_npu_acceleration._C': {e}")
-    _C = None
-_CACHE_DIR = None
-_LAST_CLEANUP_TIME = 0.0
+# --- Disk & Memory Cache Management ---
+from .cache import (  # noqa: E402
+    get_cache_dir,
+    set_cache_dir,
+    clear_cache,
+    get_cache_size,
+    get_cache_version,
+    clean_old_cache,
+)
 
-# --- Cache Initialization ---
-if _C is not None:
-    try:
-        # Default cache location: npu_cache in the same directory as this file's parent or current working dir
-        possible_cache_dirs = [
-            os.path.join(os.getcwd(), "npu_cache"),
-            os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "..", "..", "npu_cache")
-            ),
-        ]
+# --- Neural Network Modules & Quantization ---
+from .nn import (  # noqa: E402
+    NPUStatefulKVCache,
+    quantize,
+)
 
-        cache_dir = None
-        for d in possible_cache_dirs:
-            if os.path.exists(d) and os.path.isdir(d):
-                cache_dir = d
-                break
+# --- Diagnostic Introspection ---
+from .info import get_system_info, print_info  # noqa: E402
 
-        if cache_dir:
-            _CACHE_DIR = cache_dir
-            logger.info(f"Setting NPU cache directory: {cache_dir}")
-            _C.set_cache_dir(cache_dir)
-        else:
-            # Optionally create it in CWD if not found
-            cwd_cache = os.path.join(os.getcwd(), "npu_cache")
-            if not os.path.exists(cwd_cache):
-                try:
-                    os.makedirs(cwd_cache, exist_ok=True)
-                    _CACHE_DIR = cwd_cache
-                    logger.info(f"Created NPU cache directory: {cwd_cache}")
-                    _C.set_cache_dir(cwd_cache)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.debug(f"Failed to initialize disk cache: {e}")
+# --- Graph Compiler & PyTorch 2.0 TorchDynamo Backend ---
+from .frontend import (  # noqa: E402
+    compile,
+    compile_to_npu,
+    export_openvino_ir,
+    clear_graph_cache,
+    NPUGraphModule,
+    NPUDynamicGraphModule,
+)
 
-
-def get_cache_dir():
-    return _CACHE_DIR
-
-
-def set_cache_dir(cache_dir: str):
-    global _CACHE_DIR
-    _CACHE_DIR = cache_dir
-    logger.info(f"Setting NPU cache directory: {cache_dir}")
-    if _C is not None:
-        _C.set_cache_dir(cache_dir)
-
-
-def clear_cache():
-    """Clear all files in the NPU cache directory."""
-    cache_dir = get_cache_dir()
-    if not cache_dir or not os.path.exists(cache_dir):
-        logger.warning("No cache directory configured or directory does not exist.")
-        return
-    logger.info(f"Clearing NPU cache directory: {cache_dir}")
-    for root, dirs, files in os.walk(cache_dir, topdown=False):
-        for name in files:
-            try:
-                os.remove(os.path.join(root, name))
-            except Exception as e:
-                logger.debug(f"Failed to remove cache file {name}: {e}")
-        for name in dirs:
-            try:
-                os.rmdir(os.path.join(root, name))
-            except Exception as e:
-                logger.debug(f"Failed to remove cache directory {name}: {e}")
-
-
-def get_cache_size() -> tuple[int, int]:
-    """
-    Get the total size in bytes and number of files in the cache directory.
-    Returns:
-        (total_size_bytes, file_count)
-    """
-    cache_dir = get_cache_dir()
-    if not cache_dir or not os.path.exists(cache_dir):
-        return 0, 0
-    total_size = 0
-    file_count = 0
-    for root, _, files in os.walk(cache_dir):
-        for name in files:
-            file_path = os.path.join(root, name)
-            try:
-                total_size += os.path.getsize(file_path)
-                file_count += 1
-            except Exception:
-                pass
-    return total_size, file_count
-
-
-def clean_old_cache(max_size_mb: int = 1024, max_files: int = 500):
-    """
-    Clean the cache directory by deleting the oldest files (based on modification time)
-    until the total size is below max_size_mb and total file count is below max_files.
-    Throttled to run at most once every 60 seconds to prevent heavy disk I/O scans.
-    """
-    import time
-    global _LAST_CLEANUP_TIME
-    
-    current_time = time.time()
-    if current_time - _LAST_CLEANUP_TIME < 60.0:
-        return
-
-    cache_dir = get_cache_dir()
-    if not cache_dir or not os.path.exists(cache_dir):
-        return
-
-    _LAST_CLEANUP_TIME = current_time
-
-    # Gather all cache files with their modification times and sizes
-    all_files = []
-    for root, _, files in os.walk(cache_dir):
-        for name in files:
-            file_path = os.path.join(root, name)
-            try:
-                mtime = os.path.getmtime(file_path)
-                size = os.path.getsize(file_path)
-                all_files.append((file_path, mtime, size))
-            except Exception:
-                pass
-
-    total_size = sum(f[2] for f in all_files)
-    total_files = len(all_files)
-
-    max_size_bytes = max_size_mb * 1024 * 1024
-
-    if total_size <= max_size_bytes and total_files <= max_files:
-        return
-
-    # Sort files by modification time (oldest first)
-    all_files.sort(key=lambda x: x[1])
-
-    logger.info(
-        f"Cleaning NPU cache. Current size: {total_size / (1024*1024):.2f} MB ({total_files} files). "
-        f"Limits: {max_size_mb} MB, {max_files} files."
-    )
-
-    deleted_count = 0
-    deleted_size = 0
-
-    for file_path, _, size in all_files:
-        if total_size <= max_size_bytes and total_files <= max_files:
-            break
-        try:
-            os.remove(file_path)
-            total_size -= size
-            total_files -= 1
-            deleted_count += 1
-            deleted_size += size
-        except Exception as e:
-            logger.debug(f"Failed to delete old cache file {file_path}: {e}")
-
-    logger.info(f"Cleaned {deleted_count} old cache files ({deleted_size / (1024*1024):.2f} MB cleared).")
-
-
-def quantize(model: torch.nn.Module) -> torch.nn.Module:
-    """
-    Quantize the weights of all `torch.nn.Linear` layers in the model to INT8 precision.
-    Compresses model footprint by up to 2x and prepares weights for fast NPU execution.
-    """
-    import torch
-    with torch.no_grad():
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                w = module.weight.data
-                scale = w.abs().max() / 127.0
-                quantized_w = (w / scale).round().clamp(-128, 127).to(torch.int8)
-                
-                module.weight.requires_grad = False
-                module.weight.data = quantized_w
-                setattr(module, "weight_scale", scale)
-    return model
-
-
-def is_available() -> bool:
-    if _C is None:
-        return False
-    return _C.is_npu_available()
-
-
-def set_property(key: str, value: str):
-    """Set global NPU property (Level Zero backend)."""
-    if _C is not None:
-        _C.set_property(key, value)
-    else:
-        logger.warning("NPU C++ extension not loaded. Cannot set property.")
-
-
-def set_performance_hint(hint: str):
-    """Set global NPU performance hint (LATENCY, THROUGHPUT)."""
-    if _C is not None:
-        _C.set_performance_hint(hint)
-    else:
-        logger.warning("NPU C++ extension not loaded. Cannot set performance hint.")
-
-
-def set_eager_device(device: str):
-    """Set device for eager operations (CPU, NPU)."""
-    if _C is not None:
-        _C.set_eager_device(device)
-    else:
-        logger.warning("NPU C++ extension not loaded. Cannot set eager device.")
-
-
-def enable_turbo():
-    """Enable Level Zero Turbo mode for maximum performance."""
-    set_property("NPU_TURBO", "YES")
-
-
-def enable_sda():
-    """Enable Shared Device Address for zero-copy memory transfers."""
-    set_property("NPU_USE_SDA", "YES")
-
-
-# --- Expose Functional API ---
+# --- Functional & Autograd Operations ---
 from .functional import (  # noqa: E402
     add,
     sub,
@@ -284,24 +104,44 @@ from .functional import (  # noqa: E402
     scaled_dot_product_attention,
 )
 
-# --- Expose Compiler API ---
-from .frontend import compile, compile_to_npu  # noqa: E402
-
 __all__ = [
+    # Metadata
+    "__version__",
+    # Exceptions
+    "NPUError",
+    "NPURuntimeError",
+    "NPUDeviceError",
+    "NPUCompilationError",
+    "NPUUnsupportedOpError",
+    # Device
     "is_available",
     "set_property",
     "set_performance_hint",
     "enable_turbo",
     "enable_sda",
-    "compile",
-    "compile_to_npu",
-    "quantize",
+    "set_eager_device",
+    "get_eager_device",
+    # Cache
     "get_cache_dir",
     "set_cache_dir",
     "clear_cache",
     "get_cache_size",
+    "get_cache_version",
     "clean_old_cache",
-    "set_eager_device",
+    "clear_graph_cache",
+    # Diagnostics
+    "get_system_info",
+    "print_info",
+    # Compiler
+    "compile",
+    "compile_to_npu",
+    "export_openvino_ir",
+    "NPUGraphModule",
+    "NPUDynamicGraphModule",
+    # NN Modules
+    "NPUStatefulKVCache",
+    "quantize",
+    # Functional Ops
     "add",
     "sub",
     "mul",

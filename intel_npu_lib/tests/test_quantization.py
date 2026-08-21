@@ -69,6 +69,12 @@ class TestQuantization(unittest.TestCase):
         out_npu = npu_model(input_t, weight_t, scale_t, zp_t, bias_t)
         out_cpu = model(input_t, weight_t, scale_t, zp_t, bias_t)
 
+        print("\n=== DEBUG QUANTIZED LINEAR ===")
+        print("out_npu:", out_npu)
+        print("out_cpu:", out_cpu)
+        print("difference:", torch.abs(out_npu - out_cpu))
+        print("==============================\n")
+
         self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
 
     def test_quantized_linear_float16(self):

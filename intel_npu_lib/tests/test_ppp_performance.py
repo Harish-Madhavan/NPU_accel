@@ -6,9 +6,7 @@ import logging
 from intel_npu_acceleration.frontend import (
     compile_to_npu,
     _GRAPH_CACHE,
-    NPUGraphModule,
 )
-import intel_npu_acceleration
 
 class SimpleCVModel(nn.Module):
     def __init__(self):

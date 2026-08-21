@@ -21,47 +21,27 @@
 /// Map a PyTorch scalar type to the corresponding OpenVINO element type.
 /// Falls back to f32 for unsupported types with a stderr warning.
 static ov::element::Type torch_dtype_to_ov(const torch::Tensor& t) {
-    switch (t.scalar_type()) {
-        case torch::kFloat:
-            return ov::element::f32;
-        case torch::kHalf:
-            return ov::element::f16;
-        case torch::kBFloat16:
-            return ov::element::bf16;
-        case torch::kDouble:
-            return ov::element::f64;
-        case torch::kInt:
-            return ov::element::i32;
-        case torch::kLong:
-            return ov::element::i64;
-        case torch::kShort:
-            return ov::element::i16;
-        case torch::kChar:
-            return ov::element::i8;
-        case torch::kByte:
-            return ov::element::u8;
-        case torch::kBool:
-            return ov::element::boolean;
-        default:
-            std::cerr << "[Intel NPU] Unsupported dtype: " << t.scalar_type()
-                      << ". Falling back to f32." << std::endl;
-            return ov::element::f32;
-    }
+    static const std::unordered_map<c10::ScalarType, ov::element::Type> map = {
+        {torch::kFloat, ov::element::f32}, {torch::kHalf, ov::element::f16},
+        {torch::kBFloat16, ov::element::bf16}, {torch::kDouble, ov::element::f64},
+        {torch::kInt, ov::element::i32}, {torch::kLong, ov::element::i64},
+        {torch::kShort, ov::element::i16}, {torch::kChar, ov::element::i8},
+        {torch::kByte, ov::element::u8}, {torch::kBool, ov::element::boolean}
+    };
+    auto it = map.find(t.scalar_type());
+    return it != map.end() ? it->second : ov::element::f32;
 }
 
-/// Map an OV element type back to a torch dtype for the output tensor.
 static torch::Dtype ov_dtype_to_torch(ov::element::Type ov_type) {
-    if (ov_type == ov::element::f32) return torch::kFloat;
-    if (ov_type == ov::element::f16) return torch::kHalf;
-    if (ov_type == ov::element::bf16) return torch::kBFloat16;
-    if (ov_type == ov::element::f64) return torch::kDouble;
-    if (ov_type == ov::element::i32) return torch::kInt;
-    if (ov_type == ov::element::i64) return torch::kLong;
-    if (ov_type == ov::element::i16) return torch::kShort;
-    if (ov_type == ov::element::i8) return torch::kChar;
-    if (ov_type == ov::element::u8) return torch::kByte;
-    if (ov_type == ov::element::boolean) return torch::kBool;
-    return torch::kFloat;  // safe fallback
+    static const std::unordered_map<ov::element::Type_t, torch::Dtype> map = {
+        {ov::element::f32, torch::kFloat}, {ov::element::f16, torch::kHalf},
+        {ov::element::bf16, torch::kBFloat16}, {ov::element::f64, torch::kDouble},
+        {ov::element::i32, torch::kInt}, {ov::element::i64, torch::kLong},
+        {ov::element::i16, torch::kShort}, {ov::element::i8, torch::kChar},
+        {ov::element::u8, torch::kByte}, {ov::element::boolean, torch::kBool}
+    };
+    auto it = map.find(ov_type);
+    return it != map.end() ? it->second : torch::kFloat;
 }
 
 /// Make a contiguous tensor whose memory is safe to pass to OpenVINO.
@@ -218,20 +198,7 @@ torch::Tensor npu_mul(torch::Tensor a, torch::Tensor b) {
 }
 
 torch::Tensor npu_div(torch::Tensor a, torch::Tensor b) {
-    std::string key = get_key("div", {a, b});
-    ov::Shape shape_a = get_ov_shape(a);
-    ov::Shape shape_b = get_ov_shape(b);
-    // Division result is always floating-point.
-    ov::element::Type fp_type =
-        (torch_dtype_to_ov(a) == ov::element::f16 && torch_dtype_to_ov(b) == ov::element::f16)
-            ? ov::element::f16
-            : ov::element::f32;
-    auto arg_a = std::make_shared<ov::opset1::Parameter>(fp_type, shape_a);
-    auto arg_b = std::make_shared<ov::opset1::Parameter>(fp_type, shape_b);
-    auto op = std::make_shared<ov::opset1::Divide>(arg_a, arg_b);
-    auto model =
-        std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a, arg_b});
-    return execute_op(key, model, {a, b});
+    return execute_binary_op_helper<ov::opset1::Divide>("div", a, b);
 }
 
 torch::Tensor npu_matmul(torch::Tensor a, torch::Tensor b) {

@@ -90,9 +90,9 @@ setup(
             name="intel_npu_acceleration._C",
             sources=get_sources(),
             extra_compile_args={
-                "cxx": ["/std:c++17", "/O2", "/MP"]
+                "cxx": ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]
                 if os.name == "nt"
-                else ["-std=c++17", "-O3"]
+                else ["-std=c++20", "-O3"]
             },
             include_dirs=ov_include,
             library_dirs=ov_lib_dir,

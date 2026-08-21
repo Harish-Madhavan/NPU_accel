@@ -130,12 +130,22 @@ class TestIntelNPULib(unittest.TestCase):
 
         # 3. Test clear_cache runs without error
         intel_npu_acceleration.clear_cache()
+
+        # Test clear_graph_cache in-memory graph cache reset
+        from intel_npu_acceleration.frontend import _GRAPH_CACHE
+        intel_npu_acceleration.clear_graph_cache()
+        self.assertEqual(len(_GRAPH_CACHE), 0)
         
         # After clearing, verify no exceptions occurred and size is less than or equal to original.
         # (Some files may be locked by active OpenVINO execution in other parallel tests on Windows)
         new_size, new_count = intel_npu_acceleration.get_cache_size()
         self.assertLessEqual(new_size, size)
         self.assertLessEqual(new_count, count)
+
+        # 4. Test C++ backend memory cache version changes
+        v0 = intel_npu_acceleration.get_cache_version()
+        self.assertIsInstance(v0, int)
+        self.assertGreaterEqual(v0, 0)
 
     def test_quantize_api(self):
         class SimpleLinearModel(torch.nn.Module):
