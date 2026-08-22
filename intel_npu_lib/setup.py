@@ -85,6 +85,30 @@ def find_openvino():
 # Locate OpenVINO
 ov_include, ov_lib_dir, ov_libs = find_openvino()
 
+class NPUBuildExtension(BuildExtension):
+    """Custom build_ext to ensure C++20 standard flags are always passed on MSVC."""
+    def build_extensions(self):
+        for ext in self.extensions:
+            if isinstance(ext.extra_compile_args, dict):
+                cxx_flags = ext.extra_compile_args.get("cxx", [])
+            elif isinstance(ext.extra_compile_args, list):
+                cxx_flags = ext.extra_compile_args
+            else:
+                cxx_flags = []
+
+            if os.name == "nt":
+                for flag in ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]:
+                    if flag not in cxx_flags:
+                        cxx_flags.append(flag)
+            else:
+                for flag in ["-std=c++20", "-O3"]:
+                    if flag not in cxx_flags:
+                        cxx_flags.append(flag)
+
+            ext.extra_compile_args = cxx_flags
+        super().build_extensions()
+
+
 setup(
     name="intel_npu_acceleration",
     version="0.1.0",
@@ -95,17 +119,17 @@ setup(
         CppExtension(
             name="intel_npu_acceleration._C",
             sources=get_sources(),
-            extra_compile_args=(
-                ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]
+            extra_compile_args={
+                "cxx": ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]
                 if os.name == "nt"
                 else ["-std=c++20", "-O3"]
-            ),
+            },
             include_dirs=ov_include,
             library_dirs=ov_lib_dir,
             libraries=ov_libs,
         )
     ],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=False)},
+    cmdclass={"build_ext": NPUBuildExtension.with_options(use_ninja=False)},
     install_requires=["torch", "openvino>=2024.0.0"],
     entry_points={
         "torch_dynamo_backends": [
