@@ -92,29 +92,50 @@ def find_openvino():
 ov_include, ov_lib_dir, ov_libs = find_openvino()
 
 class NPUBuildExtension(BuildExtension):
-    """Custom build_ext to ensure C++20 standard flags are always passed on MSVC."""
+    """Custom build_ext to ensure C++20 standard flags are always passed on MSVC.
+
+    On Windows, distutils/MSVC does not honor the dict-style
+    ``extra_compile_args = {"cxx": [...]}`` that PyTorch documents for
+    CppExtension.  It only reads a flat ``list[str]``.  This subclass:
+
+    1. Normalises every extension's ``extra_compile_args`` from dict → list.
+    2. Injects ``/std:c++20`` (and helpers) into the compiler's own
+       ``compile_options`` so the flag is present even if setuptools
+       rebuilds the option list after our mutation.
+    """
+
     def build_extensions(self):
-        if os.name == "nt" and hasattr(self.compiler, "compile_options"):
-            if "/std:c++20" not in self.compiler.compile_options:
-                self.compiler.compile_options.append("/std:c++20")
+        # ── 1. Normalise extra_compile_args on every extension ──────────
         for ext in self.extensions:
             if isinstance(ext.extra_compile_args, dict):
-                cxx_flags = ext.extra_compile_args.get("cxx", [])
-            elif isinstance(ext.extra_compile_args, list):
-                cxx_flags = ext.extra_compile_args
-            else:
-                cxx_flags = []
+                # Merge all values (typically only "cxx") into a flat list
+                flat = []
+                for flags in ext.extra_compile_args.values():
+                    flat.extend(flags)
+                ext.extra_compile_args = flat
+            elif ext.extra_compile_args is None:
+                ext.extra_compile_args = []
 
             if os.name == "nt":
                 for flag in ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]:
-                    if flag not in cxx_flags:
-                        cxx_flags.append(flag)
-                ext.extra_compile_args = {"cxx": cxx_flags}
+                    if flag not in ext.extra_compile_args:
+                        ext.extra_compile_args.append(flag)
             else:
                 for flag in ["-std=c++20", "-O3"]:
-                    if flag not in cxx_flags:
-                        cxx_flags.append(flag)
-                ext.extra_compile_args = cxx_flags
+                    if flag not in ext.extra_compile_args:
+                        ext.extra_compile_args.append(flag)
+
+        # ── 2. Patch the compiler object directly (MSVC) ────────────────
+        if os.name == "nt":
+            # self.compiler is initialised by the time build_extensions runs
+            if hasattr(self.compiler, "compile_options"):
+                for flag in ["/std:c++20", "/DNOMINMAX"]:
+                    if flag not in self.compiler.compile_options:
+                        self.compiler.compile_options.append(flag)
+            if hasattr(self.compiler, "compile_options_debug"):
+                for flag in ["/std:c++20", "/DNOMINMAX"]:
+                    if flag not in self.compiler.compile_options_debug:
+                        self.compiler.compile_options_debug.append(flag)
 
         super().build_extensions()
 
