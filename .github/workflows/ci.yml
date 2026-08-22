@@ -17,6 +17,8 @@ jobs:
     env:
       DISTUTILS_USE_SDK: "1"
       FORCE_CUDA: "0"
+      CXXFLAGS: "/std:c++20 /MP /DNOMINMAX"
+      CFLAGS: "/std:c++20 /MP /DNOMINMAX"
     
     steps:
     - name: Checkout repository
@@ -38,13 +40,15 @@ jobs:
         key: ${{ matrix.os }}-python-${{ matrix.python-version }}
         max-size: 500M
         
-    - name: Install dependencies
+    - name: Install dependencies & build extension
       run: |
         python -m pip install --upgrade pip setuptools wheel
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install openvino
         pip install ninja pytest pytest-cov build ruff
-        pip install --no-build-isolation -e ./intel_npu_lib
+        cd intel_npu_lib
+        python setup.py build_ext --inplace
+        pip install --no-build-isolation --no-deps -e .
       shell: bash
         
     - name: Run linter

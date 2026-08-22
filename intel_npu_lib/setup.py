@@ -2,9 +2,15 @@ import os
 import sys
 import site
 
-# Ensure DISTUTILS_USE_SDK is set on Windows to prevent PyTorch ABI check errors with MSVC
+# Ensure DISTUTILS_USE_SDK and C++20 flags are set on Windows for MSVC
 if sys.platform == "win32":
     os.environ["DISTUTILS_USE_SDK"] = "1"
+    cxxflags = os.environ.get("CXXFLAGS", "")
+    if "/std:c++" not in cxxflags:
+        os.environ["CXXFLAGS"] = f"{cxxflags} /std:c++20 /MP /DNOMINMAX".strip()
+    cflags = os.environ.get("CFLAGS", "")
+    if "/std:c++" not in cflags:
+        os.environ["CFLAGS"] = f"{cflags} /std:c++20 /MP /DNOMINMAX".strip()
 
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
@@ -88,6 +94,9 @@ ov_include, ov_lib_dir, ov_libs = find_openvino()
 class NPUBuildExtension(BuildExtension):
     """Custom build_ext to ensure C++20 standard flags are always passed on MSVC."""
     def build_extensions(self):
+        if os.name == "nt" and hasattr(self.compiler, "compile_options"):
+            if "/std:c++20" not in self.compiler.compile_options:
+                self.compiler.compile_options.append("/std:c++20")
         for ext in self.extensions:
             if isinstance(ext.extra_compile_args, dict):
                 cxx_flags = ext.extra_compile_args.get("cxx", [])
@@ -100,12 +109,13 @@ class NPUBuildExtension(BuildExtension):
                 for flag in ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]:
                     if flag not in cxx_flags:
                         cxx_flags.append(flag)
+                ext.extra_compile_args = {"cxx": cxx_flags}
             else:
                 for flag in ["-std=c++20", "-O3"]:
                     if flag not in cxx_flags:
                         cxx_flags.append(flag)
+                ext.extra_compile_args = cxx_flags
 
-            ext.extra_compile_args = cxx_flags
         super().build_extensions()
 
 
