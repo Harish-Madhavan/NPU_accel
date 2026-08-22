@@ -1,7 +1,13 @@
+import os
+import sys
+import site
+
+# Ensure DISTUTILS_USE_SDK is set on Windows to prevent PyTorch ABI check errors with MSVC
+if sys.platform == "win32":
+    os.environ["DISTUTILS_USE_SDK"] = "1"
+
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
-import os
-import site
 
 
 # Helper to find sources
@@ -99,7 +105,7 @@ setup(
             libraries=ov_libs,
         )
     ],
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=False)},
     install_requires=["torch", "openvino>=2024.0.0"],
     entry_points={
         "torch_dynamo_backends": [
