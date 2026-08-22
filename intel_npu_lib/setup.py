@@ -2,15 +2,20 @@ import os
 import sys
 import site
 
-# Ensure DISTUTILS_USE_SDK and C++20 flags are set on Windows for MSVC
+# Ensure C++20 flags are set on Windows for MSVC
 if sys.platform == "win32":
     os.environ["DISTUTILS_USE_SDK"] = "1"
-    cxxflags = os.environ.get("CXXFLAGS", "")
-    if "/std:c++" not in cxxflags:
-        os.environ["CXXFLAGS"] = f"{cxxflags} /std:c++20 /MP /DNOMINMAX".strip()
-    cflags = os.environ.get("CFLAGS", "")
-    if "/std:c++" not in cflags:
-        os.environ["CFLAGS"] = f"{cflags} /std:c++20 /MP /DNOMINMAX".strip()
+    # --- MSVC cl.exe environment variables ---
+    # CL:  prepended to every cl.exe invocation (read by cl.exe itself).
+    # _CL_: appended to every cl.exe invocation.
+    # These bypass all Python-level flag plumbing (distutils, setuptools,
+    # PyTorch BuildExtension) and are the *only* reliable way to guarantee
+    # that /std:c++20 reaches the compiler on Windows CI.
+    _msvc_inject = "/std:c++20 /DNOMINMAX"
+    for var in ("CL", "_CL_"):
+        existing = os.environ.get(var, "")
+        if "/std:c++" not in existing:
+            os.environ[var] = f"{existing} {_msvc_inject}".strip()
 
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension
