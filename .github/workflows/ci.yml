@@ -44,8 +44,7 @@ jobs:
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install openvino
         pip install ninja pytest pytest-cov build ruff
-        cd intel_npu_lib
-        python setup.py develop --no-deps
+        pip install --no-build-isolation -e ./intel_npu_lib
       shell: bash
         
     - name: Run linter

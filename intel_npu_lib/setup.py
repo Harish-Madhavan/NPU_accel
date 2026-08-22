@@ -95,11 +95,11 @@ setup(
         CppExtension(
             name="intel_npu_acceleration._C",
             sources=get_sources(),
-            extra_compile_args={
-                "cxx": ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]
+            extra_compile_args=(
+                ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]
                 if os.name == "nt"
                 else ["-std=c++20", "-O3"]
-            },
+            ),
             include_dirs=ov_include,
             library_dirs=ov_lib_dir,
             libraries=ov_libs,
