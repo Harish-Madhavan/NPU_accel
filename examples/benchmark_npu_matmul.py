@@ -51,20 +51,22 @@ def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="f
     model = MatMulModel()
     model.eval()
 
-    # Compile to NPU
-    print("Compiling model for NPU...")
+    # Compile to NPU via pure PyTorch 2.x torch.compile
+    print("Compiling model for NPU (torch.compile)...")
     t0 = time.time()
     try:
-        npu_model = npu_compiler.compile_to_npu(
-            model,
-            (a, b),
-            num_streams=num_streams,
-            performance_hint="THROUGHPUT" if num_streams > 1 else "LATENCY"
-        )
+        if num_streams > 1:
+            npu_model = torch.compile(
+                model,
+                backend="npu",
+                options={"num_streams": num_streams, "performance_hint": "THROUGHPUT"}
+            )
+        else:
+            npu_model = torch.compile(model, backend="npu")
     except Exception as e:
         print(f"NPU compilation failed: {e}")
         return
-    print(f"Ahead-of-Time NPU Compilation finished in {time.time() - t0:.2f}s")
+    print(f"PyTorch NPU Compilation finished in {time.time() - t0:.2f}s")
 
     # Warmup NPU
     print(f"Warming up NPU ({warmup} iterations)...")

@@ -32,6 +32,17 @@ from .module import (
     quantized_linear,
     conv2d,
     max_pool2d,
+    embedding,
+    mse_loss,
+    matmul_backward,
+    linear_backward,
+    relu_backward,
+    gelu_backward,
+    silu_backward,
+    softmax_backward,
+    rmsnorm_backward,
+    adam_step,
+    sgd_step,
 )
 
 __all__ = [
@@ -73,4 +84,15 @@ __all__ = [
     "quantized_linear",
     "conv2d",
     "max_pool2d",
+    "embedding",
+    "mse_loss",
+    "matmul_backward",
+    "linear_backward",
+    "relu_backward",
+    "gelu_backward",
+    "silu_backward",
+    "softmax_backward",
+    "rmsnorm_backward",
+    "adam_step",
+    "sgd_step",
 ]

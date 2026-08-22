@@ -58,14 +58,21 @@ NPUBackend::NPUBackend() {
 
             m_is_available = true;
 
-            // 1. Acquire Level Zero RemoteContext (ze_context_handle_t wrapper).
+            // 1. Acquire Level Zero ZeroContext & RemoteContext.
             try {
-                m_context = m_core->get_default_context("NPU");
-                m_has_context =
-                    false;  // Let OpenVINO manage memory copies dynamically for eager mode
-                std::cout << "[Intel NPU] Level Zero RemoteContext acquired." << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "[Intel NPU] RemoteContext unavailable: " << e.what() << std::endl;
+                m_zero_context = std::make_unique<ov::intel_npu::level_zero::ZeroContext>(*m_core);
+                m_context = *m_zero_context;
+                m_has_context = true;
+                m_has_zero_context = true;
+                std::cout << "[Intel NPU] Level Zero ZeroContext & ze_context_handle acquired." << std::endl;
+            } catch (const std::exception&) {
+                try {
+                    m_context = m_core->get_default_context("NPU");
+                    m_has_context = true;
+                    std::cout << "[Intel NPU] Level Zero RemoteContext acquired." << std::endl;
+                } catch (const std::exception& e2) {
+                    std::cerr << "[Intel NPU] RemoteContext unavailable: " << e2.what() << std::endl;
+                }
             }
 
             // 2. Probe which property keys this driver version accepts.
@@ -85,6 +92,12 @@ NPUBackend::NPUBackend() {
                 {"NPU_BACKEND_TYPE", "LEVEL_ZERO"},
                 {"NPU_USE_SDA", "YES"},
                 {"NPU_TURBO", "YES"},
+                {"NPU_DISABLE_IDLE_MEMORY_PRUNING", "YES"},
+                {"NPU_RUN_INFERENCES_SEQUENTIALLY", "NO"},
+                {"NPU_DEFER_WEIGHTS_LOAD", "YES"},
+                {"NPU_QDQ_OPTIMIZATION", "YES"},
+                {"NPU_QDQ_OPTIMIZATION_AGGRESSIVE", "YES"},
+                {"NPU_COMPILATION_MODE_PARAMS", "optimization-level=2"},
             };
             for (const auto& ps : L0_PROPS) {
                 if (isPropertySupported(ps.key)) {
@@ -118,6 +131,15 @@ ov::Core& NPUBackend::getCore() {
 }
 ov::RemoteContext& NPUBackend::getContext() {
     return m_context;
+}
+ov::intel_npu::level_zero::ZeroContext& NPUBackend::getZeroContext() {
+    if (!m_zero_context) {
+        throw std::runtime_error("Level Zero ZeroContext is not initialized on this system.");
+    }
+    return *m_zero_context;
+}
+bool NPUBackend::hasZeroContext() const {
+    return m_has_zero_context;
 }
 bool NPUBackend::isAvailable() {
     return m_is_available;

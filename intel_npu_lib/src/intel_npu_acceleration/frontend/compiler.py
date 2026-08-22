@@ -80,8 +80,20 @@ def _get_core():
     return _OV_CORE
 
 
-def compile(model: torch.nn.Module, example_input: Any, *args, **kwargs) -> torch.nn.Module:
-    """Compile a PyTorch model for Intel NPU."""
+def compile(model: torch.nn.Module, example_input: Any, *args: Any, **kwargs: Any) -> torch.nn.Module:
+    """Compile a PyTorch model for hardware-accelerated execution on Intel NPU.
+
+    Convenience wrapper around `compile_to_npu`.
+
+    Args:
+        model (torch.nn.Module): PyTorch module to compile.
+        example_input (Any): Example input tensor or tuple of tensors for graph shape discovery.
+        *args: Positional arguments forwarded to `compile_to_npu`.
+        **kwargs: Keyword arguments forwarded to `compile_to_npu`.
+
+    Returns:
+        torch.nn.Module: An optimized NPUGraphModule executing on the Intel NPU.
+    """
     return compile_to_npu(model, example_input, *args, **kwargs)
 
 
@@ -99,6 +111,40 @@ def compile_to_npu(
     stateful: bool = False,
     precision: str = "auto",
 ) -> torch.nn.Module:
+    """Compile a PyTorch neural network module into a fused Intel NPU hardware executable.
+
+    Traces the computational graph using `torch.fx`, maps supported operator subgraphs to
+    OpenVINO IR, applies hardware-level constant folding and layout transformations, and compiles
+    directly into the Intel Level Zero NPU runtime.
+
+    Args:
+        model (torch.nn.Module): PyTorch module or GraphModule to compile.
+        example_input (Any): Sample input tensor or tuple of tensors used for graph tracing and shape discovery.
+        performance_hint (str, optional): Target performance mode: 'LATENCY', 'THROUGHPUT', or 'CUMULATIVE_THROUGHPUT'. Defaults to 'LATENCY'.
+        num_streams (int, optional): Number of parallel execution streams / command queues for throughput pipelining. Defaults to 1.
+        strict (bool, optional): If True, raises `NPUCompilationError` on any unsupported operation. If False, enables automatic hybrid graph partitioning with CPU fallback. Defaults to False.
+        dynamic_buckets (bool, optional): Enables static bucket dispatch for variable sequence/batch lengths. Defaults to False.
+        bucket_sizes (Optional[List[int]], optional): Custom bucket dimensions when `dynamic_buckets=True`. Defaults to powers of 2.
+        dynamic_dim (int, optional): The tensor axis index that varies dynamically (e.g. sequence length dim=1). Defaults to 1.
+        clone_outputs (bool, optional): If True, clones output tensors to decouple memory from leased backend buffers. Defaults to True.
+        preprocess_config (Optional[dict], optional): Hardware Pre-Post Processing (PPP) configuration dictionary. Defaults to None.
+        stateful (bool, optional): Enables stateful KV-cache register binding for autoregressive generation. Defaults to False.
+        precision (str, optional): Computation precision ('auto', 'fp16', 'fp32'). Defaults to 'auto'.
+
+    Returns:
+        torch.nn.Module: An optimized `NPUGraphModule` or `NPUDynamicGraphModule`.
+
+    Raises:
+        NPUCompilationError: If graph conversion fails and `strict=True`.
+
+    Examples:
+        >>> import torch
+        >>> import intel_npu_acceleration as npu
+        >>> model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU())
+        >>> x = torch.randn(1, 32)
+        >>> npu_model = npu.compile_to_npu(model, x, performance_hint="LATENCY")
+        >>> out = npu_model(x)
+    """
     global _GRAPH_CACHE
 
     if dynamic_buckets and not isinstance(model, NPUDynamicGraphModule):
@@ -324,7 +370,7 @@ def compile_to_npu(
             logger.warning("Intel NPU not detected. Falling back to CPU for execution.")
             target_device = "CPU"
         else:
-            # NPU available — per-model performance hints via typed API.
+            # NPU available — Level Zero hardware acceleration & performance hints
             try:
                 hint = ov_hints.PerformanceMode.LATENCY
                 if performance_hint == "THROUGHPUT":
@@ -333,7 +379,14 @@ def compile_to_npu(
                 config = {
                     ov_hints.performance_mode(): hint,
                     ov_hints.inference_precision(): ov_props.element.f16,
+                    ov_hints.model_priority(): ov_hints.Priority.HIGH,
                     "NPU_COMPILATION_MODE_PARAMS": "optimization-level=2",
+                    "NPU_TURBO": "YES",
+                    "NPU_DISABLE_IDLE_MEMORY_PRUNING": "YES",
+                    "NPU_RUN_INFERENCES_SEQUENTIALLY": "NO",
+                    "NPU_DEFER_WEIGHTS_LOAD": "YES",
+                    "NPU_QDQ_OPTIMIZATION": "YES",
+                    "NPU_QDQ_OPTIMIZATION_AGGRESSIVE": "YES",
                 }
 
                 # Apply streams for throughput
@@ -341,16 +394,34 @@ def compile_to_npu(
                     config[ov_props.streams.num()] = num_streams
 
             except Exception:
-                # Typed API unavailable (very old OV) — fall back to strings.
+                # Fall back to strings if typed properties are unavailable
                 config = {
                     "PERFORMANCE_HINT": performance_hint,
                     "INFERENCE_PRECISION_HINT": "f16",
+                    "MODEL_PRIORITY": "HIGH",
                     "NPU_COMPILATION_MODE_PARAMS": "optimization-level=2",
+                    "NPU_TURBO": "YES",
+                    "NPU_DISABLE_IDLE_MEMORY_PRUNING": "YES",
+                    "NPU_RUN_INFERENCES_SEQUENTIALLY": "NO",
+                    "NPU_DEFER_WEIGHTS_LOAD": "YES",
+                    "NPU_QDQ_OPTIMIZATION": "YES",
+                    "NPU_QDQ_OPTIMIZATION_AGGRESSIVE": "YES",
                 }
+                if performance_hint == "THROUGHPUT":
+                    config["NUM_STREAMS"] = str(num_streams)
 
         logger.info(f"Compiling model for {target_device}...")
         try:
-            compiled = core.compile_model(ov_model, target_device, config)
+            if target_device == "NPU":
+                try:
+                    # Bind directly to the Level Zero RemoteContext
+                    l0_context = core.get_default_context("NPU")
+                    compiled = core.compile_model(ov_model, l0_context, config)
+                except Exception as e_ctx:
+                    logger.debug(f"Level Zero RemoteContext compile fallback to target_device string: {e_ctx}")
+                    compiled = core.compile_model(ov_model, target_device, config)
+            else:
+                compiled = core.compile_model(ov_model, target_device, config)
         except Exception as e:
             if target_device == "NPU":
                 logger.warning(
@@ -395,9 +466,28 @@ def export_openvino_ir(
     preprocess_config: Optional[dict] = None,
     stateful: bool = False,
 ) -> str:
-    """
-    Export a PyTorch model directly to OpenVINO Intermediate Representation (IR) format (.xml / .bin).
-    Allows visualizing the compiled NPU model topology in Netron or running via OpenVINO C++ / Python engines.
+    """Export a PyTorch model directly to OpenVINO Intermediate Representation (IR) format (.xml / .bin).
+
+    Generates serialized OpenVINO IR files that can be visualized in Netron or deployed
+    directly using the OpenVINO C++ or Python runtime engines without PyTorch dependencies.
+
+    Args:
+        model (torch.nn.Module): PyTorch module to export.
+        example_input (Any): Concrete sample inputs for graph tracing.
+        output_xml_path (str): Destination filesystem path for the `.xml` model topology file.
+        output_bin_path (Optional[str], optional): Destination path for the `.bin` weight file.
+            If omitted, defaults to the same filename with a `.bin` extension. Defaults to None.
+        preprocess_config (Optional[dict], optional): Hardware Pre-Post Processing dictionary to bake into IR. Defaults to None.
+        stateful (bool, optional): If True, serializes KV-cache registers as OpenVINO ReadValue/Assign nodes. Defaults to False.
+
+    Returns:
+        str: The path to the generated `.xml` topology file.
+
+    Examples:
+        >>> import torch
+        >>> import intel_npu_acceleration as npu
+        >>> model = torch.nn.Linear(10, 2)
+        >>> xml_path = npu.export_openvino_ir(model, torch.randn(1, 10), "model.xml")
     """
     if isinstance(example_input, torch.Tensor):
         example_input_tuple = (example_input,)

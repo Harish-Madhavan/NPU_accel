@@ -1,5 +1,9 @@
 """
 Intel NPU Binary Model & Graph Disk Cache Management.
+
+This module manages the persistent disk cache for pre-compiled OpenVINO intermediate
+representation (IR) binary blobs and Level Zero hardware executables. Disk caching
+eliminates model compilation overhead during subsequent application startups.
 """
 
 import os
@@ -13,7 +17,8 @@ _CACHE_DIR: Optional[str] = None
 _LAST_CLEANUP_TIME: float = 0.0
 
 
-def _init_default_cache():
+def _init_default_cache() -> None:
+    """Initialize the default cache directory in the workspace or repository root."""
     global _CACHE_DIR
     try:
         from .device import _C
@@ -54,17 +59,35 @@ def _init_default_cache():
         logger.debug(f"Failed to initialize disk cache: {e}")
 
 
-# Initialize default disk cache
+# Initialize default disk cache on import
 _init_default_cache()
 
 
 def get_cache_dir() -> Optional[str]:
-    """Get the current NPU model cache directory path."""
+    """Get the absolute filesystem path of the current NPU model cache directory.
+
+    Returns:
+        Optional[str]: Path to the active cache directory, or None if unconfigured.
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> print(npu.get_cache_dir())
+    """
     return _CACHE_DIR
 
 
 def set_cache_dir(cache_dir: str) -> None:
-    """Set the NPU model cache directory path."""
+    """Configure a custom directory for persistent NPU binary model caching.
+
+    Updates both the Python runtime and the native C++ Level Zero / OpenVINO cache director.
+
+    Args:
+        cache_dir (str): Target filesystem directory path for storing compiled binary blobs.
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> npu.set_cache_dir("/path/to/my_npu_cache")
+    """
     global _CACHE_DIR
     _CACHE_DIR = cache_dir
     logger.info(f"Setting NPU cache directory: {cache_dir}")
@@ -78,7 +101,15 @@ def set_cache_dir(cache_dir: str) -> None:
 
 
 def clear_cache() -> None:
-    """Clear all compiled binary blob files in the NPU cache directory."""
+    """Purge all cached compiled model binary blobs from the disk cache directory.
+
+    Safely iterates through the cache directory and deletes all cached OpenVINO IR
+    and Level Zero binary artifacts.
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> npu.clear_cache()
+    """
     cache_dir = get_cache_dir()
     if not cache_dir or not os.path.exists(cache_dir):
         logger.warning("No cache directory configured or directory does not exist.")
@@ -98,10 +129,15 @@ def clear_cache() -> None:
 
 
 def get_cache_size() -> Tuple[int, int]:
-    """
-    Get total size in bytes and number of files in the cache directory.
+    """Calculate the total size and file count of the NPU disk cache.
+
     Returns:
-        (total_size_bytes, file_count)
+        Tuple[int, int]: A tuple of `(total_size_bytes, file_count)`.
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> size_bytes, num_files = npu.get_cache_size()
+        >>> print(f"Cache holds {num_files} models ({size_bytes / (1024 * 1024):.2f} MB)")
     """
     cache_dir = get_cache_dir()
     if not cache_dir or not os.path.exists(cache_dir):
@@ -120,7 +156,13 @@ def get_cache_size() -> Tuple[int, int]:
 
 
 def get_cache_version() -> int:
-    """Get the current model cache version counter."""
+    """Retrieve the in-memory cache version counter.
+
+    Increments whenever the in-memory C++ compiled model cache is mutated or cleared.
+
+    Returns:
+        int: The monotonic cache version counter.
+    """
     try:
         from .device import _C
 
@@ -132,10 +174,14 @@ def get_cache_version() -> int:
 
 
 def clean_old_cache(max_size_mb: int = 2048, max_files: int = 10000) -> None:
-    """
-    Clean cache directory by deleting the oldest files (LRU based on mtime)
-    until size is below max_size_mb and file count is below max_files.
-    Throttled to run at most once every 60 seconds.
+    """Prune the oldest cached models (LRU based on modification time).
+
+    Ensures the disk cache does not exceed specified capacity limits. Throttled to execute
+    at most once every 60 seconds to avoid filesystem overhead during tight training loops.
+
+    Args:
+        max_size_mb (int, optional): Maximum allowed disk cache size in megabytes. Defaults to 2048.
+        max_files (int, optional): Maximum allowed file count in cache directory. Defaults to 10000.
     """
     global _LAST_CLEANUP_TIME
 
@@ -164,7 +210,6 @@ def clean_old_cache(max_size_mb: int = 2048, max_files: int = 10000) -> None:
         max_bytes = max_size_mb * 1024 * 1024
 
         if total_size > max_bytes or len(files) > max_files:
-            # Sort files by modification time (oldest first)
             files.sort(key=lambda x: x[1])
             for file_path, _, size in files:
                 if total_size <= max_bytes and len(files) <= max_files:

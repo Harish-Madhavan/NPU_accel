@@ -101,6 +101,12 @@ setup(
     ],
     cmdclass={"build_ext": BuildExtension},
     install_requires=["torch", "openvino>=2024.0.0"],
+    entry_points={
+        "torch_dynamo_backends": [
+            "npu = intel_npu_acceleration.frontend.dynamo:_compile_backend",
+            "intel_npu = intel_npu_acceleration.frontend.dynamo:_compile_backend",
+        ]
+    },
     extras_require={
         "dev": ["pytest", "ruff"],
     },

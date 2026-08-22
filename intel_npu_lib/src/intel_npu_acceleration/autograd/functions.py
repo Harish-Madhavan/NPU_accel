@@ -19,7 +19,7 @@ def _unbroadcast(grad, target_shape):
 class NPUMatMul(torch.autograd.Function):
     """
     NPU-accelerated Matrix Multiplication with Autograd support.
-    Forward pass runs on NPU; backward pass computes gradients on CPU.
+    Both forward and backward passes execute on the Intel NPU.
     """
 
     @staticmethod
@@ -30,8 +30,7 @@ class NPUMatMul(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         a, b = ctx.saved_tensors
-        grad_a = grad_output @ b.transpose(-2, -1)
-        grad_b = a.transpose(-2, -1) @ grad_output
+        grad_a, grad_b = F_npu.matmul_backward(grad_output, a, b)
         return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
 
 
@@ -90,9 +89,7 @@ class NPUReLU(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (a,) = ctx.saved_tensors
-        grad_a = grad_output.clone()
-        grad_a[a < 0] = 0
-        return grad_a
+        return F_npu.relu_backward(grad_output, a)
 
 
 class NPUSoftmax(torch.autograd.Function):
@@ -108,14 +105,13 @@ class NPUSoftmax(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (out,) = ctx.saved_tensors
-        sum_grad_out_s = (grad_output * out).sum(ctx.dim, keepdim=True)
-        grad_a = out * (grad_output - sum_grad_out_s)
+        grad_a = F_npu.softmax_backward(grad_output, out, ctx.dim)
         return grad_a, None
 
 
 class NPULinear(torch.autograd.Function):
     """
-    NPU-accelerated Linear layer (y = xW^T + b) with Autograd support.
+    NPU-accelerated Linear layer (y = xW^T + b) with Level Zero Autograd support.
     """
 
     @staticmethod
@@ -126,10 +122,17 @@ class NPULinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         input, weight, bias = ctx.saved_tensors
-        grad_input = grad_output @ weight
-        grad_weight = grad_output.transpose(-2, -1) @ input
-        grad_bias = grad_output.sum(0) if bias is not None else None
-        return grad_input, grad_weight, grad_bias
+        needs_input = ctx.needs_input_grad[0]
+        needs_weight = ctx.needs_input_grad[1]
+        needs_bias = ctx.needs_input_grad[2] if bias is not None else False
+        grad_input, grad_weight, grad_bias = F_npu.linear_backward(
+            grad_output, input, weight, needs_input, needs_weight, needs_bias
+        )
+        return (
+            grad_input if needs_input else None,
+            grad_weight if needs_weight else None,
+            grad_bias if (bias is not None and needs_bias) else None,
+        )
 
 
 class NPUGeLU(torch.autograd.Function):
@@ -143,11 +146,7 @@ class NPUGeLU(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (a,) = ctx.saved_tensors
-        a32 = a.float()
-        cdf = 0.5 * (1.0 + torch.erf(a32 / math.sqrt(2.0)))
-        pdf = torch.exp(-0.5 * a32 * a32) / math.sqrt(2.0 * math.pi)
-        grad_a = (cdf + a32 * pdf).to(grad_output.dtype) * grad_output
-        return grad_a
+        return F_npu.gelu_backward(grad_output, a)
 
 
 class NPUSiLU(torch.autograd.Function):
@@ -161,11 +160,7 @@ class NPUSiLU(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (a,) = ctx.saved_tensors
-        sig = torch.sigmoid(a.float())
-        grad_a = (sig * (1.0 + a.float() * (1.0 - sig))).to(
-            grad_output.dtype
-        ) * grad_output
-        return grad_a
+        return F_npu.silu_backward(grad_output, a)
 
 
 class NPURMSNorm(torch.autograd.Function):
@@ -174,28 +169,15 @@ class NPURMSNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, eps):
         out = F_npu.rmsnorm(input, weight, eps)
-        rms = torch.sqrt(input.float().pow(2).mean(-1, keepdim=True) + eps)
-        x_norm = (input.float() / rms).to(input.dtype)
-        ctx.save_for_backward(x_norm, weight)
-        ctx.rms = rms
+        ctx.save_for_backward(input, weight)
+        ctx.eps = eps
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_norm, weight = ctx.saved_tensors
-        rms = ctx.rms
-
-        go = grad_output.float()
-        w = weight.float()
-        xn = x_norm.float()
-
-        grad_weight = (go * xn).sum(dim=tuple(range(go.dim() - 1))).to(weight.dtype)
-
-        dL_dxn = go * w
-        correction = (dL_dxn * xn).mean(dim=-1, keepdim=True)
-        grad_input = ((dL_dxn - xn * correction) / rms).to(grad_output.dtype)
-
-        return grad_input, grad_weight, None
+        input, weight = ctx.saved_tensors
+        grad_in, grad_w = F_npu.rmsnorm_backward(grad_output, input, weight, ctx.eps)
+        return grad_in, grad_w, None
 
 
 class NPUConv2d(torch.autograd.Function):
@@ -564,3 +546,23 @@ class NPUScaledDotProductAttention(torch.autograd.Function):
             grad_value = v.grad
 
         return grad_query, grad_key, grad_value, None, None, None, None
+
+
+class NPUMSELoss(torch.autograd.Function):
+    """NPU-accelerated MSE loss with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, pred, target, reduction="mean"):
+        ctx.save_for_backward(pred, target)
+        ctx.reduction = reduction
+        return F_npu.mse_loss(pred, target, reduction=reduction)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pred, target = ctx.saved_tensors
+        red = ctx.reduction
+        scale = 2.0 / pred.numel() if red == "mean" else (2.0 if red == "sum" else 2.0)
+        grad_pred = grad_output * scale * (pred - target)
+        grad_target = -grad_pred
+        return grad_pred, grad_target, None
+

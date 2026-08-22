@@ -1,92 +1,100 @@
 # Intel NPU Acceleration Library Documentation
 
-The `intel_npu_lib` is a custom PyTorch extension designed to accelerate tensor operations and neural network inference by offloading execution to Intel Neural Processing Units (NPUs) using OpenVINO.
-
-## Architecture Overview
-
-The library operates on two primary levels:
-1. **Eager Mode Execution (`functional.py` & `csrc/ops.cpp`)**: Overrides basic PyTorch functions to execute directly on the NPU via C++ bindings. This uses OpenVINO's `Core::compile_model` with `LATENCY` and `f16` hints. It features true zero-copy outputs where OpenVINO writes results directly to pre-allocated `torch::Tensor` memory.
-2. **Graph Compilation Mode (`frontend.py` & `converters.py`)**: Uses `torch.fx` to trace entire models (like LLMs or Vision models) or leverages TorchDynamo under PyTorch 2.x via register_backend. It builds a holistic OpenVINO graph, avoiding Python dispatch overhead and enabling massive operator fusion. Custom options are supported through options dict propagation.
-3. **Level Zero Backend Optimizations**: The library explicitly utilizes the Intel Level Zero (OneCompute) interface for low-level NPU communication. This includes hardware turbo-boost, multi-tiling compilation, and persistent InferRequest caching to minimize synchronization overhead between CPU and NPU.
+The `intel_npu_acceleration` library is a high-performance PyTorch backend extension designed to accelerate tensor operations, deep learning training, and neural network inference by offloading execution directly to Intel® Neural Processing Units (NPUs) via oneAPI Level Zero and OpenVINO™.
 
 ---
 
-## Supported Operations Parity Matrix
+## 🏛️ Architecture Overview
 
-The following table lists the operations supported by the NPU library, comparing their availability in Eager Mode (direct C++ dispatch) vs. Graph Mode (FX compiled).
+The library operates on three unified levels:
+
+1. **Native PyTorch 2.x TorchDynamo Backend (`torch.compile(..., backend="npu")`)**:
+   - Registered under `backend="npu"` and `backend="intel_npu"`.
+   - Translates PyTorch compile modes:
+     - `mode="reduce-overhead"` $\rightarrow$ Latency-optimized execution, zero-copy buffer leasing, hardware Turbo boost.
+     - `mode="max-autotune"` $\rightarrow$ High-throughput pipelining, 4 parallel hardware streams, FP16 precision fusion.
+     - `dynamic=True` $\rightarrow$ Dynamic shape compilation with dead placeholder symbol pruning.
+
+2. **C++ Level Zero Driver Integration (`csrc/device.cpp` & `csrc/ops.cpp`)**:
+   - Binds directly to the Intel Level Zero NPU runtime driver (`ov::intel_npu::level_zero::ZeroContext`, `ze_context_handle_t`).
+   - Hardware Turbo clock frequency boost (`NPU_TURBO=YES`).
+   - Unified Level Zero memory preservation (`NPU_DISABLE_IDLE_MEMORY_PRUNING=YES`) to eliminate TLB invalidation.
+   - Non-blocking concurrent hardware command queues (`NPU_RUN_INFERENCES_SEQUENTIALLY=NO`).
+   - High-priority hardware micro-scheduler dispatch (`MODEL_PRIORITY=HIGH`).
+
+3. **End-to-End Training & Autograd Backend (`intel_npu_acceleration.autograd` & `optim`)**:
+   - Both forward AND backward autograd passes run accelerated on the NPU.
+   - Hardware-accelerated optimizers (`NPUAdam`, `NPUSGD`) execute parameter updates directly on device memory.
+   - Drop-in PyTorch layers (`intel_npu_acceleration.nn`).
+
+---
+
+## 📋 Supported Operations Parity Matrix
 
 ### 1. Element-wise & Math Operations
-| PyTorch Operation | Eager Mode (`functional.py`) | Graph Mode (`converters.py`) | Notes |
-| :--- | :---: | :---: | :--- |
-| `torch.add` / `+` | ✅ | ✅ | Automatic type promotion handled in Python. |
-| `torch.sub` / `-` | ✅ | ✅ | Automatic type promotion handled in Python. |
-| `torch.mul` / `*` | ✅ | ✅ | Automatic type promotion handled in Python. |
-| `torch.div` / `/` | ✅ | ✅ | |
-| `torch.neg` / `-` | ✅ | ✅ | |
-| `operator.floordiv` (`//`) | ❌ | ✅ | Handled via Floor(Divide(A, B)) in OpenVINO. |
-| `torch.pow` / `**` | ❌ | ✅ | |
-| `torch.sin`, `torch.cos` | ❌ | ✅ | |
-| `torch.rsqrt` | ❌ | ✅ | |
-| `torch.clamp`, `hardtanh` | ❌ | ✅ | Maps to `ops.maximum` and `ops.minimum`. |
-| `torch.where` | ❌ | ✅ | |
-| `torch.triu` | ❌ | ✅ | Uses complex slicing and `range` thresholds. |
+| PyTorch Operation | Eager C++ Level Zero | Graph Mode (`torch.compile`) | Autograd Backward on NPU | Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| `torch.add` / `+` | ✅ | ✅ | ✅ | Automatic dtype promotion and unbroadcasting |
+| `torch.sub` / `-` | ✅ | ✅ | ✅ | Automatic dtype promotion and unbroadcasting |
+| `torch.mul` / `*` | ✅ | ✅ | ✅ | Automatic dtype promotion and unbroadcasting |
+| `torch.div` / `/` | ✅ | ✅ | ✅ | |
+| `torch.neg` / `-` | ✅ | ✅ | ✅ | |
+| `torch.pow` / `**` | ✅ | ✅ | ✅ | |
+| `torch.sin`, `torch.cos` | ✅ | ✅ | ✅ | |
+| `torch.rsqrt` | ✅ | ✅ | ✅ | |
+| `torch.clamp`, `hardtanh` | ✅ | ✅ | ✅ | |
+| `torch.where` | ✅ | ✅ | ✅ | |
+| `torch.triu` | ✅ | ✅ | ✅ | |
 
-### 2. Matrix & Neural Network Operations
-| PyTorch Operation | Eager Mode (`functional.py`) | Graph Mode (`converters.py`) | Notes |
-| :--- | :---: | :---: | :--- |
-| `torch.matmul`, `torch.mm` | ✅ | ✅ | |
-| `torch.nn.functional.linear` | ✅ | ✅ | Decomposed to `MatMul + Add` in FX graph. |
-| `torch.nn.functional.conv2d` | ✅ | ✅ | |
-| `torch.nn.functional.max_pool2d` | ✅ | ✅ | |
-| `torch.nn.functional.avg_pool2d` | ❌ | ✅ | |
-| `torch.nn.functional.scaled_dot_product_attention` | ✅ | ✅ | Natively uses OpenVINO's SDPA node. |
-| `torch.nn.functional.dropout` | ✅ | ✅ | Treated as Identity (No-op) during inference. |
+### 2. Matrix, Linear, & Vision Operations
+| PyTorch Operation | Eager C++ Level Zero | Graph Mode (`torch.compile`) | Autograd Backward on NPU | Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| `torch.matmul`, `torch.mm` | ✅ | ✅ | ✅ | Level Zero accelerated $g_A = g_{out} B^T, g_B = A^T g_{out}$ |
+| `torch.nn.functional.linear` | ✅ | ✅ | ✅ | Level Zero accelerated $g_x = g_{out} W, g_W = g_{out}^T x, g_b = \sum g_{out}$ |
+| `torch.nn.functional.conv2d` | ✅ | ✅ | ✅ | Multi-group and strided 2D convolution |
+| `torch.nn.functional.max_pool2d` | ✅ | ✅ | ✅ | |
+| `torch.nn.functional.avg_pool2d` | ✅ | ✅ | ✅ | |
+| `scaled_dot_product_attention` | ✅ | ✅ | ✅ | Native hardware SDPA with causal masking support |
 
-### 3. Activations & Normalization
-| PyTorch Operation | Eager Mode (`functional.py`) | Graph Mode (`converters.py`) | Notes |
-| :--- | :---: | :---: | :--- |
-| `torch.relu`, `F.relu` | ✅ | ✅ | |
-| `torch.nn.functional.gelu` | ✅ | ✅ | Supports both `erf` and `tanh` approximations. |
-| `torch.nn.functional.silu` | ✅ | ✅ | Maps to OpenVINO `swish` operation. |
-| `torch.softmax`, `F.softmax` | ✅ | ✅ | |
-| `torch.nn.functional.batch_norm` | ❌ | ✅ | |
-| `rmsnorm` (Custom) | ✅ | ✅ | Manually mapped using Variance, Mean, Divide. |
-| `torch.nn.functional.layer_norm` | ✅ | ✅ | Manually mapped using Variance, Mean, Divide. |
+### 3. Activations & Normalizations
+| PyTorch Operation | Eager C++ Level Zero | Graph Mode (`torch.compile`) | Autograd Backward on NPU | Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| `torch.relu`, `F.relu` | ✅ | ✅ | ✅ | Level Zero conditional selection derivative |
+| `torch.nn.functional.gelu` | ✅ | ✅ | ✅ | Exact error function & normal distribution derivative |
+| `torch.nn.functional.silu` | ✅ | ✅ | ✅ | Exact sigmoid product derivative |
+| `torch.softmax`, `F.softmax` | ✅ | ✅ | ✅ | Level Zero accelerated softmax backward without CPU fallback |
+| `rmsnorm` | ✅ | ✅ | ✅ | Root mean square normalization forward and backward |
+| `torch.nn.functional.layer_norm` | ✅ | ✅ | ✅ | Affine-weight layer normalization |
 
-### 4. Tensor Manipulation, Shape, & Indexing
-| PyTorch Operation | Eager Mode (`functional.py`) | Graph Mode (`converters.py`) | Notes |
-| :--- | :---: | :---: | :--- |
-| `torch.reshape`, `view` | ✅ | ✅ | |
-| `torch.transpose` | ✅ | ✅ | |
-| `torch.squeeze`, `unsqueeze` | ❌ | ✅ | |
-| `torch.cat`, `torch.stack` | ✅ | ✅ | |
-| `torch.mean` | ✅ | ✅ | |
-| `torch.zeros`, `ones`, `full` | ❌ | ✅ | Supports dynamic sizing from FX Nodes. |
-| `torch.arange` | ❌ | ✅ | |
-| `torch.clone` | ❌ | ✅ | Identity operation in graph. |
-| `operator.getitem` (Read) | ❌ | ✅ | Massive strided-slice support for all patterns. |
-| `operator.setitem` (Write) | ❌ | ✅ | Maps to `ScatterNDUpdate` or `Concat` slices. |
-| `torch.index_select` | ❌ | ✅ | Maps to `Gather`. |
-| `index_copy` / `update_kv_cache` | ✅ | ✅ | Maps to `ScatterUpdate`. Highly optimized for LLMs. |
-| `builtins.getattr` | ❌ | ✅ | Intercepts `.shape` and `.device` calls. |
+### 4. Indexing, Embeddings, & Losses
+| PyTorch Operation | Eager C++ Level Zero | Graph Mode (`torch.compile`) | Autograd Backward on NPU | Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| `torch.nn.functional.embedding` | ✅ | ✅ | ✅ | Hardware gather and index gradient scatter |
+| `torch.index_select` | ✅ | ✅ | ✅ | |
+| `torch.reshape`, `view` | ✅ | ✅ | ✅ | Zero-copy descriptor manipulation |
+| `torch.transpose` | ✅ | ✅ | ✅ | |
+| `torch.squeeze`, `unsqueeze` | ✅ | ✅ | ✅ | |
+| `torch.cat`, `torch.stack` | ✅ | ✅ | ✅ | |
+| `torch.mean` | ✅ | ✅ | ✅ | |
+| `torch.zeros`, `ones`, `full` | ✅ | ✅ | ✅ | |
+| `update_kv_cache` | ✅ | ✅ | ✅ | Stateful NPU KV-cache manipulation |
+| `mse_loss` | ✅ | ✅ | ✅ | Hardware-accelerated MSE loss forward and backward |
+
+### 5. Hardware Optimizers
+| Optimizer | Module | Description |
+| :--- | :--- | :--- |
+| `NPUAdam` | `intel_npu_acceleration.optim.NPUAdam` | Fused first moment, second moment, bias correction, and weight update kernel on NPU |
+| `NPUSGD` | `intel_npu_acceleration.optim.NPUSGD` | Momentum-buffered SGD update kernel on NPU |
 
 ---
 
-## Build & Continuous Integration
+## 🛠️ Build & Verification
 
-### Build Acceleration
-The C++ core (`csrc/`) requires OpenVINO headers. 
-* **Windows**: Compiles with `/O2` and `/MP` for multi-core aggressive optimization.
-* **Linux**: Compiles with `-O3`.
-To build locally, use `ninja` for maximum speed:
 ```bash
-pip install ninja
+# Build C++ Level Zero Extension
+cd intel_npu_lib
 python setup.py build_ext --inplace
-```
 
-### CI Pipeline
-The GitHub Actions CI pipeline runs across `windows-latest` and `ubuntu-latest` against `Python 3.10` and `3.11`. It uses:
-1. **Pip Caching**: Avoids re-downloading PyTorch/OpenVINO wheels.
-2. **Ninja**: Greatly speeds up C++ compilation time.
-3. **Pytest-Xdist**: Executes the test suite in parallel (`-n auto`).
-4. **Pytest-Cov**: Generates line-by-line coverage reports for the `intel_npu_acceleration` Python module.
+# Run Full Test Suite
+pytest
+```

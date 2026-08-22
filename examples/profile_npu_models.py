@@ -81,10 +81,10 @@ def main():
     # 1. Profile Native PyTorch CPU
     cpu_stats = profile_execution(model, x, iters=args.iters, warmup=args.warmup, mode_name="PyTorch CPU")
 
-    # 2. Profile NPU Compiled Graph
+    # 2. Profile NPU Compiled Graph (Standard PyTorch 2.x torch.compile)
     try:
-        npu_model = npu.compile(model, x, performance_hint="LATENCY")
-        npu_stats = profile_execution(npu_model, x, iters=args.iters, warmup=args.warmup, mode_name="Intel NPU (Latency Mode)")
+        npu_model = torch.compile(model, backend="npu")
+        npu_stats = profile_execution(npu_model, x, iters=args.iters, warmup=args.warmup, mode_name="Intel NPU (torch.compile)")
     except Exception as e:
         print(f"ERROR: NPU Compilation failed: {e}")
         return

@@ -25,6 +25,7 @@ from .functions import (
     NPUMean,
     NPUEmbedding,
     NPUScaledDotProductAttention,
+    NPUMSELoss,
 )
 
 
@@ -135,6 +136,12 @@ def embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, sca
     return torch.nn.functional.embedding(input, weight, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse)
 
 
+def mse_loss(pred, target, reduction="mean"):
+    if _should_use_autograd(pred, target):
+        return NPUMSELoss.apply(pred, target, reduction)
+    return F_npu.mse_loss(pred, target, reduction=reduction)
+
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
     if _should_use_autograd(query, key, value):
         return NPUScaledDotProductAttention.apply(query, key, value, attn_mask, dropout_p, is_causal, scale)
@@ -166,4 +173,5 @@ torch.fx.wrap(cat)
 torch.fx.wrap(stack)
 torch.fx.wrap(mean)
 torch.fx.wrap(embedding)
+torch.fx.wrap(mse_loss)
 torch.fx.wrap(scaled_dot_product_attention)

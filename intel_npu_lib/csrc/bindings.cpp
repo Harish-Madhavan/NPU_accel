@@ -33,6 +33,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_update_kv_cache", &npu_update_kv_cache, "NPU accelerated KV cache update");
     m.def("npu_quantized_linear", &npu_quantized_linear,
           "NPU accelerated weight-only Quantized Linear (MatMul + Scale + ZP + Bias)");
+    m.def("npu_embedding", &npu_embedding, "NPU accelerated Embedding Lookup");
+    m.def("npu_embedding_backward", &npu_embedding_backward, "NPU accelerated Embedding Backward");
+    m.def("npu_matmul_backward", &npu_matmul_backward, "NPU accelerated MatMul Backward");
+    m.def("npu_linear_backward", &npu_linear_backward, "NPU accelerated Linear Backward");
+    m.def("npu_relu_backward", &npu_relu_backward, "NPU accelerated ReLU Backward");
+    m.def("npu_gelu_backward", &npu_gelu_backward, "NPU accelerated GELU Backward");
+    m.def("npu_silu_backward", &npu_silu_backward, "NPU accelerated SiLU Backward");
+    m.def("npu_softmax_backward", &npu_softmax_backward, "NPU accelerated Softmax Backward");
+    m.def("npu_rmsnorm_backward", &npu_rmsnorm_backward, "NPU accelerated RMSNorm Backward");
+    m.def("npu_mse_loss", &npu_mse_loss, "NPU accelerated MSE Loss");
+    m.def("npu_mse_loss_backward", &npu_mse_loss_backward, "NPU accelerated MSE Loss Backward");
+    m.def("npu_adam_step", &npu_adam_step, "NPU accelerated Adam Optimizer Step");
+    m.def("npu_sgd_step", &npu_sgd_step, "NPU accelerated SGD Optimizer Step");
     m.def("set_cache_dir", &set_npu_cache_dir, "Set OpenVINO disk cache directory");
     m.def("set_property", &set_npu_property, "Set global NPU property (Level Zero optimizations)");
     m.def("set_performance_hint", &set_npu_performance_hint,

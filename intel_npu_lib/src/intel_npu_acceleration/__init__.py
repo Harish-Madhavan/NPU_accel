@@ -27,10 +27,19 @@ from .exceptions import (  # noqa: E402
     NPUUnsupportedOpError,
 )
 
-# --- Device Management & Properties ---
+# --- Device Management & Seamless Acceleration ---
 from .device import (  # noqa: E402
     _C,
     is_available,
+    device_count,
+    current_device,
+    get_device_name,
+    get_device_properties,
+    empty_cache,
+    synchronize,
+    turbo,
+    performance_mode,
+    accelerate,
     set_property,
     set_performance_hint,
     enable_turbo,
@@ -50,6 +59,7 @@ from .cache import (  # noqa: E402
 )
 
 # --- Neural Network Modules & Quantization ---
+from . import nn
 from .nn import (  # noqa: E402
     NPUStatefulKVCache,
     quantize,
@@ -67,6 +77,9 @@ from .frontend import (  # noqa: E402
     NPUGraphModule,
     NPUDynamicGraphModule,
 )
+
+from . import optim
+from .optim import NPUAdam, NPUSGD
 
 # --- Functional & Autograd Operations ---
 from .functional import (  # noqa: E402
@@ -101,6 +114,7 @@ from .functional import (  # noqa: E402
     hardsigmoid,
     hardswish,
     embedding,
+    mse_loss,
     scaled_dot_product_attention,
 )
 
@@ -113,8 +127,17 @@ __all__ = [
     "NPUDeviceError",
     "NPUCompilationError",
     "NPUUnsupportedOpError",
-    # Device
+    # Device & Seamless Integration
     "is_available",
+    "device_count",
+    "current_device",
+    "get_device_name",
+    "get_device_properties",
+    "empty_cache",
+    "synchronize",
+    "turbo",
+    "performance_mode",
+    "accelerate",
     "set_property",
     "set_performance_hint",
     "enable_turbo",

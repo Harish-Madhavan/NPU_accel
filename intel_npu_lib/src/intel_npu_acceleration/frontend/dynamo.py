@@ -1,10 +1,14 @@
 """
-TorchDynamo Backend Registration for PyTorch 2.0 (torch.compile(model, backend='npu')).
-Seamlessly plugs Intel NPU hardware acceleration into standard PyTorch compilation APIs.
+TorchDynamo Backend Registration for PyTorch 2.0+ (torch.compile(model, backend='npu')).
+
+This module registers the 'npu' and 'intel_npu' custom backend compilers in PyTorch's
+TorchDynamo system, translating standard PyTorch compilation parameters (`mode`, `dynamic`,
+`options`, and `torch.autocast`) into low-level Intel oneAPI Level Zero and OpenVINO runtime
+optimizations.
 """
 
 import logging
-from typing import List
+from typing import List, Any, Callable
 import torch
 import torch.fx
 
@@ -13,10 +17,26 @@ logger = logging.getLogger("intel_npu_acceleration.frontend.dynamo")
 try:
     from torch._dynamo import register_backend
 
-    def _compile_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], **kwargs):
-        """
-        Dynamo backend for compiling PyTorch models natively via torch.compile(model, backend='npu').
-        Plumbs standard PyTorch parameters (mode, dynamic, options, autocast) into NPU hardware optimizations.
+    def _compile_backend(
+        gm: torch.fx.GraphModule,
+        example_inputs: List[torch.Tensor],
+        **kwargs: Any
+    ) -> Callable[..., Any]:
+        """TorchDynamo compiler backend entrypoint for Intel NPU compilation.
+
+        Translates idiomatic PyTorch 2.x compilation arguments:
+        - `mode="reduce-overhead"` -> LATENCY performance mode, zero-copy buffer leasing, Turbo boost.
+        - `mode="max-autotune"` -> THROUGHPUT mode, 4 parallel hardware streams, FP16 precision.
+        - `dynamic=True` -> Dynamic shape bucket compilation with dead placeholder symbol pruning.
+        - `torch.autocast(...)` -> FP16 execution precision.
+
+        Args:
+            gm (torch.fx.GraphModule): The traced FX graph module extracted by TorchDynamo.
+            example_inputs (List[torch.Tensor]): Concrete sample tensors for shape/dtype discovery.
+            **kwargs: Extra configuration options passed from `torch.compile(..., options={...})`.
+
+        Returns:
+            Callable: A callable compiled module executing on the Intel NPU.
         """
         from .compiler import compile_to_npu
 
@@ -41,7 +61,9 @@ try:
             kwargs.setdefault("dynamic_buckets", True)
 
         # Automatic PyTorch Autocast detection
-        if torch.is_autocast_enabled() or (hasattr(torch, "is_autocast_cpu_enabled") and torch.is_autocast_cpu_enabled()):
+        if torch.is_autocast_enabled() or (
+            hasattr(torch, "is_autocast_cpu_enabled") and torch.is_autocast_cpu_enabled()
+        ):
             kwargs.setdefault("precision", "fp16")
 
         # Prune unused placeholders (e.g. Dynamo SymInt symbols with 0 users in dynamic shapes)
@@ -75,7 +97,7 @@ try:
             if is_tuple:
                 num_outputs = len(ret_vals)
 
-                def tuple_wrapper(*args, **wrapper_kwargs):
+                def tuple_wrapper(*args: Any, **wrapper_kwargs: Any) -> tuple:
                     res = compiled(*args, **wrapper_kwargs)
                     if num_outputs == 1:
                         if isinstance(res, tuple):
@@ -87,7 +109,7 @@ try:
             elif is_list:
                 num_outputs = len(ret_vals)
 
-                def list_wrapper(*args, **wrapper_kwargs):
+                def list_wrapper(*args: Any, **wrapper_kwargs: Any) -> list:
                     res = compiled(*args, **wrapper_kwargs)
                     if num_outputs == 1:
                         if isinstance(res, list):
@@ -99,10 +121,9 @@ try:
 
         return compiled
 
-    # Register multiple convenient backend names for seamless PyTorch 2.x integration
-    register_backend(compiler_fn=_compile_backend, name="npu")
-    register_backend(compiler_fn=_compile_backend, name="intel_npu")
-    npu = _compile_backend
+    register_backend(name="npu", compiler_fn=_compile_backend)
+    register_backend(name="intel_npu", compiler_fn=_compile_backend)
+    logger.debug("Successfully registered 'npu' and 'intel_npu' TorchDynamo backends.")
 
-except Exception as e:
-    logger.debug(f"TorchDynamo backend registration not active: {e}")
+except ImportError:
+    pass
