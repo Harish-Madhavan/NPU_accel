@@ -58,7 +58,7 @@ def train(model, device, train_loader, optimizer, epoch):
                 f"Progress: [{batch_idx * len(data):5d}/{len(train_loader.dataset):5d}] | "
                 f"Loss: {loss.item():.6f}"
             )
-    
+
     avg_loss = total_loss / len(train_loader)
     elapsed = time.time() - start_time
     print(f"Epoch {epoch} finished in {elapsed:.2f}s | Avg Loss: {avg_loss:.6f}")
@@ -70,7 +70,7 @@ def run_latency_benchmark(model, npu_model, test_set, num_samples=200):
     Both targets run sequentially with batch_size=1.
     """
     print(f"\nRunning Latency Benchmark (sequential execution on {num_samples} single images)...")
-    
+
     # 1. CPU Latency Benchmark
     model.eval()
     cpu_latencies = []
@@ -78,30 +78,30 @@ def run_latency_benchmark(model, npu_model, test_set, num_samples=200):
         for i in range(num_samples):
             img, _ = test_set[i]
             img = img.unsqueeze(0)  # Shape (1, 1, 28, 28)
-            
+
             t0 = time.time()
             _ = model(img)
             t1 = time.time()
             if i >= 10:  # Warmup
                 cpu_latencies.append((t1 - t0) * 1000.0)  # ms
-                
+
     avg_cpu_lat = sum(cpu_latencies) / len(cpu_latencies)
-    
+
     # 2. NPU Latency Benchmark
     npu_latencies = []
     with torch.no_grad():
         for i in range(num_samples):
             img, _ = test_set[i]
             img = img.unsqueeze(0)
-            
+
             t0 = time.time()
             _ = npu_model(img)
             t1 = time.time()
             if i >= 10:  # Warmup
                 npu_latencies.append((t1 - t0) * 1000.0)  # ms
-                
+
     avg_npu_lat = sum(npu_latencies) / len(npu_latencies)
-    
+
     print(f"  CPU Sequential Latency: {avg_cpu_lat:.3f} ms / image")
     print(f"  NPU Sequential Latency: {avg_npu_lat:.3f} ms / image")
     return avg_cpu_lat, avg_npu_lat
@@ -114,7 +114,7 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
     NPU runs with multi-stream asynchronous pipelining for maximum VPU core saturation.
     """
     print("\nRunning Throughput Benchmark...")
-    
+
     # 1. CPU Throughput
     model.eval()
     cpu_images_processed = 0
@@ -127,17 +127,17 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
             cpu_images_processed += data.size(0)
     cpu_duration = time.time() - t0
     cpu_throughput = cpu_images_processed / cpu_duration if cpu_duration > 0 else 0
-    
+
     # 2. NPU Throughput
     npu_images_processed = 0
     t0 = time.time()
     num_requests_to_run = max_batches * test_loader_large.batch_size
-    
+
     if hasattr(npu_model, "infer_async") and hasattr(npu_model, "wait_async") and getattr(npu_model, "num_streams", 1) > 1:
         from collections import deque
         active_handles = deque()
         iterator = iter(test_loader_single)
-        
+
         with torch.no_grad():
             # Fill the multi-stream execution pipeline
             for _ in range(min(npu_model.num_streams, num_requests_to_run)):
@@ -148,12 +148,12 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
                     npu_images_processed += 1
                 except StopIteration:
                     break
-                    
+
             # Interleave wait and submit to keep streams saturated
             while active_handles:
                 oldest_handle = active_handles.popleft()
                 _ = npu_model.wait_async(oldest_handle)
-                
+
                 if npu_images_processed < num_requests_to_run:
                     try:
                         data, _ = next(iterator)
@@ -170,10 +170,10 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
                     break
                 _ = npu_model(data)
                 npu_images_processed += 1
-                
+
     npu_duration = time.time() - t0
     npu_throughput = npu_images_processed / npu_duration if npu_duration > 0 else 0
-    
+
     print(f"  CPU Throughput (Batch={test_loader_large.batch_size}): {cpu_throughput:.2f} images/sec")
     print(f"  NPU Throughput (Streams={getattr(npu_model, 'num_streams', 1)}): {npu_throughput:.2f} images/sec")
     return cpu_throughput, npu_throughput
@@ -181,7 +181,7 @@ def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_si
 
 def evaluate_accuracy(model, npu_model, test_loader):
     print("\nEvaluating Accuracy...")
-    
+
     # CPU Accuracy
     model.eval()
     cpu_correct = 0
@@ -190,9 +190,9 @@ def evaluate_accuracy(model, npu_model, test_loader):
             output = model(data)
             pred = output.argmax(dim=1, keepdim=True)
             cpu_correct += pred.eq(target.view_as(pred)).sum().item()
-            
+
     cpu_acc = 100.0 * cpu_correct / len(test_loader.dataset)
-    
+
     # NPU Accuracy (expects input on CPU, compiles/offloads internally)
     npu_correct = 0
     with torch.no_grad():
@@ -205,9 +205,9 @@ def evaluate_accuracy(model, npu_model, test_loader):
                 output = npu_model(img)
                 pred = output.argmax(dim=1, keepdim=True)
                 npu_correct += pred.eq(tgt.view_as(pred)).sum().item()
-                
+
     npu_acc = 100.0 * npu_correct / len(test_loader.dataset)
-    
+
     print(f"  CPU Test Accuracy: {cpu_acc:.2f}%")
     print(f"  NPU Test Accuracy: {npu_acc:.2f}%")
     return cpu_acc, npu_acc
@@ -356,7 +356,7 @@ def main():
     num_samples = min(100, len(test_set))
     cpu_lat, npu_lat = run_latency_benchmark(model, npu_model, test_set, num_samples=num_samples)
     cpu_thr, npu_thr = run_throughput_benchmark(model, npu_model, test_loader_cpu, test_loader_npu, max_batches=5)
-    
+
     # Evaluate accuracy on a subset to keep execution time fast (e.g. up to 500 images)
     subset_size = min(500, len(test_set))
     subset_indices = torch.arange(subset_size)
@@ -367,7 +367,7 @@ def main():
     # Print beautiful summary table
     lat_speedup = cpu_lat / npu_lat if npu_lat > 0 else 0
     thr_speedup = npu_thr / cpu_thr if cpu_thr > 0 else 0
-    
+
     print("\n" + "=" * 70)
     print("                INTEL NPU VS CPU MNIST PERFORMANCE SUMMARY               ")
     print("=" * 70)

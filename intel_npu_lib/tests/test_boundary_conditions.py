@@ -11,12 +11,12 @@ class TestBoundaryConditions(unittest.TestCase):
             (10, 0),
             (1, 0, 5),
         ]
-        
+
         for shape in test_shapes:
             with self.subTest(shape=shape):
                 a = torch.randn(shape)
                 b = torch.randn(shape)
-                
+
                 # Element-wise add
                 try:
                     res = npu.add(a, b)
@@ -30,11 +30,11 @@ class TestBoundaryConditions(unittest.TestCase):
         # Create a non-contiguous tensor by slicing or transposing
         a_base = torch.randn(10, 20)
         a = a_base[:, :10] # Sliced, likely non-contiguous if we don't call .contiguous()
-        
+
         b = torch.randn(10, 10)
-        
+
         self.assertFalse(a.is_contiguous())
-        
+
         try:
             res = npu.add(a, b)
             self.assertTrue(torch.allclose(res, a + b, atol=1e-3))
@@ -46,7 +46,7 @@ class TestBoundaryConditions(unittest.TestCase):
         shape = (2, 3, 4, 5, 6)
         a = torch.randn(shape)
         b = torch.randn(shape)
-        
+
         try:
             res = npu.add(a, b)
             self.assertTrue(torch.allclose(res, a + b, atol=1e-3))
@@ -56,7 +56,7 @@ class TestBoundaryConditions(unittest.TestCase):
     def test_different_dtypes(self):
         """Test ops with different dtypes (FP16, INT8, UINT8)."""
         dtypes = [torch.float16, torch.int32]
-        
+
         for dtype in dtypes:
             with self.subTest(dtype=dtype):
                 if dtype.is_floating_point:
@@ -65,7 +65,7 @@ class TestBoundaryConditions(unittest.TestCase):
                 else:
                     a = torch.randint(0, 100, (10, 10)).to(dtype)
                     b = torch.randint(0, 100, (10, 10)).to(dtype)
-                
+
                 try:
                     res = npu.add(a, b)
                     self.assertEqual(res.dtype, dtype)
@@ -77,7 +77,7 @@ class TestBoundaryConditions(unittest.TestCase):
         """Test UINT8 image boundary clamping (mentioned in ROADMAP)."""
         a = torch.randint(0, 256, (1, 3, 224, 224), dtype=torch.uint8)
         b = torch.randint(0, 256, (1, 3, 224, 224), dtype=torch.uint8)
-        
+
         # NPU add for uint8 might wrap or clamp depending on implementation.
         # Standard torch.add for uint8 wraps.
         # Let's see what our NPU implementation does.

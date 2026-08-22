@@ -31,6 +31,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_conv2d", &npu_conv2d, "NPU accelerated Conv2d");
     m.def("npu_max_pool2d", &npu_max_pool2d, "NPU accelerated MaxPool2d");
     m.def("npu_update_kv_cache", &npu_update_kv_cache, "NPU accelerated KV cache update");
+    m.def("npu_rotary_embedding", &npu_rotary_embedding,
+          "NPU accelerated Rotary Position Embedding (RoPE)");
     m.def("npu_quantized_linear", &npu_quantized_linear,
           "NPU accelerated weight-only Quantized Linear (MatMul + Scale + ZP + Bias)");
     m.def("npu_embedding", &npu_embedding, "NPU accelerated Embedding Lookup");

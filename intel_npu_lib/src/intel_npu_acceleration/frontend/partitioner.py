@@ -97,7 +97,7 @@ def partition_and_compile_hybrid(
     # Compile supported submodules recursively
     for name, child in list(split_parent.named_children()):
         is_supported = True
-        
+
         # Check if the child module is a GraphModule before checking graph.nodes
         if not hasattr(child, "graph"):
             is_supported = OpRegistry.get_module(type(child)) is not None

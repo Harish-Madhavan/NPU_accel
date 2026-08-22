@@ -92,30 +92,30 @@ class TestNPUStress(unittest.TestCase):
         model = AdditionModel()
         x = torch.randn(2, 2)
         y = torch.randn(2, 2)
-        
+
         # Compile with clone_outputs=False to test weakref buffer recycling
         npu_model = compile_to_npu(model, (x, y), num_streams=5, clone_outputs=False)
-        
+
         pool = npu_model.output_pools[0]
         self.assertEqual(len(pool.active_buffers), 0)
-        
+
         def run_inferences():
             # Launch 5 overlapping async inferences
             handles = []
             for i in range(5):
                 h = npu_model.infer_async(x + i, y)
                 handles.append(h)
-                
+
             # Active buffers should now be 5
             self.assertEqual(len(pool.active_buffers), 5)
-            
+
             # Wait and collect outputs
             outputs = []
             for i, h in enumerate(handles):
                 out = npu_model.wait_async(h)
                 self.assertTrue(torch.allclose(out, x + i + y, atol=1e-3, rtol=1e-3))
                 outputs.append(out)
-                
+
             # Tensors are still held in local scope `outputs`, so they must not be recycled yet
             self.assertEqual(len(pool.active_buffers), 5)
             return len(pool.active_buffers)
@@ -123,10 +123,10 @@ class TestNPUStress(unittest.TestCase):
         # Execute in nested scope
         active_before = run_inferences()
         self.assertEqual(active_before, 5)
-        
+
         # After returning, the local scope variables are completely destroyed. Force garbage collection!
         gc.collect()
-        
+
         # Active buffers should drop back to 0, and all 5 should be returned to idle!
         self.assertEqual(len(pool.active_buffers), 0)
         self.assertEqual(len(pool.idle_buffers), 5)

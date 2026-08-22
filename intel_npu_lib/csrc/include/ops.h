@@ -114,6 +114,9 @@ torch::Tensor npu_max_pool2d(torch::Tensor input, std::vector<int64_t> kernel_si
 torch::Tensor npu_update_kv_cache(torch::Tensor cache, torch::Tensor new_kv,
                                   torch::Tensor position);
 
+/** @brief Hardware accelerated Rotary Position Embedding (RoPE) for LLMs. */
+torch::Tensor npu_rotary_embedding(torch::Tensor x, torch::Tensor cos, torch::Tensor sin);
+
 /** @brief Weight-only quantized linear transformation (MatMul + Scale + ZP + Bias). */
 torch::Tensor npu_quantized_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor scale,
                                    torch::Tensor zero_point, torch::Tensor bias);

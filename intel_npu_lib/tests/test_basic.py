@@ -135,7 +135,7 @@ class TestIntelNPULib(unittest.TestCase):
         from intel_npu_acceleration.frontend import _GRAPH_CACHE
         intel_npu_acceleration.clear_graph_cache()
         self.assertEqual(len(_GRAPH_CACHE), 0)
-        
+
         # After clearing, verify no exceptions occurred and size is less than or equal to original.
         # (Some files may be locked by active OpenVINO execution in other parallel tests on Windows)
         new_size, new_count = intel_npu_acceleration.get_cache_size()

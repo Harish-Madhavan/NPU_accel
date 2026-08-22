@@ -28,7 +28,7 @@ class TestTransformations(unittest.TestCase):
         p_scalar.set_friendly_name("start_pos")
         p_tensor = ops.parameter(ov.Shape([2, 4]), ov.Type.f32)
         p_tensor.set_friendly_name("x")
-        
+
         # Simple computation: multiply tensor by scalar cast to float
         scalar_f32 = ops.convert(p_scalar, destination_type=ov.Type.f32)
         out = ops.multiply(p_tensor, scalar_f32)
@@ -38,7 +38,7 @@ class TestTransformations(unittest.TestCase):
         placeholder_names = ["start_pos", "x"]
 
         folded_model = fold_scalar_parameter_inputs(ov_model, example_inputs, placeholder_names)
-        
+
         # After folding, only 1 parameter (the tensor 'x') should remain!
         self.assertEqual(len(folded_model.get_parameters()), 1)
         self.assertEqual(folded_model.get_parameters()[0].get_friendly_name(), "x")

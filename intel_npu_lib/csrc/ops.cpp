@@ -794,6 +794,49 @@ torch::Tensor npu_embedding_backward(torch::Tensor grad_output, torch::Tensor in
 }
 
 // ---------------------------------------------------------------------------
+// Rotary Position Embedding (RoPE)
+// ---------------------------------------------------------------------------
+
+torch::Tensor npu_rotary_embedding(torch::Tensor x, torch::Tensor cos, torch::Tensor sin) {
+    x = x.contiguous();
+    cos = cos.contiguous();
+    sin = sin.contiguous();
+
+    std::string key = get_key("rotary_embedding", {x, cos, sin});
+    auto ov_type = torch_dtype_to_ov(x);
+    auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(x));
+    auto arg_cos = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(cos));
+    auto arg_sin = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(sin));
+
+    int64_t last_dim = x.size(-1);
+    int64_t half_dim = last_dim / 2;
+
+    // Split x into x1 and x2 along last dimension
+    auto split_lengths = ov::opset1::Constant::create(ov::element::i64, ov::Shape{2}, {half_dim, half_dim});
+    auto axis_node = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {-1});
+    auto split = std::make_shared<ov::opset1::VariadicSplit>(arg_x, axis_node, split_lengths);
+
+    auto x1 = split->output(0);
+    auto x2 = split->output(1);
+
+    // out1 = x1 * cos - x2 * sin
+    auto x1_cos = std::make_shared<ov::opset1::Multiply>(x1, arg_cos);
+    auto x2_sin = std::make_shared<ov::opset1::Multiply>(x2, arg_sin);
+    auto out1 = std::make_shared<ov::opset1::Subtract>(x1_cos, x2_sin);
+
+    // out2 = x1 * sin + x2 * cos
+    auto x1_sin = std::make_shared<ov::opset1::Multiply>(x1, arg_sin);
+    auto x2_cos = std::make_shared<ov::opset1::Multiply>(x2, arg_cos);
+    auto out2 = std::make_shared<ov::opset1::Add>(x1_sin, x2_cos);
+
+    // Concat along last axis
+    auto concat = std::make_shared<ov::opset1::Concat>(ov::OutputVector{out1, out2}, -1);
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{concat}, ov::ParameterVector{arg_x, arg_cos, arg_sin});
+    return execute_op(key, model, {x, cos, sin});
+}
+
+// ---------------------------------------------------------------------------
 // Backward Autograd Operators
 // ---------------------------------------------------------------------------
 

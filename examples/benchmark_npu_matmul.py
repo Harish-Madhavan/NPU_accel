@@ -18,15 +18,15 @@ class MatMulModel(torch.nn.Module):
 
 def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="float16", seed=42, num_streams=1):
     torch.manual_seed(seed)
-    
+
     print("=" * 70)
     print("              INTEL NPU MATMUL PERFORMANCE BENCHMARK             ")
     print("=" * 70)
     print(f"PyTorch Version  : {torch.__version__}")
-    
+
     npu_available = npu_compiler.is_available()
     print(f"NPU Hardware     : {'Detected' if npu_available else 'Not Detected (CPU Fallback)'}")
-    
+
     # Inputs
     print(f"Matrix Shape     : ({m}x{n}) x ({n}x{k}) -> ({m}x{k})")
     print(f"Data Type        : {dtype_str}")
@@ -85,32 +85,32 @@ def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="f
     # NPU Stress iterations
     print(f"Running NPU stress test ({iterations} iterations)...")
     npu_latencies = []
-    
+
     t_stress_start = time.time()
     if hasattr(npu_model, "infer_async") and hasattr(npu_model, "wait_async") and num_streams > 1:
         from collections import deque
         active_handles = deque()
         submitted = 0
         completed = 0
-        
+
         # Fill the multi-stream execution pipeline
         for _ in range(min(num_streams, iterations)):
             h = npu_model.infer_async(a, b)
             active_handles.append((h, time.time()))
             submitted += 1
-            
+
         # Interleave waits and submissions
         while active_handles:
             h, t_sub = active_handles.popleft()
             _ = npu_model.wait_async(h)
             completed += 1
             npu_latencies.append((time.time() - t_sub) * 1000.0)  # latency per request in ms
-            
+
             if submitted < iterations:
                 h_new = npu_model.infer_async(a, b)
                 active_handles.append((h_new, time.time()))
                 submitted += 1
-                
+
             if iterations >= 10 and completed % (iterations // 5) == 0:
                 print(f"  Progress: {completed:3d}/{iterations:3d}")
     else:
@@ -119,10 +119,10 @@ def run_benchmark(m=2048, n=2048, k=2048, iterations=50, warmup=10, dtype_str="f
             _ = npu_model(a, b)
             t_end = time.time()
             npu_latencies.append((t_end - t_start) * 1000.0)  # ms
-            
+
             if iterations >= 10 and (i + 1) % (iterations // 5) == 0:
                 print(f"  Progress: {i + 1:3d}/{iterations:3d}")
-                
+
     total_stress_duration = time.time() - t_stress_start
 
     # NPU statistics

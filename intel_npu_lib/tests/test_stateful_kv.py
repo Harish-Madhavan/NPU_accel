@@ -48,7 +48,7 @@ class TestStatefulKVCache(unittest.TestCase):
 
         # 3. Perform 4 autoregressive steps of length 1 (matching standard token-by-token generation)
         np.random.seed(42)
-        
+
         step_tensors = []
         for step in range(4):
             step_np = np.random.randn(batch_size, 1, num_heads, head_dim).astype(np.float32)
@@ -103,10 +103,10 @@ class TestStatefulKVCache(unittest.TestCase):
         # Write to cache (2 updates of length 1)
         step_tensor_1 = torch.randn(batch_size, 1, num_heads, head_dim)
         step_tensor_2 = torch.randn(batch_size, 1, num_heads, head_dim)
-        
+
         model_npu(step_tensor_1)
         out_before_reset = model_npu(step_tensor_2)
-        
+
         self.assertNotEqual(torch.sum(out_before_reset), 0.0)
 
         # Reset states
@@ -148,7 +148,7 @@ class TestStatefulKVCache(unittest.TestCase):
 
         # Execution 2 (uses other double buffer, e.g. buffer 1)
         res2 = compiled(torch.tensor([[5.0, 5.0], [5.0, 5.0]]), torch.tensor([[10.0, 10.0], [10.0, 10.0]]))
-        
+
         # Verify res1 was NOT overwritten and still contains the values from execution 1
         self.assertTrue(torch.allclose(res1, torch.tensor([[3.0, 3.0], [3.0, 3.0]])))
         self.assertTrue(torch.allclose(res2, torch.tensor([[15.0, 15.0], [15.0, 15.0]])))
@@ -223,7 +223,7 @@ class TestStatefulKVCache(unittest.TestCase):
         class MultiLayerFunctionalLLM(nn.Module):
             def forward(self, new_kv, kv_cache, position):
                 from intel_npu_acceleration.functional import update_kv_cache
-                
+
                 # Slicing individual caches for Layer 0 (K at 0, V at 1) and Layer 1 (K at 2, V at 3)
                 ck0 = kv_cache[0]
                 cv0 = kv_cache[1]

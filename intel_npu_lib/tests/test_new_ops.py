@@ -9,7 +9,7 @@ class TestNewOps(unittest.TestCase):
         res = npu.squeeze(a)
         self.assertEqual(res.shape, (10, 20))
         self.assertTrue(torch.allclose(res, a.squeeze(), atol=1e-3))
-        
+
         # Squeeze specific dim
         res = npu.squeeze(a, dim=0)
         self.assertEqual(res.shape, (10, 1, 20))
@@ -33,11 +33,11 @@ class TestNewOps(unittest.TestCase):
         res = npu.zeros(size)
         self.assertEqual(res.shape, tuple(size))
         self.assertTrue(torch.all(res == 0))
-        
+
         res = npu.ones(size)
         self.assertEqual(res.shape, tuple(size))
         self.assertTrue(torch.all(res == 1))
-        
+
         res = npu.full(size, 3.14)
         self.assertEqual(res.shape, tuple(size))
         self.assertTrue(torch.allclose(res, torch.full(size, 3.14), atol=1e-3))

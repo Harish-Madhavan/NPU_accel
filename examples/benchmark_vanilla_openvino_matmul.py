@@ -42,13 +42,13 @@ def main():
     param_a = ops.parameter([args.size, args.size], ov_type, name="A")
     param_b = ops.parameter([args.size, args.size], ov_type, name="B")
     matmul = ops.matmul(param_a, param_b, transpose_a=False, transpose_b=False)
-    
+
     model = ov.Model([matmul.output(0)], [param_a, param_b], "Vanilla_MatMul")
 
     # 2. Compile Model
     core = ov.Core()
     config = {}
-    
+
     try:
         hint = ov_hints.PerformanceMode.THROUGHPUT if args.performance_hint == "THROUGHPUT" else ov_hints.PerformanceMode.LATENCY
         config[ov_hints.performance_mode()] = hint
@@ -70,7 +70,7 @@ def main():
 
     # 3. Create Inputs & Remote/Host Tensors
     infer_requests = [compiled_model.create_infer_request() for _ in range(args.num_streams)]
-    
+
     # Pre-allocate contiguous inputs to avoid overhead
     input_a = np.random.randn(args.size, args.size).astype(np_dtype)
     input_b = np.random.randn(args.size, args.size).astype(np_dtype)
@@ -90,20 +90,20 @@ def main():
     if args.num_streams > 1:
         # Multi-stream Pipelined Asynchronous Benchmark
         start_time = time.time()
-        
+
         # Schedule initial requests
         in_flight = 0
         req_idx = 0
-        
+
         for i in range(args.iterations):
             req = infer_requests[req_idx]
             req.set_tensor("A", ov.Tensor(input_a))
             req.set_tensor("B", ov.Tensor(input_b))
-            
+
             req.start_async()
             in_flight += 1
             req_idx = (req_idx + 1) % args.num_streams
-            
+
             if in_flight >= args.num_streams:
                 # Wait for the oldest request to finish
                 wait_idx = (req_idx - args.num_streams) % args.num_streams
@@ -113,7 +113,7 @@ def main():
         # Wait for remaining requests
         for req in infer_requests:
             req.wait()
-            
+
         total_time = time.time() - start_time
         avg_latency_ms = (total_time / args.iterations) * 1000.0
     else:
@@ -122,18 +122,18 @@ def main():
             req = infer_requests[0]
             req.set_tensor("A", ov.Tensor(input_a))
             req.set_tensor("B", ov.Tensor(input_b))
-            
+
             t0 = time.time()
             req.infer()
             latencies.append((time.time() - t0) * 1000.0)
-            
+
         avg_latency_ms = np.mean(latencies)
 
     # 6. Calculate Throughput
     # Matrix Multiplications require 2 * N^3 operations
     ops_per_matmul = 2 * (args.size ** 3)
     gops_per_matmul = ops_per_matmul / 1e9
-    
+
     if args.num_streams > 1:
         system_throughput_gops = (gops_per_matmul * args.iterations) / total_time
     else:

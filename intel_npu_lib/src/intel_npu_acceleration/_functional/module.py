@@ -165,6 +165,22 @@ def quantized_linear(
     return _C.npu_quantized_linear(input, weight, scale, zero_point, bias)
 
 
+def rotary_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Hardware accelerated Rotary Position Embedding (RoPE) for LLMs."""
+    if _C is not None and not _is_proxy(x, cos, sin):
+        try:
+            return _C.npu_rotary_embedding(x, cos, sin)
+        except Exception:
+            pass
+    # PyTorch CPU reference fallback
+    d = x.shape[-1]
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2 :]
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    return torch.cat([out1, out2], dim=-1)
+
+
 def conv2d(
     input: torch.Tensor,
     weight: torch.Tensor,

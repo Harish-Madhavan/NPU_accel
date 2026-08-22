@@ -133,7 +133,7 @@ class Attention(nn.Module):
         output = n_f.scaled_dot_product_attention(
             xq, keys, values, attn_mask=mask, is_causal=False if mask is not None else (seqlen > 1)
         )
-        
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output), cache_k, cache_v
 
@@ -308,7 +308,7 @@ class StatefulAttention(nn.Module):
         output = torch.nn.functional.scaled_dot_product_attention(
             xq, keys, values, attn_mask=mask, is_causal=False
         )
-        
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -386,7 +386,7 @@ def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaCon
     tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
     if not tokens:
         tokens = [32]  # space
-        
+
     print(f"  Prompt tokens: {tokens}")
     print(f"  Generated Text : '{prompt}", end="", flush=True)
 
@@ -400,24 +400,24 @@ def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaCon
     )
 
     t_start = time.time()
-    
+
     # 1. Prefill Phase
     for start_pos, tok_id in enumerate(tokens[:-1]):
         input_t = torch.tensor([[tok_id]], dtype=torch.long)
         _, kv_cache = npu_model(input_t, start_pos, kv_cache)
-        
+
     next_token = tokens[-1]
     start_pos = len(tokens) - 1
-    
+
     # 2. Decode Phase
     latencies = []
     for step in range(max_gen_len):
         current_pos = start_pos + step
         if current_pos >= conf.max_seq_len:
             break
-            
+
         input_t = torch.tensor([[next_token]], dtype=torch.long)
-        
+
         t0 = time.time()
         logits, kv_cache = npu_model(input_t, current_pos, kv_cache)
         t1 = time.time()
@@ -425,7 +425,7 @@ def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaCon
 
         # Greedy decoding: pick highest logit index
         next_token = torch.argmax(logits[0, -1]).item()
-        
+
         # Safe ASCII decode
         char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
         print(char, end="", flush=True)
@@ -442,7 +442,7 @@ def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf:
     tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
     if not tokens:
         tokens = [32]
-        
+
     print(f"  Prompt tokens: {tokens}")
     print(f"  Generated Text : '{prompt}", end="", flush=True)
 
@@ -458,40 +458,40 @@ def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf:
     )
 
     t_start = time.time()
-    
+
     # 1. Prefill Phase
     for start_pos, tok_id in enumerate(tokens[:-1]):
         input_t = torch.tensor([[tok_id]], dtype=torch.long)
-        
+
         idx = torch.tensor([start_pos])
         cos = freqs_cos[idx]  # shape: (1, 8)
         sin = freqs_sin[idx]  # shape: (1, 8)
-        
+
         # Causal mask: 1 for active positions, -inf for futures
         mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
         mask[0, 0, 0, : start_pos + 1] = 0.0
-        
+
         npu_model(input_t, cos, sin, mask)
-        
+
     next_token = tokens[-1]
     start_pos = len(tokens) - 1
-    
+
     # 2. Decode Phase
     latencies = []
     for step in range(max_gen_len):
         current_pos = start_pos + step
         if current_pos >= conf.max_seq_len:
             break
-            
+
         input_t = torch.tensor([[next_token]], dtype=torch.long)
-        
+
         idx = torch.tensor([current_pos])
         cos = freqs_cos[idx]  # shape: (1, 8)
         sin = freqs_sin[idx]  # shape: (1, 8)
-        
+
         mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
         mask[0, 0, 0, : current_pos + 1] = 0.0
-        
+
         t0 = time.time()
         logits = npu_model(input_t, cos, sin, mask)
         t1 = time.time()
@@ -499,7 +499,7 @@ def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf:
 
         # Greedy decoding
         next_token = torch.argmax(logits[0, -1]).item()
-        
+
         char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
         print(char, end="", flush=True)
         time.sleep(0.015)
@@ -597,7 +597,7 @@ def main():
     print(f"| NPU FP16 (Functional)    | Host-Tensor    | {fp16_latency:25.2f} ms |")
     print(f"| NPU FP16 (Stateful)      | Hardware-Reg   | {stateful_latency:25.2f} ms |")
     print("=" * 67)
-    
+
     speedup_stateful = fp16_latency / stateful_latency if stateful_latency > 0 else 0
     print(f"Stateful (Zero-Transfer Hardware Cache) speedup: {speedup_stateful:.2f}x\n")
 

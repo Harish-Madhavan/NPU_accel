@@ -18,7 +18,7 @@ class TestAutogradSLM(unittest.TestCase):
 
         # Indices must be long integers
         indices = torch.randint(0, vocab_size, (batch_size, seq_len))
-        
+
         # Weights require grad
         w1 = torch.randn(vocab_size, embed_dim, requires_grad=True)
         w2 = w1.detach().clone().requires_grad_(True)

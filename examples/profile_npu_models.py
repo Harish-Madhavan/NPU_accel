@@ -27,7 +27,7 @@ class ProfilerModel(torch.nn.Module):
 
 def profile_execution(model: torch.nn.Module, input_tensor: torch.Tensor, iters: int = 50, warmup: int = 10, mode_name: str = "NPU Model"):
     print(f"\nRunning Profiling for [{mode_name}] ({iters} iterations, {warmup} warmup runs)...")
-    
+
     # Warmup runs
     with torch.no_grad():
         for _ in range(warmup):

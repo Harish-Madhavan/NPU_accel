@@ -180,7 +180,7 @@ class NPUGraphModule(torch.nn.Module):
                 target_dtype = _OV_TO_NP.get(ov_type, np.float32)
                 torch_dtype = torch.from_numpy(np.array(0, dtype=target_dtype)).dtype
                 self.output_info.append((True, shape, torch_dtype))
-                
+
                 # Zero-copy lease optimization threshold: only lease for large output tensors or when clone_outputs is disabled
                 num_elements = int(np.prod(shape))
                 if num_elements > 100000 or not self.clone_outputs:

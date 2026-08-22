@@ -170,6 +170,24 @@ class TestIntelNPULibLLM(unittest.TestCase):
         print(f"Transformer Block Max Diff: {diff}")
         self.assertTrue(torch.allclose(out_npu, out_cpu, rtol=1e-1, atol=1e-1))
 
+    def test_rotary_embedding(self):
+        """Verify fused RoPE operator against PyTorch baseline."""
+        bs, slen, n_heads, head_dim = 2, 8, 4, 16
+        x = torch.randn(bs, slen, n_heads, head_dim)
+        cos = torch.randn(1, slen, 1, head_dim // 2)
+        sin = torch.randn(1, slen, 1, head_dim // 2)
+
+        # PyTorch reference
+        d = head_dim
+        x1 = x[..., : d // 2]
+        x2 = x[..., d // 2 :]
+        out1 = x1 * cos - x2 * sin
+        out2 = x1 * sin + x2 * cos
+        expected = torch.cat([out1, out2], dim=-1)
+
+        res = intel_npu_acceleration.rotary_embedding(x, cos, sin)
+        self.assertTrue(torch.allclose(res, expected, rtol=1e-2, atol=1e-2))
+
 
 if __name__ == "__main__":
     unittest.main()

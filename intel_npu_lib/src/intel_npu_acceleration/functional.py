@@ -45,12 +45,14 @@ ones = F_base.ones
 full = F_base.full
 max_pool2d = F_base.max_pool2d
 update_kv_cache = F_base.update_kv_cache
+rotary_embedding = F_base.rotary_embedding
 quantized_linear = F_base.quantized_linear
 identity = F_base.identity
 dropout = F_base.dropout
 
 torch.fx.wrap(quantized_linear)
 torch.fx.wrap(update_kv_cache)
+torch.fx.wrap(rotary_embedding)
 
 # Compilation flag to ensure functional execution during native OpenVINO tracing
 _IS_COMPILING: bool = False
