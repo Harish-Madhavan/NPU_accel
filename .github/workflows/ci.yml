@@ -19,7 +19,7 @@ jobs:
       FORCE_CUDA: "0"
       # CL / _CL_ are read by cl.exe directly (prepended / appended).
       # CXXFLAGS and CFLAGS are Unix conventions that MSVC ignores.
-      CL: "/std:c++20 /MP /DNOMINMAX"
+      CL: "/std:c++20 /MP /DNOMINMAX /wd4251 /wd4244 /wd4267 /wd4275 /wd4018"
       _CL_: "/std:c++20 /DNOMINMAX"
     
     steps:
@@ -74,7 +74,7 @@ jobs:
       run: |
         MSVC_BIN="$(cygpath "$VCToolsInstallDir")/bin/HostX64/x64"
         export PATH="$MSVC_BIN:$PATH"
-        python -m build --wheel --no-build-isolation ./intel_npu_lib
+        python -m build --wheel --no-isolation ./intel_npu_lib
       shell: bash
         
     - name: Upload Built Wheel Artifact
