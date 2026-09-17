@@ -1,19 +1,78 @@
 [build-system]
-requires = ["setuptools", "wheel", "torch", "openvino"]
+# NOTE: torch + openvino are required at *build* time because setup.py uses
+# torch.utils.cpp_extension and links against OpenVINO headers/libs.
+# CI pre-installs them, then builds with --no-build-isolation.
+requires = ["setuptools>=61", "wheel", "torch>=2.1", "openvino>=2024.0.0"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "intel_npu_acceleration"
+version = "0.2.0"
+description = "PyTorch acceleration library for Intel NPU — Level Zero / OpenVINO backend"
+# README lives alongside this pyproject (setuptools requires readme files
+# to be inside the project directory, so this is a package-level README
+# that links to the full repo-root documentation).
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["intel", "npu", "openvino", "pytorch", "level-zero"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "torch>=2.1",
+    "openvino>=2024.0.0",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/Harish-Madhavan/NPU_accel"
+Documentation = "https://github.com/Harish-Madhavan/NPU_accel#readme"
+Issues = "https://github.com/Harish-Madhavan/NPU_accel/issues"
+
+[project.scripts]
+# `intel-npu-info` is equivalent to `python -m intel_npu_acceleration --info`
+intel-npu-info = "intel_npu_acceleration.__main__:main"
+
+[project.optional-dependencies]
+# NOTE: setup.py is intentionally slim — name/version/deps/entry-points all
+# live here so there is a single source of truth.
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "build"]
+
+[project.entry-points."torch_dynamo_backends"]
+npu = "intel_npu_acceleration.frontend.dynamo:_compile_backend"
+intel_npu = "intel_npu_acceleration.frontend.dynamo:_compile_backend"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+intel_npu_acceleration = ["py.typed"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-addopts = "-v --tb=short"
-pythonpath = [
-    "src",
-]
-testpaths = [
-    "tests",
+addopts = "-v --tb=short --strict-markers"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "npu: marks tests requiring NPU hardware",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::torch.jit.TracerWarning",
+    # torch.jit.trace / trace_method emit FutureWarning internally via
+    # openvino.convert_model; conversion still supported so silence it.
+    "ignore::FutureWarning",
 ]
 
 [tool.ruff]
@@ -21,13 +80,32 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "C90", "I", "N", "UP", "B", "A", "C4", "TCH", "TID", "Q"]
 ignore = [
-    "E501",  # line too long
-    "E402",  # module level import not at top of file
-    "F401",  # unused import
-    "F403",  # unable to detect undefined names from star import
-    "F405",  # name may be undefined from star imports
-    "F841",  # local variable assigned but never used
-    "E741",  # ambiguous variable name
+    "E501",  # line too long (handled by formatter)
+    "E402",  # module level import not at top (dynamic loading)
+    "F401",  # unused import (re-exports)
+    "F403",  # star import
+    "F405",  # undefined from star
+    "F841",  # unused variable (kept for clarity)
+    "E741",  # ambiguous var name
+    "C901",  # too complex (refactor gradually)
+    "W191",  # tab indentation
+    "N812",  # lowercase imported as non-lowercase (standard for torch.nn.functional as F)
+    "A001",  # shadowing built-in (standard PyTorch: input)
+    "A002",  # shadowing built-in in argument (standard PyTorch: input)
+    "A004",  # shadowing built-in import (standard PyTorch: compile)
+    "TID252", # relative imports from parent modules
+    "UP035",  # deprecated typing imports
+    "B904",   # raise from in except
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N806", "N802", "N803", "N812"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.isort]
+known-first-party = ["intel_npu_acceleration"]
+

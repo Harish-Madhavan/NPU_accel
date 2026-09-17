@@ -52,13 +52,42 @@ When you use `intel_npu_acceleration`, the following hardware optimizations are 
 
 ## 🛠️ Installation
 
+### Prerequisites
+- **Python** 3.10+ (3.11 / 3.12 recommended)
+- **Intel NPU driver** 31.0.100.x+ ([Intel Support](https://www.intel.com/content/www/us/en/support/articles/000095856/processors.html))
+- **Windows**: Visual Studio 2022 with *Desktop development with C++* (provides `cl.exe`), or run `build_npu.bat` which locates it via `vswhere`
+- **Linux**: `sudo apt install build-essential python3-dev`
+
+### Option A — Editable install (recommended for development)
 ```bash
 # Clone the repository
 git clone https://github.com/Harish-Madhavan/NPU_accel.git
 cd NPU_accel/intel_npu_lib
 
-# Install in editable mode
-pip install -e .
+# CPU-only PyTorch is enough (much smaller download than the default CUDA wheel)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install openvino "numpy>=1.24"
+
+# Windows (configures MSVC automatically and builds the C++ extension):
+#   ..\build_npu.bat
+# Any OS / manual build:
+python setup.py build_ext --inplace
+pip install --no-build-isolation --no-deps -e .
+```
+
+Environment knobs for the build:
+| Variable | Effect |
+| :--- | :--- |
+| `NPU_NO_BUILD_EXT=1` | Skip the C++ extension (pure-Python / CPU-fallback install) |
+| `NPU_VERBOSE_BUILD=1` | Verbose OpenVINO header/lib discovery logging |
+| `OPENVINO_DIR` / `INTEL_OPENVINO_DIR` | Extra hint for a non-PyPI OpenVINO toolkit install |
+
+### Option B — Build a wheel
+```bash
+cd NPU_accel/intel_npu_lib
+pip install build
+python -m build --wheel --no-isolation
+pip install dist/*.whl
 ```
 
 ### Verify NPU Availability
@@ -69,45 +98,70 @@ print(f"NPU Available : {npu.is_available()}")
 print(f"Device Name   : {npu.get_device_name()}")
 print(f"Device Count  : {npu.device_count()}")
 ```
+Or from a terminal (also available as `intel-npu-info` after install):
+```bash
+python -m intel_npu_acceleration --info
+```
+
+### Troubleshooting
+| Symptom | Fix |
+| :--- | :--- |
+| `cl.exe not found` / MSVC error | Install VS 2022 *Desktop development with C++*, or run from a Developer Prompt / `build_npu.bat` |
+| OpenVINO headers/libs not found (stub-mode warning) | `pip install "openvino>=2024.0.0"`, or set `OPENVINO_DIR` to a toolkit install |
+| `pip install -e .` downloads a huge CUDA torch | Pre-install CPU torch first: `pip install torch --index-url https://download.pytorch.org/whl/cpu` |
+| Compiled-model cache grows unbounded | Set `INTEL_NPU_CACHE_DIR` (or `NPU_CACHE_DIR`) to a dedicated folder; prune with `python -m intel_npu_acceleration --clear-cache` |
+| No NPU hardware | Library still imports and falls back to CPU; `npu.is_available()` returns `False` |
 
 ---
 
 ## 🚀 Quick Start (Pure PyTorch)
 
-### 1. PyTorch 2.x `torch.compile` (Standard Syntax)
+### 1. Standard PyTorch Syntax (`model.to("npu")` & `torch.compile`)
 
-You write standard PyTorch code. The library handles all NPU kernel compilation and Level Zero optimizations under the hood:
+Use your normal PyTorch patterns. The library automatically routes execution to the Intel NPU:
 
 ```python
 import torch
-import intel_npu_acceleration  # Automatically registers the 'npu' backend!
+import intel_npu_acceleration  # Auto-registers 'npu' device, torch.npu, and Dynamo backend!
 
-class MyModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(128, 64)
-        self.act = torch.nn.GELU()
-        self.fc2 = torch.nn.Linear(64, 10)
+# Option A: Standard PyTorch device movement (.to("npu"))
+model = torch.nn.Linear(128, 10).to("npu")
+x = torch.randn(2, 128, device="npu")
+out = model(x)
 
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-model = MyModel().eval()
-x = torch.randn(1, 128)
-
-# Pure PyTorch:
+# Option B: PyTorch 2.x torch.compile
 compiled_model = torch.compile(model, backend="npu")
-output = compiled_model(x)
+out2 = compiled_model(x)
+
+# Option C: Universal PyTorch Accelerator (PyTorch 2.4+)
+assert torch.accelerator.is_available()
+torch.accelerator.synchronize()
 ```
 
-### 2. One-Line Accelerator / Module Extension
+### 2. Standard `torch.npu` APIs
 
 ```python
-# Option A: One-line accelerate helper
-compiled_model = npu.accelerate(model)
+import torch
+import intel_npu_acceleration
 
-# Option B: Direct module method
-compiled_model = model.compile_npu(mode="reduce-overhead")
+# Device inspection & memory management
+print(f"NPU Available : {torch.npu.is_available()}")
+print(f"Device Name   : {torch.npu.get_device_name(0)}")
+print(f"Device Count  : {torch.npu.device_count()}")
+
+# Level Zero command streams and synchronization
+with torch.npu.device(0):
+    stream = torch.npu.Stream()
+    with torch.npu.stream(stream):
+        out = model(x)
+    stream.synchronize()
+
+torch.npu.synchronize()
+torch.npu.empty_cache()
+
+# Automatic Mixed Precision
+with torch.autocast(device_type="npu", dtype=torch.float16):
+    out = model(x)
 ```
 
 ---
@@ -177,4 +231,4 @@ Run the full automated test suite:
 ```powershell
 pytest
 ```
-* **Status**: 120 test suites passing, 34 subtests passing with 0 warnings.
+* **Status**: 148 tests passing with 0 warnings (upstream `torch.jit.trace` deprecation warnings from OpenVINO conversion are suppressed both in-library and via pytest `filterwarnings`).

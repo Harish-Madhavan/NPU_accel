@@ -3,10 +3,11 @@ Intel NPU Acceleration CLI Entry Point.
 Allows running `python -m intel_npu_acceleration` to inspect diagnostics, manage cache, and verify runtime status.
 """
 
-import sys
 import argparse
+import sys
+
 import intel_npu_acceleration as npu
-from intel_npu_acceleration.info import print_info, get_system_info
+from intel_npu_acceleration.info import print_info
 
 
 def main():
@@ -33,8 +34,7 @@ def main():
     args = parser.parse_args()
 
     if args.version:
-        info = get_system_info()
-        print(f"intel_npu_acceleration (PyTorch: {info['pytorch_version']}, OpenVINO: {info['openvino_version']})")
+        print(f"intel_npu_acceleration {npu.__version__}")
         sys.exit(0)
 
     if args.clear_cache:

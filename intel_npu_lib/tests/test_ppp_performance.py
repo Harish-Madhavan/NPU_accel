@@ -1,12 +1,15 @@
+import logging
 import unittest
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import logging
+
 from intel_npu_acceleration.frontend import (
-    compile_to_npu,
     _GRAPH_CACHE,
+    compile_to_npu,
 )
+
 
 class SimpleCVModel(nn.Module):
     def __init__(self):

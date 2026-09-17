@@ -1,8 +1,10 @@
-from typing import Optional, List, Dict, Any
+import logging
+from typing import Any
+
 import torch
 import torch.fx
-import logging
-from ..registry import OpRegistry
+
+from intel_npu_acceleration.registry import OpRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -10,13 +12,16 @@ logger = logging.getLogger(__name__)
 def _is_node_supported(node: torch.fx.Node, root_model: torch.nn.Module) -> bool:
     """Check if an FX graph node is supported by the OpRegistry."""
     if node.op == "call_function":
-        return OpRegistry.get_function(node.target) is not None
+        return OpRegistry.is_function_supported(node.target)
     if node.op == "call_method":
-        return OpRegistry.get_method(node.target) is not None
+        return OpRegistry.is_method_supported(node.target)
     if node.op == "call_module":
         target_sub = root_model
-        for atom in str(node.target).split("."):
-            target_sub = getattr(target_sub, atom)
+        try:
+            for atom in str(node.target).split("."):
+                target_sub = getattr(target_sub, atom)
+        except AttributeError:
+            return False
         return OpRegistry.get_module(type(target_sub)) is not None
     return True
 
@@ -28,10 +33,10 @@ def partition_and_compile_hybrid(
     performance_hint: str,
     num_streams: int,
     dynamic_buckets: bool,
-    bucket_sizes: Optional[List[int]],
+    bucket_sizes: list[int] | None,
     dynamic_dim: int,
     clone_outputs: bool,
-    preprocess_config: Optional[dict],
+    preprocess_config: dict | None,
 ) -> torch.nn.Module:
     """
     Automated Hybrid Graph Partitioning & CPU Fallback.
@@ -88,9 +93,9 @@ def partition_and_compile_hybrid(
             split_parent(*example_input_tuple)
         except Exception as e:
             logger.debug(f"Calibration forward pass notice: {e}")
-
-    for h in hooks:
-        h.remove()
+        finally:
+            for h in hooks:
+                h.remove()
 
     from .compiler import compile_to_npu  # Delay-import to avoid circular dependency
 
@@ -100,7 +105,7 @@ def partition_and_compile_hybrid(
 
         # Check if the child module is a GraphModule before checking graph.nodes
         if not hasattr(child, "graph"):
-            is_supported = OpRegistry.get_module(type(child)) is not None
+            is_supported = OpRegistry.is_module_supported(type(child))
         else:
             for n in child.graph.nodes:
                 if n.op not in ["placeholder", "output", "get_attr"]:

@@ -4,20 +4,22 @@ import sys
 # Ensure library is importable when run directly from repository
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
 
-import time
 import argparse
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
+
 import intel_npu_acceleration as npu
 
 # --- Model Definition ---
 
 class Net(nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.fc1 = nn.Linear(9216, 128)
@@ -65,149 +67,105 @@ def train(model, device, train_loader, optimizer, epoch):
 
 
 def run_latency_benchmark(model, npu_model, test_set, num_samples=200):
-    """
-    Run a fair, head-to-head latency comparison on CPU vs NPU.
-    Both targets run sequentially with batch_size=1.
-    """
+    """Latency benchmark — sequential batch=1, perf_counter + inference_mode."""
     print(f"\nRunning Latency Benchmark (sequential execution on {num_samples} single images)...")
 
-    # 1. CPU Latency Benchmark
+    def bench(target, name):
+        latencies = []
+        with torch.inference_mode():
+            for i in range(num_samples):
+                img, _ = test_set[i]
+                img = img.unsqueeze(0)
+                t0 = time.perf_counter()
+                _ = target(img)
+                dt = (time.perf_counter() - t0) * 1000.0
+                if i >= 10:
+                    latencies.append(dt)
+        avg = sum(latencies) / len(latencies) if latencies else 0
+        print(f"  {name} Sequential Latency: {avg:.3f} ms / image")
+        return avg
+
     model.eval()
-    cpu_latencies = []
-    with torch.no_grad():
-        for i in range(num_samples):
-            img, _ = test_set[i]
-            img = img.unsqueeze(0)  # Shape (1, 1, 28, 28)
-
-            t0 = time.time()
-            _ = model(img)
-            t1 = time.time()
-            if i >= 10:  # Warmup
-                cpu_latencies.append((t1 - t0) * 1000.0)  # ms
-
-    avg_cpu_lat = sum(cpu_latencies) / len(cpu_latencies)
-
-    # 2. NPU Latency Benchmark
-    npu_latencies = []
-    with torch.no_grad():
-        for i in range(num_samples):
-            img, _ = test_set[i]
-            img = img.unsqueeze(0)
-
-            t0 = time.time()
-            _ = npu_model(img)
-            t1 = time.time()
-            if i >= 10:  # Warmup
-                npu_latencies.append((t1 - t0) * 1000.0)  # ms
-
-    avg_npu_lat = sum(npu_latencies) / len(npu_latencies)
-
-    print(f"  CPU Sequential Latency: {avg_cpu_lat:.3f} ms / image")
-    print(f"  NPU Sequential Latency: {avg_npu_lat:.3f} ms / image")
-    return avg_cpu_lat, avg_npu_lat
+    avg_cpu = bench(model, "CPU")
+    avg_npu = bench(npu_model, "NPU")
+    return avg_cpu, avg_npu
 
 
 def run_throughput_benchmark(model, npu_model, test_loader_large, test_loader_single, max_batches=10):
-    """
-    Measure throughput in images / second.
-    CPU runs with large batch size (highly parallelized).
-    NPU runs with multi-stream asynchronous pipelining for maximum VPU core saturation.
-    """
+    """Throughput — large batch CPU vs pipelined NPU."""
     print("\nRunning Throughput Benchmark...")
-
-    # 1. CPU Throughput
     model.eval()
-    cpu_images_processed = 0
-    t0 = time.time()
-    with torch.no_grad():
+    cpu_images = 0
+    t0 = time.perf_counter()
+    with torch.inference_mode():
         for batch_idx, (data, _) in enumerate(test_loader_large):
             if batch_idx >= max_batches:
                 break
             _ = model(data)
-            cpu_images_processed += data.size(0)
-    cpu_duration = time.time() - t0
-    cpu_throughput = cpu_images_processed / cpu_duration if cpu_duration > 0 else 0
+            cpu_images += data.size(0)
+    cpu_dur = time.perf_counter() - t0
+    cpu_thr = cpu_images / cpu_dur if cpu_dur > 0 else 0
 
-    # 2. NPU Throughput
-    npu_images_processed = 0
-    t0 = time.time()
-    num_requests_to_run = max_batches * test_loader_large.batch_size
-
-    if hasattr(npu_model, "infer_async") and hasattr(npu_model, "wait_async") and getattr(npu_model, "num_streams", 1) > 1:
+    npu_images = 0
+    t0 = time.perf_counter()
+    num_req = max_batches * test_loader_large.batch_size
+    use_async = (
+        hasattr(npu_model, "infer_async")
+        and hasattr(npu_model, "wait_async")
+        and getattr(npu_model, "num_streams", 1) > 1
+    )
+    if use_async:
         from collections import deque
-        active_handles = deque()
-        iterator = iter(test_loader_single)
 
-        with torch.no_grad():
-            # Fill the multi-stream execution pipeline
-            for _ in range(min(npu_model.num_streams, num_requests_to_run)):
+        active: deque = deque()
+        it = iter(test_loader_single)
+        with torch.inference_mode():
+            for _ in range(min(npu_model.num_streams, num_req)):
                 try:
-                    data, _ = next(iterator)
-                    handle = npu_model.infer_async(data)
-                    active_handles.append(handle)
-                    npu_images_processed += 1
+                    data, _ = next(it)
+                    active.append(npu_model.infer_async(data))
+                    npu_images += 1
                 except StopIteration:
                     break
-
-            # Interleave wait and submit to keep streams saturated
-            while active_handles:
-                oldest_handle = active_handles.popleft()
-                _ = npu_model.wait_async(oldest_handle)
-
-                if npu_images_processed < num_requests_to_run:
+            while active:
+                h = active.popleft()
+                _ = npu_model.wait_async(h)
+                if npu_images < num_req:
                     try:
-                        data, _ = next(iterator)
-                        handle = npu_model.infer_async(data)
-                        active_handles.append(handle)
-                        npu_images_processed += 1
+                        data, _ = next(it)
+                        active.append(npu_model.infer_async(data))
+                        npu_images += 1
                     except StopIteration:
                         pass
     else:
-        # Fallback to synchronous execution
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch_idx, (data, _) in enumerate(test_loader_single):
-                if batch_idx >= num_requests_to_run:
+                if batch_idx >= num_req:
                     break
                 _ = npu_model(data)
-                npu_images_processed += 1
-
-    npu_duration = time.time() - t0
-    npu_throughput = npu_images_processed / npu_duration if npu_duration > 0 else 0
-
-    print(f"  CPU Throughput (Batch={test_loader_large.batch_size}): {cpu_throughput:.2f} images/sec")
-    print(f"  NPU Throughput (Streams={getattr(npu_model, 'num_streams', 1)}): {npu_throughput:.2f} images/sec")
-    return cpu_throughput, npu_throughput
+                npu_images += 1
+    npu_dur = time.perf_counter() - t0
+    npu_thr = npu_images / npu_dur if npu_dur > 0 else 0
+    print(f"  CPU Throughput (Batch={test_loader_large.batch_size}): {cpu_thr:.2f} images/sec")
+    print(f"  NPU Throughput (Streams={getattr(npu_model, 'num_streams', 1)}): {npu_thr:.2f} images/sec")
+    return cpu_thr, npu_thr
 
 
 def evaluate_accuracy(model, npu_model, test_loader):
     print("\nEvaluating Accuracy...")
-
-    # CPU Accuracy
     model.eval()
-    cpu_correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            output = model(data)
-            pred = output.argmax(dim=1, keepdim=True)
-            cpu_correct += pred.eq(target.view_as(pred)).sum().item()
 
-    cpu_acc = 100.0 * cpu_correct / len(test_loader.dataset)
-
-    # NPU Accuracy (expects input on CPU, compiles/offloads internally)
-    npu_correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            # Evaluate using NPU compiled model
-            # To evaluate correctly on batch size 1:
-            for i in range(data.size(0)):
-                img = data[i:i+1]
-                tgt = target[i:i+1]
-                output = npu_model(img)
+    def _acc(target_model):
+        correct = 0
+        with torch.inference_mode():
+            for data, target in test_loader:
+                output = target_model(data)
                 pred = output.argmax(dim=1, keepdim=True)
-                npu_correct += pred.eq(tgt.view_as(pred)).sum().item()
+                correct += pred.eq(target.view_as(pred)).sum().item()
+        return 100.0 * correct / len(test_loader.dataset)
 
-    npu_acc = 100.0 * npu_correct / len(test_loader.dataset)
-
+    cpu_acc = _acc(model)
+    npu_acc = _acc(npu_model)
     print(f"  CPU Test Accuracy: {cpu_acc:.2f}%")
     print(f"  NPU Test Accuracy: {npu_acc:.2f}%")
     return cpu_acc, npu_acc

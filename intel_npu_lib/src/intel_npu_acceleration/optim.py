@@ -5,9 +5,13 @@ This module provides hardware-accelerated optimizer implementations where parame
 and gradient momentum updates execute directly on the Intel NPU via fused Level Zero kernels.
 """
 
+from collections.abc import Callable
+
 import torch
-from typing import List, Optional, Tuple, Callable, Any
+
 from . import _functional as F_npu
+
+__all__ = ["NPUAdam", "NPUSGD", "clip_grad_norm_"]
 
 
 class NPUAdam(torch.optim.Optimizer):
@@ -41,7 +45,7 @@ class NPUAdam(torch.optim.Optimizer):
         self,
         params,
         lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.999),
+        betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
     ) -> None:
@@ -56,11 +60,11 @@ class NPUAdam(torch.optim.Optimizer):
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """Perform a single optimization step on the NPU hardware.
 
         Args:
@@ -145,17 +149,17 @@ class NPUSGD(torch.optim.Optimizer):
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
 
-        defaults = dict(
-            lr=lr,
-            momentum=momentum,
-            dampening=dampening,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-        )
+        defaults = {
+            "lr": lr,
+            "momentum": momentum,
+            "dampening": dampening,
+            "weight_decay": weight_decay,
+            "nesterov": nesterov,
+        }
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """Perform a single SGD optimization step on the NPU hardware.
 
         Args:
@@ -193,3 +197,47 @@ class NPUSGD(torch.optim.Optimizer):
                     state["momentum_buffer"] = new_buf
 
         return loss
+
+
+def clip_grad_norm_(
+    parameters,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+) -> torch.Tensor:
+    """Clips gradient norm of an iterable of parameters.
+
+    Args:
+        parameters: Iterable of Tensors or a single Tensor that will have gradients normalized.
+        max_norm (float): Max norm of the gradients.
+        norm_type (float, optional): Type of the used p-norm. Defaults to 2.0.
+        error_if_nonfinite (bool, optional): If True, raises RuntimeError on non-finite norm. Defaults to False.
+
+    Returns:
+        torch.Tensor: Total norm of the parameter gradients.
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    grads = [p.grad for p in parameters if p.grad is not None]
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+
+    if norm_type == float("inf"):
+        norms = [g.detach().abs().max() for g in grads]
+        total_norm = torch.stack(norms).max() if len(norms) > 0 else torch.tensor(0.0)
+    else:
+        total_norm = torch.norm(torch.stack([torch.norm(g.detach(), norm_type) for g in grads]), norm_type)
+
+    if error_if_nonfinite and (torch.isnan(total_norm) or torch.isinf(total_norm)):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients is non-finite ({total_norm}), so it cannot be clipped."
+        )
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+    for g in grads:
+        g.detach().mul_(clip_coef_clamped)
+    return total_norm
+

@@ -6,26 +6,63 @@ representation (IR) binary blobs and Level Zero hardware executables. Disk cachi
 eliminates model compilation overhead during subsequent application startups.
 """
 
-import os
-import time
+__all__ = [
+    "get_cache_dir",
+    "set_cache_dir",
+    "ensure_cache_dir",
+    "clear_cache",
+    "get_cache_size",
+    "get_cache_version",
+    "clean_old_cache",
+]
+
 import logging
-from typing import Tuple, Optional
+import os
+import threading
+import time
 
 logger = logging.getLogger("intel_npu_acceleration.cache")
 
-_CACHE_DIR: Optional[str] = None
+_CACHE_DIR: str | None = None
 _LAST_CLEANUP_TIME: float = 0.0
+_CACHE_LOCK = threading.Lock()
 
 
 def _init_default_cache() -> None:
-    """Initialize the default cache directory in the workspace or repository root."""
+    """Initialize the default cache directory if one already exists.
+
+    Priority: ``INTEL_NPU_CACHE_DIR`` / ``NPU_CACHE_DIR`` env vars first
+    (created on demand), then an existing ``./npu_cache`` next to the
+    current working directory or the repo checkout.
+
+    Deliberately side-effect free apart from the explicit env-var case:
+    never creates directories on import unless the user explicitly asked
+    for a location via environment. Directory creation otherwise happens
+    lazily in `set_cache_dir` / `ensure_cache_dir`.
+    """
     global _CACHE_DIR
     try:
         from .device import _C
     except ImportError:
-        _C = None
+        _C = None  # noqa: N806
 
     try:
+        # Explicit user request always wins (docs promise this variable).
+        for env_var in ("INTEL_NPU_CACHE_DIR", "NPU_CACHE_DIR"):
+            env_dir = os.environ.get(env_var)
+            if env_dir:
+                target = os.path.abspath(os.path.expandvars(os.path.expanduser(env_dir)))
+                try:
+                    os.makedirs(target, exist_ok=True)
+                except Exception as e:
+                    logger.debug(f"Failed to create env cache dir '{target}': {e}")
+                    continue
+                _CACHE_DIR = target
+                logger.info(f"Setting NPU cache directory from {env_var}: {target}")
+                if _C is not None and hasattr(_C, "set_cache_dir"):
+                    _C.set_cache_dir(target)
+                return
+
         possible_cache_dirs = [
             os.path.join(os.getcwd(), "npu_cache"),
             os.path.abspath(
@@ -44,17 +81,6 @@ def _init_default_cache() -> None:
             logger.info(f"Setting NPU cache directory: {cache_dir}")
             if _C is not None and hasattr(_C, "set_cache_dir"):
                 _C.set_cache_dir(cache_dir)
-        else:
-            cwd_cache = os.path.join(os.getcwd(), "npu_cache")
-            if not os.path.exists(cwd_cache):
-                try:
-                    os.makedirs(cwd_cache, exist_ok=True)
-                    _CACHE_DIR = cwd_cache
-                    logger.info(f"Created NPU cache directory: {cwd_cache}")
-                    if _C is not None and hasattr(_C, "set_cache_dir"):
-                        _C.set_cache_dir(cwd_cache)
-                except Exception:
-                    pass
     except Exception as e:
         logger.debug(f"Failed to initialize disk cache: {e}")
 
@@ -63,7 +89,29 @@ def _init_default_cache() -> None:
 _init_default_cache()
 
 
-def get_cache_dir() -> Optional[str]:
+def ensure_cache_dir(cache_dir: str | None = None) -> str | None:
+    """Ensure the cache directory exists, creating it on demand.
+
+    Args:
+        cache_dir: Directory to ensure. Defaults to the configured cache dir.
+
+    Returns:
+        The ensured directory path, or None if unconfigured.
+    """
+    global _CACHE_DIR
+    target = cache_dir or _CACHE_DIR
+    if not target:
+        return None
+    try:
+        os.makedirs(target, exist_ok=True)
+        _CACHE_DIR = target
+        return target
+    except Exception as e:
+        logger.debug(f"Failed to create cache directory '{target}': {e}")
+        return None
+
+
+def get_cache_dir() -> str | None:
     """Get the absolute filesystem path of the current NPU model cache directory.
 
     Returns:
@@ -89,6 +137,10 @@ def set_cache_dir(cache_dir: str) -> None:
         >>> npu.set_cache_dir("/path/to/my_npu_cache")
     """
     global _CACHE_DIR
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception as e:
+        logger.debug(f"Failed to create cache directory '{cache_dir}': {e}")
     _CACHE_DIR = cache_dir
     logger.info(f"Setting NPU cache directory: {cache_dir}")
     try:
@@ -128,7 +180,7 @@ def clear_cache() -> None:
                 logger.debug(f"Failed to remove cache directory {name}: {e}")
 
 
-def get_cache_size() -> Tuple[int, int]:
+def get_cache_size() -> tuple[int, int]:
     """Calculate the total size and file count of the NPU disk cache.
 
     Returns:
@@ -177,7 +229,8 @@ def clean_old_cache(max_size_mb: int = 2048, max_files: int = 10000) -> None:
     """Prune the oldest cached models (LRU based on modification time).
 
     Ensures the disk cache does not exceed specified capacity limits. Throttled to execute
-    at most once every 60 seconds to avoid filesystem overhead during tight training loops.
+    at most once per `NPU_CACHE_THROTTLE_SEC` (see `config.cache_throttle_seconds`)
+    to avoid filesystem overhead during tight training loops.
 
     Args:
         max_size_mb (int, optional): Maximum allowed disk cache size in megabytes. Defaults to 2048.
@@ -185,42 +238,60 @@ def clean_old_cache(max_size_mb: int = 2048, max_files: int = 10000) -> None:
     """
     global _LAST_CLEANUP_TIME
 
-    current_time = time.time()
-    if current_time - _LAST_CLEANUP_TIME < 60.0:
-        return
+    from .config import config as npu_config
 
-    cache_dir = get_cache_dir()
-    if not cache_dir or not os.path.exists(cache_dir):
-        return
+    with _CACHE_LOCK:
+        current_time = time.time()
+        if current_time - _LAST_CLEANUP_TIME < npu_config.cache_throttle_seconds:
+            return
 
-    _LAST_CLEANUP_TIME = current_time
+        cache_dir = get_cache_dir()
+        if not cache_dir or not os.path.exists(cache_dir):
+            return
 
-    try:
-        files = []
-        for root, _, filenames in os.walk(cache_dir):
-            for name in filenames:
-                file_path = os.path.join(root, name)
-                try:
-                    stat = os.stat(file_path)
-                    files.append((file_path, stat.st_mtime, stat.st_size))
-                except Exception:
-                    pass
+        try:
+            files = []
+            for root, _, filenames in os.walk(cache_dir):
+                for name in filenames:
+                    file_path = os.path.join(root, name)
+                    try:
+                        stat = os.stat(file_path)
+                        files.append((file_path, stat.st_mtime, stat.st_size))
+                    except Exception:
+                        pass
 
-        total_size = sum(f[2] for f in files)
-        max_bytes = max_size_mb * 1024 * 1024
+            total_size = sum(f[2] for f in files)
+            max_bytes = max_size_mb * 1024 * 1024
 
-        if total_size > max_bytes or len(files) > max_files:
+            if total_size <= max_bytes and len(files) <= max_files:
+                _LAST_CLEANUP_TIME = current_time
+                return
+
             files.sort(key=lambda x: x[1])
-            for file_path, _, size in files:
-                if total_size <= max_bytes and len(files) <= max_files:
+
+            removed = 0
+            for file_path, _, size in list(files):
+                if total_size <= max_bytes and (len(files) - removed) <= max_files:
                     break
                 try:
                     os.remove(file_path)
                     total_size -= size
-                    files.pop(0)
+                    removed += 1
                 except Exception as e:
                     logger.debug(
                         f"Failed to remove cache file {os.path.basename(file_path)}: {e}"
                     )
-    except Exception as e:
-        logger.debug(f"Error during cache cleanup: {e}")
+
+            for root, dirs, _ in os.walk(cache_dir, topdown=False):
+                for d in dirs:
+                    dir_path = os.path.join(root, d)
+                    try:
+                        if not os.listdir(dir_path):
+                            os.rmdir(dir_path)
+                    except Exception:
+                        pass
+
+            _LAST_CLEANUP_TIME = current_time
+        except Exception as e:
+            logger.debug(f"Error during cache cleanup: {e}")
+            return

@@ -3,9 +3,11 @@ Unit tests for out-of-the-box, seamless PyTorch integration and convenience APIs
 """
 
 import unittest
+
 import torch
 import torch.nn as nn
 from torch.testing import assert_close
+
 import intel_npu_acceleration as npu
 
 

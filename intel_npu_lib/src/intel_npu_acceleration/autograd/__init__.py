@@ -1,31 +1,36 @@
 import torch
 import torch.fx
-from .. import _functional as F_npu
+
+from intel_npu_acceleration import _functional as F_npu
+
 from .functions import (
-    NPUMatMul,
     NPUAdd,
-    NPUSub,
-    NPUMul,
-    NPUReLU,
-    NPUSoftmax,
-    NPULinear,
-    NPUGeLU,
-    NPUSiLU,
-    NPURMSNorm,
+    NPUBCEWithLogitsLoss,
+    NPUCat,
     NPUConv2d,
-    NPULayerNorm,
+    NPUCrossEntropyLoss,
+    NPUDiv,
+    NPUEmbedding,
+    NPUGeLU,
     NPUHardSigmoid,
     NPUHardSwish,
-    NPUNeg,
-    NPUDiv,
-    NPUTranspose,
-    NPUReshape,
-    NPUCat,
-    NPUStack,
+    NPUL1Loss,
+    NPULayerNorm,
+    NPULinear,
+    NPUMatMul,
     NPUMean,
-    NPUEmbedding,
-    NPUScaledDotProductAttention,
     NPUMSELoss,
+    NPUMul,
+    NPUNeg,
+    NPUReLU,
+    NPUReshape,
+    NPURMSNorm,
+    NPUScaledDotProductAttention,
+    NPUSiLU,
+    NPUSoftmax,
+    NPUStack,
+    NPUSub,
+    NPUTranspose,
 )
 
 
@@ -142,6 +147,24 @@ def mse_loss(pred, target, reduction="mean"):
     return F_npu.mse_loss(pred, target, reduction=reduction)
 
 
+def cross_entropy_loss(pred, target, reduction="mean"):
+    if _should_use_autograd(pred, target):
+        return NPUCrossEntropyLoss.apply(pred, target, reduction)
+    return F_npu.cross_entropy_loss(pred, target, reduction=reduction)
+
+
+def l1_loss(pred, target, reduction="mean"):
+    if _should_use_autograd(pred, target):
+        return NPUL1Loss.apply(pred, target, reduction)
+    return F_npu.l1_loss(pred, target, reduction=reduction)
+
+
+def bce_with_logits_loss(input, target, weight=None, reduction="mean", pos_weight=None):
+    if _should_use_autograd(input, target):
+        return NPUBCEWithLogitsLoss.apply(input, target, weight, reduction, pos_weight)
+    return F_npu.bce_with_logits_loss(input, target, weight=weight, reduction=reduction, pos_weight=pos_weight)
+
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
     if _should_use_autograd(query, key, value):
         return NPUScaledDotProductAttention.apply(query, key, value, attn_mask, dropout_p, is_causal, scale)
@@ -174,4 +197,8 @@ torch.fx.wrap(stack)
 torch.fx.wrap(mean)
 torch.fx.wrap(embedding)
 torch.fx.wrap(mse_loss)
+torch.fx.wrap(cross_entropy_loss)
+torch.fx.wrap(l1_loss)
+torch.fx.wrap(bce_with_logits_loss)
 torch.fx.wrap(scaled_dot_product_attention)
+

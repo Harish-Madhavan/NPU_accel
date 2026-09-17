@@ -1,6 +1,8 @@
-import unittest
-import torch
 import operator
+import unittest
+
+import torch
+
 import intel_npu_acceleration.functional as npu_func
 from intel_npu_acceleration.registry import OpRegistry
 

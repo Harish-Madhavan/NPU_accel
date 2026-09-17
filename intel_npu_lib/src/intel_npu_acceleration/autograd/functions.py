@@ -1,9 +1,11 @@
-import torch
 import math
-from .. import _functional as F_npu
+
+import torch
+
+from intel_npu_acceleration import _functional as F_npu
 
 
-def _unbroadcast(grad, target_shape):
+def _unbroadcast(grad: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     if grad.shape == target_shape:
         return grad
     grad_dim = len(grad.shape)
@@ -273,13 +275,13 @@ class NPULayerNorm(torch.autograd.Function):
         grad_input = None
         if ctx.needs_input_grad[0]:
             w = weight.float() if weight is not None else 1.0
-            dL_dxn = go * w
+            dl_dxn = go * w
 
-            N = math.prod(normalized_shape)
-            mean_dL_dxn = dL_dxn.sum(dim=axes, keepdim=True) / N
-            mean_dL_dxn_xn = (dL_dxn * xn).sum(dim=axes, keepdim=True) / N
+            n_elements = math.prod(normalized_shape)
+            mean_dl_dxn = dl_dxn.sum(dim=axes, keepdim=True) / n_elements
+            mean_dl_dxn_xn = (dl_dxn * xn).sum(dim=axes, keepdim=True) / n_elements
 
-            grad_input = ((dL_dxn - mean_dL_dxn - xn * mean_dL_dxn_xn) / rms).to(grad_output.dtype)
+            grad_input = ((dl_dxn - mean_dl_dxn - xn * mean_dl_dxn_xn) / rms).to(grad_output.dtype)
 
         return grad_input, None, grad_weight, grad_bias, None
 
@@ -565,4 +567,62 @@ class NPUMSELoss(torch.autograd.Function):
         grad_pred = grad_output * scale * (pred - target)
         grad_target = -grad_pred
         return grad_pred, grad_target, None
+
+
+class NPUCrossEntropyLoss(torch.autograd.Function):
+    """NPU-accelerated Cross Entropy loss with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, pred, target, reduction="mean"):
+        ctx.save_for_backward(pred, target)
+        ctx.reduction = reduction
+        return F_npu.cross_entropy_loss(pred, target, reduction=reduction)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pred, target = ctx.saved_tensors
+        red = ctx.reduction
+        grad_pred = F_npu.cross_entropy_loss_backward(grad_output, pred, target, reduction=red)
+        return grad_pred, None, None
+
+
+class NPUL1Loss(torch.autograd.Function):
+    """NPU-accelerated L1 loss with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, pred, target, reduction="mean"):
+        ctx.save_for_backward(pred, target)
+        ctx.reduction = reduction
+        return F_npu.l1_loss(pred, target, reduction=reduction)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pred, target = ctx.saved_tensors
+        red = ctx.reduction
+        grad_pred = F_npu.l1_loss_backward(grad_output, pred, target, reduction=red)
+        grad_target = -grad_pred
+        return grad_pred, grad_target, None
+
+
+class NPUBCEWithLogitsLoss(torch.autograd.Function):
+    """NPU-accelerated Binary Cross Entropy with Logits Loss with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, target, weight=None, reduction="mean", pos_weight=None):
+        ctx.save_for_backward(input, target, weight, pos_weight)
+        ctx.reduction = reduction
+        return F_npu.bce_with_logits_loss(
+            input, target, weight=weight, reduction=reduction, pos_weight=pos_weight
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, target, weight, pos_weight = ctx.saved_tensors
+        red = ctx.reduction
+        grad_input = F_npu.bce_with_logits_loss_backward(
+            grad_output, input, target, weight=weight, reduction=red, pos_weight=pos_weight
+        )
+        return grad_input, None, None, None, None
+
+
 

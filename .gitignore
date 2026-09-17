@@ -44,6 +44,7 @@ env/
 .ninja_log
 build_log.txt
 intel_npu_lib/build_log.txt
+logs/
 
 # --- Intel NPU Runtime Cache ---
 npu_cache/

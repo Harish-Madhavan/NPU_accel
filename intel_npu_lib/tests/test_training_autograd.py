@@ -1,10 +1,12 @@
 import unittest
+
 import torch
 import torch.nn as nn
 from torch.testing import assert_close
+
 import intel_npu_acceleration as npu
 import intel_npu_acceleration.functional as F_npu
-from intel_npu_acceleration.optim import NPUAdam, NPUSGD
+from intel_npu_acceleration.optim import NPUSGD, NPUAdam
 
 
 class TestTrainingAndOptimizers(unittest.TestCase):

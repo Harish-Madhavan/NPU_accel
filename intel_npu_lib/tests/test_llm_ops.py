@@ -1,9 +1,11 @@
-import torch
-import unittest
-import intel_npu_acceleration
 import time
+import unittest
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import intel_npu_acceleration
 
 
 # Custom _torch_rmsnorm for reference, matching the one in __init__.py

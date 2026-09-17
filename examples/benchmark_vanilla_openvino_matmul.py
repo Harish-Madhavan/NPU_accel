@@ -6,11 +6,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import argparse
 import time
+
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
 import openvino.properties as ov_props
 import openvino.properties.hint as ov_hints
+
 
 def main():
     parser = argparse.ArgumentParser(description="Vanilla OpenVINO MatMul Benchmark")
@@ -95,7 +97,7 @@ def main():
         in_flight = 0
         req_idx = 0
 
-        for i in range(args.iterations):
+        for _i in range(args.iterations):
             req = infer_requests[req_idx]
             req.set_tensor("A", ov.Tensor(input_a))
             req.set_tensor("B", ov.Tensor(input_b))

@@ -1,8 +1,10 @@
 import unittest
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.testing import assert_close
+
 import intel_npu_acceleration as npu
 import intel_npu_acceleration.functional as F_npu
 
@@ -139,7 +141,7 @@ class TestPyTorchConformance(unittest.TestCase):
 
         # Verify loss and updated weights match
         assert_close(loss_n, loss_c, atol=1e-2, rtol=1e-2)
-        for p_cpu, p_npu in zip(model_cpu.parameters(), model_npu.parameters()):
+        for p_cpu, p_npu in zip(model_cpu.parameters(), model_npu.parameters(), strict=False):
             assert_close(p_npu, p_cpu, atol=1e-2, rtol=1e-2)
 
     def test_torch_compile_modes_conformance(self):

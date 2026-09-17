@@ -1,6 +1,9 @@
 import unittest
+
 import torch
+
 import intel_npu_acceleration as npu
+
 
 class TestNewOps(unittest.TestCase):
     def test_squeeze(self):

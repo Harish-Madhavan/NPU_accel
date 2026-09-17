@@ -1,17 +1,19 @@
 import unittest
+
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
 import torch
 import torch.nn as nn
+
 from intel_npu_acceleration.frontend.transformations import (
+    apply_pre_post_processing,
     clean_node_name,
-    fold_scalar_parameter_inputs,
-    reshape_model_inputs_to_static,
     configure_input_ppp,
     configure_output_ppp,
-    apply_pre_post_processing,
+    fold_scalar_parameter_inputs,
     optimize_ov_model,
+    reshape_model_inputs_to_static,
 )
 
 

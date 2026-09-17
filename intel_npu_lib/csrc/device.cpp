@@ -154,6 +154,31 @@ void NPUBackend::setPerformanceHint(const std::string& hint) {
     } else {
         m_performance_hint = ov::hint::PerformanceMode::LATENCY;
     }
+    // Apply immediately so in-flight and future compiles observe it —
+    // previously the member was only consulted by the eager compile path.
+    if (m_core) {
+        try {
+            m_core->set_property("NPU", {{ov::hint::performance_mode.name(), m_performance_hint}});
+        } catch (const std::exception& e) {
+            std::cerr << "[Intel NPU] Failed to apply performance hint: " << e.what() << std::endl;
+        }
+    }
+}
+
+std::string NPUBackend::getEagerDevice() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_eager_device;
+}
+
+std::string NPUBackend::getCompileConfigKey() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::string hint = "LATENCY";
+    if (m_performance_hint == ov::hint::PerformanceMode::THROUGHPUT) {
+        hint = "THROUGHPUT";
+    } else if (m_performance_hint == ov::hint::PerformanceMode::CUMULATIVE_THROUGHPUT) {
+        hint = "CUMULATIVE_THROUGHPUT";
+    }
+    return hint + "_" + m_eager_device;
 }
 
 void NPUBackend::setEagerDevice(const std::string& device) {
@@ -188,6 +213,26 @@ ov::CompiledModel NPUBackend::getOrCompileModel(const std::string& key,
             {ov::hint::performance_mode.name(), m_performance_hint},
             {ov::hint::inference_precision.name(), ov::element::f16},
         };
+
+        // Match the graph-mode (Python) Level Zero utilization tuning so
+        // eager kernels get the same Turbo / memory / QDQ treatment.
+        // Each key is gated on driver support (probed at init).
+        static const std::pair<const char*, const char*> NPU_EAGER_PROPS[] = {
+            {"NPU_TURBO", "YES"},
+            {"NPU_DISABLE_IDLE_MEMORY_PRUNING", "YES"},
+            {"NPU_RUN_INFERENCES_SEQUENTIALLY", "NO"},
+            {"NPU_DEFER_WEIGHTS_LOAD", "YES"},
+            {"NPU_QDQ_OPTIMIZATION", "YES"},
+            {"NPU_QDQ_OPTIMIZATION_AGGRESSIVE", "YES"},
+            {"NPU_COMPILATION_MODE_PARAMS", "optimization-level=2"},
+            {"NPU_USE_SDA", "YES"},
+            {"NPU_BACKEND_TYPE", "LEVEL_ZERO"},
+        };
+        for (const auto& kv : NPU_EAGER_PROPS) {
+            if (isPropertySupported(kv.first)) {
+                compile_props[kv.first] = kv.second;
+            }
+        }
 
         // Add compilation-mode tuning only when the driver supports it.
         if (isPropertySupported("NPU_COMPILATION_MODE_CONFIG")) {
@@ -273,6 +318,7 @@ ov::InferRequest NPUBackend::getOrCachedInferRequest(const std::string& key) {
 
 void NPUBackend::setCacheDir(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_core) return;
     try {
         m_core->set_property(ov::cache_dir(path));
     } catch (const std::exception& e) {
@@ -282,6 +328,7 @@ void NPUBackend::setCacheDir(const std::string& path) {
 
 void NPUBackend::setProperty(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_core) return;
     if (!isPropertySupported(key)) {
         std::cerr << "[Intel NPU] Property '" << key
                   << "' is not supported by this driver; ignoring." << std::endl;
@@ -326,6 +373,12 @@ void set_npu_performance_hint(const std::string& hint) {
 }
 void set_npu_eager_device(const std::string& device) {
     NPUBackend::getInstance().setEagerDevice(device);
+}
+void set_npu_turbo(bool enable) {
+    NPUBackend::getInstance().setProperty("NPU_TURBO", enable ? "YES" : "NO");
+}
+void set_npu_sda(bool enable) {
+    NPUBackend::getInstance().setProperty("NPU_USE_SDA", enable ? "YES" : "NO");
 }
 void clear_cpp_model_cache() {
     NPUBackend::getInstance().clearCache();

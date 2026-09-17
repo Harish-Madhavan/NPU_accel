@@ -1,6 +1,19 @@
+"""Build script for the Intel NPU C++ extension (``intel_npu_acceleration._C``).
+
+Single-source-of-truth policy: package name, version, dependencies,
+entry-points, and package layout all live in ``pyproject.toml``. This file
+only defines *how* to build the native extension.
+
+Environment knobs:
+    NPU_NO_BUILD_EXT=1   Skip the C++ extension (pure-Python install).
+    NPU_VERBOSE_BUILD=1  Echo OpenVINO discovery details.
+    OPENVINO_DIR / INTEL_OPENVINO_DIR / OPENVINO_PACKAGE_DIR
+                         Extra hints for locating OpenVINO headers/libs.
+"""
+
 import os
-import sys
 import site
+import sys
 
 # Ensure C++20 flags are set on Windows for MSVC
 if sys.platform == "win32":
@@ -17,141 +30,207 @@ if sys.platform == "win32":
         if "/std:c++" not in existing:
             os.environ[var] = f"{existing} {_msvc_inject}".strip()
 
-from setuptools import setup, find_packages
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+from setuptools import setup
 
 
-# Helper to find sources
 def get_sources():
-    csrc_dir = os.path.join(os.path.dirname(__file__), "csrc")
-    # Explicitly list sources to ensure order and inclusion
+    """Return the ordered list of C++ sources for the ``_C`` extension."""
+    csrc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
     sources = [
         os.path.join(csrc_dir, "bindings.cpp"),
         os.path.join(csrc_dir, "device.cpp"),
         os.path.join(csrc_dir, "ops.cpp"),
     ]
+    missing = [s for s in sources if not os.path.isfile(s)]
+    if missing:
+        raise FileNotFoundError(f"C++ sources missing: {missing}")
     return sources
 
 
-def find_openvino():
-    """
-    Attempts to locate OpenVINO include and library paths from the python environment.
-    """
+def _verbose() -> bool:
+    return os.environ.get("NPU_VERBOSE_BUILD", "0") == "1"
+
+
+def _candidate_openvino_roots():
+    """Yield OpenVINO install roots, cheapest checks first."""
+    # 1. Explicit env-var hints (toolkit installs, custom sysroots).
+    for var in ("OPENVINO_DIR", "INTEL_OPENVINO_DIR", "OPENVINO_PACKAGE_DIR"):
+        hint = os.environ.get(var)
+        if hint and os.path.isdir(hint):
+            yield hint
+    # 2. Imported python package (pip install openvino).
     try:
-        import openvino
+        import openvino  # noqa: PLC0415
 
         ov_dir = os.path.dirname(openvino.__file__)
         print(f"Found OpenVINO package at: {ov_dir}")
+        yield ov_dir
     except ImportError:
-        print(
-            "OpenVINO not found in Python environment. Attempting to find via site-packages..."
-        )
-        # Fallback: try to find in site-packages manually if import fails during build
-        paths = site.getsitepackages() + [site.getusersitepackages()]
-        ov_dir = None
+        print("OpenVINO not importable; scanning site-packages as fallback...")
+        try:
+            paths = site.getsitepackages() + [site.getusersitepackages()]
+        except Exception:
+            paths = []
         for p in paths:
             candidate = os.path.join(p, "openvino")
-            if os.path.exists(candidate):
-                ov_dir = candidate
-                break
+            if os.path.isdir(candidate):
+                yield candidate
 
-        if ov_dir is None:
-            print(
-                "WARNING: OpenVINO not found. Building without linking OpenVINO (Stub mode)."
-            )
-            return [], [], []
 
-    # Define search paths relative to package root
-    # Structure varies by OS and version, so we search
-    include_path = None
-    lib_path = None
-
-    # Search for include directory containing 'openvino/openvino.hpp'
-    for root, dirs, files in os.walk(ov_dir):
-        if "include" in dirs:
-            inc_candidate = os.path.join(root, "include")
-            if os.path.exists(os.path.join(inc_candidate, "openvino", "openvino.hpp")):
-                include_path = inc_candidate
-                break
-
-    # Search for library directory
-    # Windows: look for openvino.lib
-    # Linux: look for libopenvino.so
+def _find_in_root(root: str):
+    """Look for headers/libs under known sub-layouts, then bounded walk."""
+    header_rel = os.path.join("openvino", "openvino.hpp")
     lib_name = "openvino.lib" if os.name == "nt" else "libopenvino.so"
 
-    for root, dirs, files in os.walk(ov_dir):
-        if lib_name in files:
-            lib_path = root
-            break
-
+    # Known layouts first (avoids a full tree walk in the common case).
+    known_inc = [
+        os.path.join(root, "include"),
+        os.path.join(root, "runtime", "include"),
+        os.path.join(root, "share", "openvino"),
+    ]
+    include_path = next(
+        (c for c in known_inc if os.path.isfile(os.path.join(c, header_rel))),
+        None,
+    )
+    known_lib = [
+        os.path.join(root, "libs"),
+        os.path.join(root, "lib"),
+        os.path.join(root, "runtime", "lib", "intel64"),
+        root,
+    ]
+    lib_path = next(
+        (c for c in known_lib if os.path.isfile(os.path.join(c, lib_name))),
+        None,
+    )
     if include_path and lib_path:
-        print(f"OpenVINO Include: {include_path}")
-        print(f"OpenVINO Lib: {lib_path}")
-        return [include_path], [lib_path], ["openvino"]
-    else:
-        print(f"WARNING: Could not locate OpenVINO headers/libs within {ov_dir}")
-        return [], [], []
+        return include_path, lib_path
+
+    # Bounded fallback walk (max depth keeps `pip install` responsive).
+    max_depth = 5
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.count(os.sep) - base_depth
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        # Prune obviously irrelevant subtrees.
+        dirnames[:] = [d for d in dirnames if d not in {"__pycache__", "tests", "test"}]
+        if include_path is None and os.path.isfile(
+            os.path.join(dirpath, "include", header_rel)
+            if os.path.basename(dirpath) != "include"
+            else os.path.join(dirpath, header_rel)
+        ):
+            cand = (
+                dirpath
+                if os.path.basename(dirpath) == "include"
+                else os.path.join(dirpath, "include")
+            )
+            if os.path.isfile(os.path.join(cand, header_rel)):
+                include_path = cand
+        if lib_path is None and lib_name in filenames:
+            lib_path = dirpath
+        if include_path and lib_path:
+            return include_path, lib_path
+    if include_path and lib_path:
+        return include_path, lib_path
+    return None, None
 
 
-# Locate OpenVINO
+def find_openvino():
+    """Locate OpenVINO include/lib dirs; return (includes, lib_dirs, libs).
+
+    Returns empty lists (stub mode) when OpenVINO cannot be found so a
+    pure-CPU fallback build can still proceed.
+    """
+    for root in _candidate_openvino_roots():
+        inc, lib = _find_in_root(root)
+        if inc and lib:
+            print(f"OpenVINO Include: {inc}")
+            print(f"OpenVINO Lib: {lib}")
+            return [inc], [lib], ["openvino"]
+        if _verbose():
+            print(f"OpenVINO layout not recognised under: {root}")
+    print(
+        "WARNING: OpenVINO headers/libs not found. "
+        "Building without linking OpenVINO (stub/CPU-fallback mode). "
+        "Set OPENVINO_DIR or `pip install openvino>=2024.0.0` for full NPU support."
+    )
+    return [], [], []
+
+
 ov_include, ov_lib_dir, ov_libs = find_openvino()
 
-class NPUBuildExtension(BuildExtension):
-    """Custom build_ext to ensure C++20 standard flags are always passed on MSVC.
 
-    On Windows, distutils/MSVC does not honor the dict-style
-    ``extra_compile_args = {"cxx": [...]}`` that PyTorch documents for
-    CppExtension.  It only reads a flat ``list[str]``.  This subclass:
+class NPUBuildExtension:
+    """Lazy import wrapper so ``--help``/metadata queries don't need torch."""
 
-    1. Normalises every extension's ``extra_compile_args`` from dict → list.
-    2. Injects ``/std:c++20`` (and helpers) into the compiler's own
-       ``compile_options`` so the flag is present even if setuptools
-       rebuilds the option list after our mutation.
-    """
+    @staticmethod
+    def make_cmdclass():
+        from torch.utils.cpp_extension import BuildExtension  # noqa: PLC0415
 
-    def build_extensions(self):
-        # ── 1. Normalise extra_compile_args on every extension ──────────
-        for ext in self.extensions:
-            if isinstance(ext.extra_compile_args, dict):
-                # Merge all values (typically only "cxx") into a flat list
-                flat = []
-                for flags in ext.extra_compile_args.values():
-                    flat.extend(flags)
-                ext.extra_compile_args = flat
-            elif ext.extra_compile_args is None:
-                ext.extra_compile_args = []
+        class _NPUBuildExtension(BuildExtension):
+            """Ensure C++20 flags reach MSVC (flat list, not dict-style).
 
-            if os.name == "nt":
-                for flag in ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]:
-                    if flag not in ext.extra_compile_args:
-                        ext.extra_compile_args.append(flag)
-            else:
-                for flag in ["-std=c++20", "-O3"]:
-                    if flag not in ext.extra_compile_args:
-                        ext.extra_compile_args.append(flag)
+            On Windows, distutils/MSVC does not honor the dict-style
+            ``extra_compile_args = {"cxx": [...]}`` that PyTorch documents for
+            CppExtension. This subclass normalises to a flat list and patches
+            the compiler object directly.
+            """
 
-        # ── 2. Patch the compiler object directly (MSVC) ────────────────
-        if os.name == "nt":
-            # self.compiler is initialised by the time build_extensions runs
-            if hasattr(self.compiler, "compile_options"):
-                for flag in ["/std:c++20", "/DNOMINMAX"]:
-                    if flag not in self.compiler.compile_options:
-                        self.compiler.compile_options.append(flag)
-            if hasattr(self.compiler, "compile_options_debug"):
-                for flag in ["/std:c++20", "/DNOMINMAX"]:
-                    if flag not in self.compiler.compile_options_debug:
-                        self.compiler.compile_options_debug.append(flag)
+            def build_extensions(self):
+                for ext in self.extensions:
+                    if isinstance(ext.extra_compile_args, dict):
+                        flat = []
+                        for flags in ext.extra_compile_args.values():
+                            flat.extend(flags)
+                        ext.extra_compile_args = flat
+                    elif ext.extra_compile_args is None:
+                        ext.extra_compile_args = []
 
-        super().build_extensions()
+                    if os.name == "nt":
+                        for flag in ["/std:c++20", "/O2", "/MP", "/DNOMINMAX"]:
+                            if flag not in ext.extra_compile_args:
+                                ext.extra_compile_args.append(flag)
+                    else:
+                        for flag in ["-std=c++20", "-O3"]:
+                            if flag not in ext.extra_compile_args:
+                                ext.extra_compile_args.append(flag)
+
+                if os.name == "nt":
+                    if hasattr(self.compiler, "compile_options"):
+                        for flag in ["/std:c++20", "/DNOMINMAX"]:
+                            if flag not in self.compiler.compile_options:
+                                self.compiler.compile_options.append(flag)
+                    if hasattr(self.compiler, "compile_options_debug"):
+                        for flag in ["/std:c++20", "/DNOMINMAX"]:
+                            if flag not in self.compiler.compile_options_debug:
+                                self.compiler.compile_options_debug.append(flag)
+
+                super().build_extensions()
+
+        return _NPUBuildExtension.with_options(use_ninja=False)
 
 
-setup(
-    name="intel_npu_acceleration",
-    version="0.1.0",
-    description="PyTorch acceleration library for Intel NPU",
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
-    ext_modules=[
+import shutil  # noqa: E402
+
+ext_modules = []
+cmdclass = {}
+skip_reason = None
+
+if os.environ.get("NPU_NO_BUILD_EXT", "0") == "1":
+    skip_reason = "NPU_NO_BUILD_EXT=1 is set"
+elif os.name == "nt" and shutil.which("cl") is None:
+    skip_reason = (
+        "MSVC cl.exe not on PATH — install 'Desktop development with C++' "
+        "or run from a VS Developer Prompt / build_npu.bat"
+    )
+
+if skip_reason is not None:
+    print(f"WARNING: skipping C++ extension ({skip_reason}). Installing pure-Python fallback.")
+else:
+    from torch.utils.cpp_extension import CppExtension  # noqa: E402
+
+    ext_modules = [
         CppExtension(
             name="intel_npu_acceleration._C",
             sources=get_sources(),
@@ -164,16 +243,9 @@ setup(
             library_dirs=ov_lib_dir,
             libraries=ov_libs,
         )
-    ],
-    cmdclass={"build_ext": NPUBuildExtension.with_options(use_ninja=False)},
-    install_requires=["torch", "openvino>=2024.0.0"],
-    entry_points={
-        "torch_dynamo_backends": [
-            "npu = intel_npu_acceleration.frontend.dynamo:_compile_backend",
-            "intel_npu = intel_npu_acceleration.frontend.dynamo:_compile_backend",
-        ]
-    },
-    extras_require={
-        "dev": ["pytest", "ruff"],
-    },
-)
+    ]
+    cmdclass = {"build_ext": NPUBuildExtension.make_cmdclass()}
+
+# NOTE: name/version/description/dependencies/packages/entry-points are all
+# declared in pyproject.toml — do not duplicate them here.
+setup(ext_modules=ext_modules, cmdclass=cmdclass)

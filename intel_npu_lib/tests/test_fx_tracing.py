@@ -1,7 +1,9 @@
+import time
 import unittest
+
 import torch
 import torch.nn as nn
-import time
+
 import intel_npu_acceleration as npu
 from intel_npu_acceleration.frontend import NPUCompilationError
 

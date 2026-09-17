@@ -1,6 +1,7 @@
-import unittest
 import io
 import sys
+import unittest
+
 import intel_npu_acceleration as npu
 from intel_npu_acceleration.info import get_system_info, print_info
 
@@ -19,6 +20,10 @@ class TestSystemInfoCLI(unittest.TestCase):
         self.assertIn("cache_size_mb", info)
         self.assertIn("cache_file_count", info)
         self.assertIn("in_memory_graph_cache_count", info)
+        self.assertIn("torch_npu_registered", info)
+        self.assertIn("torch_backends_npu_registered", info)
+        self.assertIn("dynamo_npu_registered", info)
+        self.assertIn("accelerator_available", info)
 
     def test_print_info_stdout(self):
         captured_output = io.StringIO()
@@ -35,6 +40,7 @@ class TestSystemInfoCLI(unittest.TestCase):
 
     def test_cli_version_flag(self):
         from unittest.mock import patch
+
         from intel_npu_acceleration.__main__ import main
 
         captured_output = io.StringIO()
@@ -47,6 +53,7 @@ class TestSystemInfoCLI(unittest.TestCase):
 
     def test_cli_clear_cache_flag(self):
         from unittest.mock import patch
+
         from intel_npu_acceleration.__main__ import main
 
         captured_output = io.StringIO()
@@ -59,6 +66,7 @@ class TestSystemInfoCLI(unittest.TestCase):
 
     def test_cli_info_flag(self):
         from unittest.mock import patch
+
         from intel_npu_acceleration.__main__ import main
 
         captured_output = io.StringIO()

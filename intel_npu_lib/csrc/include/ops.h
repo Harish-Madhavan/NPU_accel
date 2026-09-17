@@ -153,6 +153,18 @@ torch::Tensor npu_mse_loss(torch::Tensor pred, torch::Tensor target, int64_t red
 /** @brief Backward gradient for Mean Squared Error loss. */
 torch::Tensor npu_mse_loss_backward(torch::Tensor grad_output, torch::Tensor pred, torch::Tensor target, int64_t reduction);
 
+/** @brief Cross Entropy Loss forward reduction. */
+torch::Tensor npu_cross_entropy_loss(torch::Tensor pred, torch::Tensor target, int64_t reduction);
+
+/** @brief Backward gradient for Cross Entropy Loss. */
+torch::Tensor npu_cross_entropy_loss_backward(torch::Tensor grad_output, torch::Tensor pred, torch::Tensor target, int64_t reduction);
+
+/** @brief L1 Loss (Mean Absolute Error) forward reduction. */
+torch::Tensor npu_l1_loss(torch::Tensor pred, torch::Tensor target, int64_t reduction);
+
+/** @brief Backward gradient for L1 Loss. */
+torch::Tensor npu_l1_loss_backward(torch::Tensor grad_output, torch::Tensor pred, torch::Tensor target, int64_t reduction);
+
 /** @brief Embedding gradient scatter (index_add). */
 torch::Tensor npu_embedding_backward(torch::Tensor grad_output, torch::Tensor indices, int64_t num_embeddings);
 

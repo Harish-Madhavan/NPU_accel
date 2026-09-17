@@ -17,10 +17,11 @@ The library operates on three unified levels:
 
 2. **C++ Level Zero Driver Integration (`csrc/device.cpp` & `csrc/ops.cpp`)**:
    - Binds directly to the Intel Level Zero NPU runtime driver (`ov::intel_npu::level_zero::ZeroContext`, `ze_context_handle_t`).
-   - Hardware Turbo clock frequency boost (`NPU_TURBO=YES`).
+   - Hardware Turbo clock frequency boost (`NPU_TURBO=YES`, live via `npu.enable_turbo()`).
    - Unified Level Zero memory preservation (`NPU_DISABLE_IDLE_MEMORY_PRUNING=YES`) to eliminate TLB invalidation.
    - Non-blocking concurrent hardware command queues (`NPU_RUN_INFERENCES_SEQUENTIALLY=NO`).
    - High-priority hardware micro-scheduler dispatch (`MODEL_PRIORITY=HIGH`).
+   - Eager kernels compile with the same Level Zero property set as graph mode (gated on driver support); eager binaries are keyed by op/shape/dtype **plus** performance hint and eager device so hint changes can't reuse stale binaries.
 
 3. **End-to-End Training & Autograd Backend (`intel_npu_acceleration.autograd` & `optim`)**:
    - Both forward AND backward autograd passes run accelerated on the NPU.
@@ -79,12 +80,42 @@ The library operates on three unified levels:
 | `torch.zeros`, `ones`, `full` | ✅ | ✅ | ✅ | |
 | `update_kv_cache` | ✅ | ✅ | ✅ | Stateful NPU KV-cache manipulation |
 | `mse_loss` | ✅ | ✅ | ✅ | Hardware-accelerated MSE loss forward and backward |
+| `cross_entropy_loss` | ✅ | ✅ | ✅ | 1D indices & 2D probabilities, forward & backward on NPU |
+| `l1_loss` | ✅ | ✅ | ✅ | Mean Absolute Error loss forward and sign backward on NPU |
+| `bce_with_logits_loss` | ✅ | ✅ | ✅ | Binary cross entropy with logits forward & backward |
 
-### 5. Hardware Optimizers
-| Optimizer | Module | Description |
+### 5. Hardware Optimizers & Training Utilities
+| Tool / Optimizer | Module | Description |
 | :--- | :--- | :--- |
 | `NPUAdam` | `intel_npu_acceleration.optim.NPUAdam` | Fused first moment, second moment, bias correction, and weight update kernel on NPU |
 | `NPUSGD` | `intel_npu_acceleration.optim.NPUSGD` | Momentum-buffered SGD update kernel on NPU |
+| `clip_grad_norm_` | `intel_npu_acceleration.optim.clip_grad_norm_` | Gradient clipping matching PyTorch standard `clip_grad_norm_` |
+
+### 6. First-Class PyTorch Backend APIs (`torch.device`, `torch.npu`, `torch.accelerator`)
+| API Surface | Support | Description |
+| :--- | :---: | :--- |
+| `torch.device("npu")` / `torch.device("npu:0")` | ✅ | Full PrivateUse1 device typing and device string parsing |
+| `torch.npu.is_available()` | ✅ | Detects physical Intel Core Ultra NPU hardware availability |
+| `torch.npu.device_count()`, `current_device()` | ✅ | Device enumeration and active device index tracking |
+| `torch.npu.get_device_name()`, `get_device_properties()` | ✅ | Device naming and properties container with attribute & dict access |
+| `torch.npu.synchronize()`, `empty_cache()` | ✅ | Level Zero command queue synchronization and cache purge |
+| `torch.npu.Stream()`, `torch.npu.Event()` | ✅ | Stream command queue management and timing events |
+| `torch.npu.stream(s)`, `torch.npu.device(d)` | ✅ | Stream and device context managers |
+| `torch.npu.amp.autocast("npu")` | ✅ | Automatic mixed precision (FP16 / BF16) execution |
+| `torch.backends.npu.*` | ✅ | Performance flags (`allow_tf32`, `flash_sdp_enabled`, `version`) |
+| `torch.accelerator.*` (PyTorch 2.4+) | ✅ | Universal accelerator bridge (`synchronize`, `empty_cache`, `current_accelerator`, `streams`) |
+| `torch.Tensor.to("npu")`, `torch.Tensor.npu()` | ✅ | Zero-copy Unified System Memory (USM) tensor management |
+| `torch.Tensor.is_npu` | ✅ | Tensor device type introspection property |
+| `torch.nn.Module.to("npu")`, `model.npu()` | ✅ | Automated graph compilation and hardware execution |
+
+### 7. Quantization & Model Compression
+| Technique | Support | Details |
+| :--- | :---: | :--- |
+| `quantize(model, mode="int8")` | ✅ | INT8 symmetric weights with per-channel row-wise or per-tensor scales |
+| `quantize(model, mode="int4")` | ✅ | 4-bit asymmetric packed weights (2 nibbles per uint8 byte) with zero-point offsets |
+| `quantized_linear` | ✅ | Hardware-accelerated linear kernel supporting FP32, FP16, INT8, and packed INT4 |
+| Compiler Auto-Dequantization | ✅ | Native OpenVINO compiler automatic unpack for INT8 and packed INT4 during `compile_to_npu` |
+
 
 ---
 
@@ -95,6 +126,11 @@ The library operates on three unified levels:
 cd intel_npu_lib
 python setup.py build_ext --inplace
 
-# Run Full Test Suite
+# Run Full Test Suite (148 tests, 0 warnings)
 pytest
 ```
+
+> Note: `torch.jit.trace` / `trace_method` `FutureWarning`s emitted internally by
+> `openvino.convert_model` are suppressed in `frontend/compiler.py` via targeted
+> `warnings.catch_warnings()` and in `pyproject.toml` via `filterwarnings`, so both
+> library users and `pytest` runs stay warning-free.

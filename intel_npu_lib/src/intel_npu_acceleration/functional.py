@@ -6,7 +6,54 @@ Operations automatically dispatch to Level Zero hardware execution for both forw
 and backward autograd passes when gradients are required.
 """
 
+__all__ = [
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "neg",
+    "matmul",
+    "linear",
+    "relu",
+    "gelu",
+    "silu",
+    "softmax",
+    "rmsnorm",
+    "layer_norm",
+    "hardsigmoid",
+    "hardswish",
+    "transpose",
+    "reshape",
+    "cat",
+    "stack",
+    "mean",
+    "embedding",
+    "mse_loss",
+    "cross_entropy_loss",
+    "l1_loss",
+    "bce_with_logits_loss",
+    "conv2d",
+    "scaled_dot_product_attention",
+    "squeeze",
+    "unsqueeze",
+    "index_select",
+    "zeros",
+    "ones",
+    "full",
+    "max_pool2d",
+    "update_kv_cache",
+    "rotary_embedding",
+    "quantized_linear",
+    "identity",
+    "dropout",
+    "NPUStatefulKVCache",
+]
+
+import contextlib
+from collections.abc import Iterator
+
 import torch.fx
+
 from . import _functional as F_base
 from . import autograd as F_auto
 
@@ -33,6 +80,9 @@ stack = F_auto.stack
 mean = F_auto.mean
 embedding = F_auto.embedding
 mse_loss = F_auto.mse_loss
+cross_entropy_loss = F_auto.cross_entropy_loss
+l1_loss = F_auto.l1_loss
+bce_with_logits_loss = F_auto.bce_with_logits_loss
 conv2d = F_auto.conv2d
 scaled_dot_product_attention = F_auto.scaled_dot_product_attention
 
@@ -55,7 +105,20 @@ torch.fx.wrap(update_kv_cache)
 torch.fx.wrap(rotary_embedding)
 
 # Compilation flag to ensure functional execution during native OpenVINO tracing
+# Use a simple bool for backward compat; compiler sets it via context manager
 _IS_COMPILING: bool = False
+
+
+@contextlib.contextmanager
+def _compilation_context() -> Iterator[None]:
+    """Context manager that sets _IS_COMPILING during OV conversion."""
+    global _IS_COMPILING
+    prev = _IS_COMPILING
+    _IS_COMPILING = True
+    try:
+        yield
+    finally:
+        _IS_COMPILING = prev
 
 # Re-export NPUStatefulKVCache for backwards compatibility
 from .nn.stateful_kv import NPUStatefulKVCache  # noqa: F401, E402

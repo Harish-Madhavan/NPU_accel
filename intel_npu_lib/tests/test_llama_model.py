@@ -1,8 +1,10 @@
+import math
 import unittest
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-import math
+
 from intel_npu_acceleration import compile_to_npu
 from intel_npu_acceleration.functional import update_kv_cache
 
@@ -198,6 +200,7 @@ class TestLlamaModel(unittest.TestCase):
         )
 
         import warnings
+
         from torch.jit import TracerWarning
 
         with warnings.catch_warnings():

@@ -61,7 +61,7 @@ jobs:
         
     - name: Run linter
       run: |
-        ruff check ./intel_npu_lib || true
+        ruff check ./intel_npu_lib
       shell: bash
         
     - name: Run test suite with coverage

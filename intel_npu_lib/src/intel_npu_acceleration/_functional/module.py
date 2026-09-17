@@ -1,6 +1,8 @@
 import warnings
+from typing import List, Optional
+
 import torch
-from typing import Optional, List
+
 from .utils import _C, _is_proxy, _promote_binary, _restore_dtype, _to_pair
 
 
@@ -14,7 +16,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def linear(
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if (
         _C is None
@@ -41,9 +43,9 @@ def rmsnorm(
 
 def layer_norm(
     input: torch.Tensor,
-    normalized_shape: List[int],
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    normalized_shape: list[int],
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
     if _C is None or _is_proxy(input, weight, bias):
@@ -61,7 +63,7 @@ def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float = 0.0,
@@ -121,8 +123,8 @@ def quantized_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    zero_point: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if any(isinstance(arg, torch.fx.Proxy) for arg in (input, weight, scale, zero_point, bias)):
         out_features = weight.shape[0]
@@ -184,7 +186,7 @@ def rotary_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
 def conv2d(
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     stride=(1, 1),
     padding=(0, 0),
     dilation=(1, 1),
@@ -256,7 +258,115 @@ def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") 
     return _C.npu_mse_loss(pred, target, red_map.get(reduction, 1))
 
 
-def matmul_backward(grad_output: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> List[torch.Tensor]:
+def cross_entropy_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    if _C is None or _is_proxy(pred, target):
+        return torch.nn.functional.cross_entropy(pred, target, reduction=reduction)
+    red_map = {"none": 0, "mean": 1, "sum": 2}
+    try:
+        return _C.npu_cross_entropy_loss(pred, target, red_map.get(reduction, 1))
+    except Exception:
+        return torch.nn.functional.cross_entropy(pred, target, reduction=reduction)
+
+
+def cross_entropy_loss_backward(
+    grad_output: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    if _C is not None and not _is_proxy(grad_output, pred, target):
+        red_map = {"none": 0, "mean": 1, "sum": 2}
+        try:
+            return _C.npu_cross_entropy_loss_backward(grad_output, pred, target, red_map.get(reduction, 1))
+        except Exception:
+            pass
+    sm = torch.softmax(pred, dim=-1)
+    if target.dim() == pred.dim():
+        target_prob = target
+    else:
+        target_prob = torch.zeros_like(pred).scatter_(-1, target.unsqueeze(-1), 1.0)
+    grad = sm - target_prob
+    if reduction == "mean":
+        batch_size = pred.shape[0] if pred.dim() > 1 else 1
+        grad = grad / batch_size
+    return grad * grad_output
+
+
+def l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Compute L1 loss (Mean Absolute Error) accelerated on Intel NPU."""
+    if _C is None or _is_proxy(pred, target):
+        return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
+    red_map = {"none": 0, "mean": 1, "sum": 2}
+    try:
+        return _C.npu_l1_loss(pred, target, red_map.get(reduction, 1))
+    except Exception:
+        return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
+
+
+def l1_loss_backward(
+    grad_output: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Compute backward gradient for L1 loss."""
+    if _C is not None and not _is_proxy(grad_output, pred, target):
+        red_map = {"none": 0, "mean": 1, "sum": 2}
+        try:
+            return _C.npu_l1_loss_backward(grad_output, pred, target, red_map.get(reduction, 1))
+        except Exception:
+            pass
+    diff = pred - target
+    sgn = torch.sign(diff)
+    if reduction == "mean":
+        sgn = sgn / pred.numel()
+    return sgn * grad_output
+
+
+def bce_with_logits_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    reduction: str = "mean",
+    pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute Binary Cross Entropy with Logits Loss."""
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        input, target, weight=weight, reduction=reduction, pos_weight=pos_weight
+    )
+
+
+def bce_with_logits_loss_backward(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    reduction: str = "mean",
+    pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute backward gradient for Binary Cross Entropy with Logits Loss."""
+    sig = torch.sigmoid(input)
+    if pos_weight is not None:
+        grad = sig * (1.0 + (pos_weight - 1.0) * target) - target * pos_weight
+    else:
+        grad = sig - target
+    if weight is not None:
+        grad = grad * weight
+    if reduction == "mean":
+        grad = grad / input.numel()
+    return grad * grad_output
+
+
+
+def matmul_backward(grad_output: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
     if _C is not None and not _is_proxy(grad_output, a, b):
         try:
             return _C.npu_matmul_backward(grad_output, a, b)
@@ -274,7 +384,7 @@ def linear_backward(
     needs_input_grad: bool = True,
     needs_weight_grad: bool = True,
     needs_bias_grad: bool = True,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     if _C is not None and not _is_proxy(grad_output, input, weight):
         try:
             return _C.npu_linear_backward(
@@ -339,7 +449,7 @@ def rmsnorm_backward(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     if _C is not None and not _is_proxy(grad_output, input, weight):
         try:
             return _C.npu_rmsnorm_backward(grad_output, input, weight, eps)
@@ -351,9 +461,9 @@ def rmsnorm_backward(
     rms = torch.sqrt(in_f.pow(2).mean(-1, keepdim=True) + eps)
     xn = in_f / rms
     grad_w = (go * xn).sum(dim=tuple(range(go.dim() - 1))).to(weight.dtype)
-    dL_dxn = go * w_f
-    correction = (dL_dxn * xn).mean(-1, keepdim=True)
-    grad_in = ((dL_dxn - xn * correction) / rms).to(grad_output.dtype)
+    dl_dxn = go * w_f
+    correction = (dl_dxn * xn).mean(-1, keepdim=True)
+    grad_in = ((dl_dxn - xn * correction) / rms).to(grad_output.dtype)
     return [grad_in, grad_w]
 
 
@@ -368,7 +478,7 @@ def adam_step(
     eps: float,
     weight_decay: float,
     step: int,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     if _C is not None and not _is_proxy(param, grad, exp_avg, exp_avg_sq):
         try:
             return _C.npu_adam_step(
@@ -397,7 +507,7 @@ def sgd_step(
     dampening: float,
     nesterov: bool,
     has_momentum_buffer: bool,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     if _C is not None and not _is_proxy(param, grad, momentum_buffer):
         try:
             return _C.npu_sgd_step(

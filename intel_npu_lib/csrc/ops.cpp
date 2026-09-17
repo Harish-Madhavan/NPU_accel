@@ -7,6 +7,7 @@
 #include <openvino/opsets/opset13.hpp>  // For ScaledDotProductAttention
 #include <openvino/opsets/opset3.hpp>   // For ScatterUpdate
 #include <openvino/opsets/opset4.hpp>   // For Swish (SiLU)
+#include <openvino/opsets/opset5.hpp>   // For LogSoftmax
 #include <openvino/opsets/opset8.hpp>   // For GELU
 #include <sstream>
 #include <string>
@@ -29,7 +30,10 @@ static ov::element::Type torch_dtype_to_ov(const torch::Tensor& t) {
         {torch::kByte, ov::element::u8}, {torch::kBool, ov::element::boolean}
     };
     auto it = map.find(t.scalar_type());
-    return it != map.end() ? it->second : ov::element::f32;
+    if (it != map.end()) return it->second;
+    std::cerr << "[Intel NPU] Unsupported torch dtype (" << t.scalar_type()
+              << "); falling back to f32." << std::endl;
+    return ov::element::f32;
 }
 
 static torch::Dtype ov_dtype_to_torch(ov::element::Type ov_type) {
@@ -81,8 +85,12 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
                          const std::vector<torch::Tensor>& inputs) {
     try {
         auto& backend = NPUBackend::getInstance();
-        backend.getOrCompileModel(key, model);
-        auto infer_request = backend.getOrCachedInferRequest(key);
+        // Fold the active compile configuration (performance hint + eager
+        // device) into the cache key so a hint change can't reuse a binary
+        // compiled under different settings.
+        const std::string full_key = key + "_" + backend.getCompileConfigKey();
+        backend.getOrCompileModel(full_key, model);
+        auto infer_request = backend.getOrCachedInferRequest(full_key);
 
         // Ensure inputs are contiguous and kept alive for the duration of inference
         std::vector<torch::Tensor> contiguous_inputs;
@@ -140,7 +148,7 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
         TORCH_CHECK(false,
                     "[Intel NPU] Execution Failed for key '" + key + "': " + std::string(e.what()));
     }
-    // Unreachable — silences compiler warning about missing return.
+    // Unreachable — TORCH_CHECK always throws; silences C4715.
     return torch::Tensor();
 }
 
@@ -1014,6 +1022,134 @@ torch::Tensor npu_mse_loss_backward(torch::Tensor grad_output, torch::Tensor pre
     auto scale = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {scale_val});
     auto grad = std::make_shared<ov::opset1::Multiply>(std::make_shared<ov::opset1::Multiply>(scale, diff), arg_g);
 
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad}, ov::ParameterVector{arg_g, arg_p, arg_t});
+    return execute_op(key, model, {grad_output, pred, target});
+}
+
+torch::Tensor npu_cross_entropy_loss(torch::Tensor pred, torch::Tensor target, int64_t reduction) {
+    std::string key = get_key("cross_entropy_loss", {pred, target}, std::to_string(reduction));
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(pred), get_ov_shape(pred));
+    auto arg_t = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(target), get_ov_shape(target));
+
+    auto log_sm = std::make_shared<ov::opset5::LogSoftmax>(arg_p, -1);
+
+    std::shared_ptr<ov::Node> nll;
+    if (target.dim() == pred.dim()) {
+        auto prod = std::make_shared<ov::opset1::Multiply>(arg_t, log_sm);
+        auto neg_one = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {-1.0f});
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
+        nll = std::make_shared<ov::opset1::Multiply>(
+            neg_one,
+            std::make_shared<ov::opset1::ReduceSum>(prod, axes_c, false)
+        );
+    } else {
+        int64_t num_classes = pred.size(-1);
+        auto depth_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {num_classes});
+        auto on_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {1.0f});
+        auto off_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {0.0f});
+        auto one_hot = std::make_shared<ov::opset1::OneHot>(arg_t, depth_c, on_c, off_c, -1);
+
+        auto prod = std::make_shared<ov::opset1::Multiply>(one_hot, log_sm);
+        auto neg_one = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {-1.0f});
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
+        nll = std::make_shared<ov::opset1::Multiply>(
+            neg_one,
+            std::make_shared<ov::opset1::ReduceSum>(prod, axes_c, false)
+        );
+    }
+
+    std::shared_ptr<ov::Node> result = nll;
+    if (reduction == 1) {
+        std::vector<int64_t> axes(target.dim());
+        std::iota(axes.begin(), axes.end(), 0);
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{axes.size()}, axes);
+        result = std::make_shared<ov::opset1::ReduceMean>(nll, axes_c, false);
+    } else if (reduction == 2) {
+        std::vector<int64_t> axes(target.dim());
+        std::iota(axes.begin(), axes.end(), 0);
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{axes.size()}, axes);
+        result = std::make_shared<ov::opset1::ReduceSum>(nll, axes_c, false);
+    }
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, ov::ParameterVector{arg_p, arg_t});
+    return execute_op(key, model, {pred, target});
+}
+
+torch::Tensor npu_cross_entropy_loss_backward(torch::Tensor grad_output, torch::Tensor pred, torch::Tensor target, int64_t reduction) {
+    std::string key = get_key("cross_entropy_loss_backward", {grad_output, pred, target}, std::to_string(reduction));
+    auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output), get_ov_shape(grad_output));
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(pred), get_ov_shape(pred));
+    auto arg_t = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(target), get_ov_shape(target));
+
+    auto sm = std::make_shared<ov::opset1::Softmax>(arg_p, -1);
+
+    std::shared_ptr<ov::Node> target_one_hot;
+    if (target.dim() == pred.dim()) {
+        target_one_hot = arg_t;
+    } else {
+        int64_t num_classes = pred.size(-1);
+        auto depth_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{}, {num_classes});
+        auto on_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {1.0f});
+        auto off_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {0.0f});
+        target_one_hot = std::make_shared<ov::opset1::OneHot>(arg_t, depth_c, on_c, off_c, -1);
+    }
+
+    auto diff = std::make_shared<ov::opset1::Subtract>(sm, target_one_hot);
+
+    std::shared_ptr<ov::Node> scaled_diff = diff;
+    if (reduction == 1) {
+        float n_val = static_cast<float>(pred.dim() > 1 ? pred.size(0) : 1);
+        auto scale_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {1.0f / n_val});
+        scaled_diff = std::make_shared<ov::opset1::Multiply>(diff, scale_c);
+    }
+
+    auto grad = std::make_shared<ov::opset1::Multiply>(scaled_diff, arg_g);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad}, ov::ParameterVector{arg_g, arg_p, arg_t});
+    return execute_op(key, model, {grad_output, pred, target});
+}
+
+torch::Tensor npu_l1_loss(torch::Tensor pred, torch::Tensor target, int64_t reduction) {
+    std::string key = get_key("l1_loss", {pred, target}, std::to_string(reduction));
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(pred), get_ov_shape(pred));
+    auto arg_t = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(target), get_ov_shape(target));
+
+    auto diff = std::make_shared<ov::opset1::Subtract>(arg_p, arg_t);
+    auto abs_diff = std::make_shared<ov::opset1::Abs>(diff);
+
+    std::shared_ptr<ov::Node> result = abs_diff;
+    if (reduction == 1) {
+        std::vector<int64_t> axes(pred.dim());
+        std::iota(axes.begin(), axes.end(), 0);
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{axes.size()}, axes);
+        result = std::make_shared<ov::opset1::ReduceMean>(abs_diff, axes_c, false);
+    } else if (reduction == 2) {
+        std::vector<int64_t> axes(pred.dim());
+        std::iota(axes.begin(), axes.end(), 0);
+        auto axes_c = ov::opset1::Constant::create(ov::element::i64, ov::Shape{axes.size()}, axes);
+        result = std::make_shared<ov::opset1::ReduceSum>(abs_diff, axes_c, false);
+    }
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, ov::ParameterVector{arg_p, arg_t});
+    return execute_op(key, model, {pred, target});
+}
+
+torch::Tensor npu_l1_loss_backward(torch::Tensor grad_output, torch::Tensor pred, torch::Tensor target, int64_t reduction) {
+    std::string key = get_key("l1_loss_backward", {grad_output, pred, target}, std::to_string(reduction));
+    auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output), get_ov_shape(grad_output));
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(pred), get_ov_shape(pred));
+    auto arg_t = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(target), get_ov_shape(target));
+
+    auto diff = std::make_shared<ov::opset1::Subtract>(arg_p, arg_t);
+    auto sgn = std::make_shared<ov::opset1::Sign>(diff);
+
+    std::shared_ptr<ov::Node> scaled_sgn = sgn;
+    if (reduction == 1) {
+        float n_val = static_cast<float>(pred.numel());
+        auto scale_c = ov::opset1::Constant::create(arg_p->get_element_type(), ov::Shape{}, {1.0f / n_val});
+        scaled_sgn = std::make_shared<ov::opset1::Multiply>(sgn, scale_c);
+    }
+
+    auto grad = std::make_shared<ov::opset1::Multiply>(scaled_sgn, arg_g);
     auto model = std::make_shared<ov::Model>(ov::OutputVector{grad}, ov::ParameterVector{arg_g, arg_p, arg_t});
     return execute_op(key, model, {grad_output, pred, target});
 }

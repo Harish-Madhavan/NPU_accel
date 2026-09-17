@@ -19,8 +19,22 @@ git clone https://github.com/Harish-Madhavan/NPU_accel.git
 cd NPU_accel/intel_npu_lib
 
 # Install Python packages and inplace C++ library
-pip install -e .
+# (CPU torch keeps the download small; install it first)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install openvino "numpy>=1.24"
+
+# Windows: configures MSVC automatically (supports --clean / --no-install)
+#   ..\build_npu.bat
+# Any OS:
+python setup.py build_ext --inplace
+pip install --no-build-isolation --no-deps -e .
 ```
+
+Build knobs: `NPU_NO_BUILD_EXT=1` skips the native extension (pure-Python
+fallback), `NPU_VERBOSE_BUILD=1` prints OpenVINO discovery details, and
+`OPENVINO_DIR`/`INTEL_OPENVINO_DIR` point at a non-PyPI toolkit install.
+Single source of truth: package metadata lives in `pyproject.toml`;
+`setup.py` only defines how to build the `_C` extension.
 
 ### 3. Verification
 Verify that the package can bind to the C++ Level Zero driver and load successfully:
@@ -28,6 +42,10 @@ Verify that the package can bind to the C++ Level Zero driver and load successfu
 import intel_npu_acceleration as npu
 
 print(f"Is NPU backend available: {npu.is_available()}")
+```
+```bash
+# Equivalent terminal diagnostics (also installed as `intel-npu-info`):
+python -m intel_npu_acceleration --info
 ```
 
 ---
@@ -109,3 +127,5 @@ $env:INTEL_NPU_CACHE_DIR="C:\my_ai_models\npu_cache"
 # Linux
 export INTEL_NPU_CACHE_DIR="/home/user/my_ai_models/npu_cache"
 ```
+(`NPU_CACHE_DIR` is accepted as an alias. Explicit env vars take precedence
+over the default `./npu_cache` and are created on demand at import.)

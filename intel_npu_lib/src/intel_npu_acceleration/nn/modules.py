@@ -7,10 +7,12 @@ replacements for standard PyTorch layers during training and inference.
 """
 
 import math
+from typing import Any
+
 import torch
 import torch.nn as nn
-from typing import Optional, List, Union, Tuple, Any
-from .. import functional as F_npu
+
+from intel_npu_acceleration import functional as F_npu
 
 
 class Linear(nn.Module):
@@ -109,10 +111,10 @@ class Conv2d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int]],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int]] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
+        dilation: int | tuple[int, int] = 1,
         groups: int = 1,
         bias: bool = True,
         device: Any = None,
@@ -222,7 +224,7 @@ class LayerNorm(nn.Module):
 
     def __init__(
         self,
-        normalized_shape: Union[int, List[int], torch.Size],
+        normalized_shape: int | list[int] | torch.Size,
         eps: float = 1e-5,
         elementwise_affine: bool = True,
         device: Any = None,
@@ -319,3 +321,50 @@ class MSELoss(nn.Module):
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute MSE loss on NPU."""
         return F_npu.mse_loss(input, target, reduction=self.reduction)
+
+
+class CrossEntropyLoss(nn.Module):
+    """NPU-accelerated Cross Entropy Loss."""
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute Cross Entropy loss on NPU."""
+        return F_npu.cross_entropy_loss(input, target, reduction=self.reduction)
+
+
+class L1Loss(nn.Module):
+    """NPU-accelerated L1 Loss (Mean Absolute Error)."""
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute L1 loss on NPU."""
+        return F_npu.l1_loss(input, target, reduction=self.reduction)
+
+
+class BCEWithLogitsLoss(nn.Module):
+    """NPU-accelerated Binary Cross Entropy with Logits Loss."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor | None = None,
+        reduction: str = "mean",
+        pos_weight: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("weight", weight)
+        self.reduction = reduction
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute BCE with logits loss on NPU."""
+        return F_npu.bce_with_logits_loss(
+            input, target, weight=self.weight, reduction=self.reduction, pos_weight=self.pos_weight
+        )
+
+

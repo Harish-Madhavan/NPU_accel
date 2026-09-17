@@ -6,33 +6,65 @@ hint configuration, and execution target management for Intel® Neural Processin
 via oneAPI Level Zero and the OpenVINO™ runtime backend.
 """
 
-import os
-import platform
+__all__ = [
+    "is_available",
+    "device_count",
+    "current_device",
+    "get_device_name",
+    "get_device_properties",
+    "empty_cache",
+    "synchronize",
+    "set_property",
+    "set_performance_hint",
+    "get_performance_hint",
+    "enable_turbo",
+    "get_turbo_state",
+    "enable_sda",
+    "set_eager_device",
+    "get_eager_device",
+    "turbo",
+    "performance_mode",
+    "accelerate",
+]
+
+import contextlib
 import logging
-from typing import Optional, Dict, Any
+import threading
+from collections.abc import Iterator
+from typing import Any
 
 logger = logging.getLogger("intel_npu_acceleration.device")
 
+_TURBO_LOCK = threading.Lock()
+_PERF_HINT_LOCK = threading.Lock()
+_CURRENT_PERF_HINT: str = "LATENCY"
+_CURRENT_TURBO: bool | None = None
+
+_OV_CORE_LOCK = threading.Lock()
+_OV_CORE: Any | None = None
+
+
+def _get_ov_core() -> Any | None:
+    """Return a shared OpenVINO Core instance (cached to avoid re-probing)."""
+    global _OV_CORE
+    if _OV_CORE is not None:
+        return _OV_CORE
+    with _OV_CORE_LOCK:
+        if _OV_CORE is not None:
+            return _OV_CORE
+        try:
+            import openvino as ov
+
+            _OV_CORE = ov.Core()
+        except Exception as e:
+            logger.debug(f"OpenVINO Core init failed: {e}")
+            _OV_CORE = None
+        return _OV_CORE
+
 # --- Windows DLL Path Loading (OpenVINO + PyTorch) ---
-if platform.system() == "Windows":
-    try:
-        import torch
+from ._dll import setup_windows_dll_directories
 
-        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-        if os.path.exists(torch_lib):
-            os.add_dll_directory(torch_lib)
-    except (ImportError, AttributeError):
-        pass
-
-    try:
-        import openvino
-
-        ov_dir = os.path.dirname(openvino.__file__)
-        for d in [ov_dir, os.path.join(ov_dir, "libs"), os.path.join(ov_dir, "lib")]:
-            if os.path.exists(d):
-                os.add_dll_directory(d)
-    except (ImportError, AttributeError):
-        pass
+setup_windows_dll_directories()
 
 # --- Native C++ Extension Loading ---
 try:
@@ -42,6 +74,22 @@ except ImportError as e:
     _C = None
 
 _EAGER_DEVICE: str = "NPU"
+
+
+def _apply_to_ov_core(properties: dict[str, str]) -> None:
+    """Mirror driver properties to the Python OpenVINO Core singleton.
+
+    Graph-mode compiles use the Python ``ov.Core`` (not the C++ backend's
+    Core), so global settings must reach both. Best-effort: the NPU plugin
+    accepts unknown keys silently and per-compile configs override globals.
+    """
+    try:
+        from .frontend.compiler import _get_core
+
+        core = _get_core()
+        core.set_property("NPU", properties)
+    except Exception as e:
+        logger.debug(f"OV Core property mirror skipped: {e}")
 
 
 def is_available() -> bool:
@@ -64,10 +112,10 @@ def is_available() -> bool:
         except Exception as e:
             logger.debug(f"C++ NPU probe failed: {e}")
 
+    core = _get_ov_core()
+    if core is None:
+        return False
     try:
-        import openvino as ov
-
-        core = ov.Core()
         return "NPU" in core.available_devices
     except Exception as e:
         logger.debug(f"OpenVINO NPU probe failed: {e}")
@@ -93,57 +141,51 @@ def set_property(key: str, value: str) -> None:
             _C.set_property(key, value)
         except Exception as e:
             logger.warning(f"Failed to set property '{key}'='{value}': {e}")
+    # Graph mode uses the Python ov.Core singleton (separate from the C++
+    # backend's Core), so mirror there as well.
+    _apply_to_ov_core({key: value})
 
 
 def set_performance_hint(hint: str) -> None:
-    """Configure runtime performance hint for compiled NPU executions.
-
-    Configures whether the hardware scheduler prioritizes minimum single-request latency
-    or maximum parallel throughput.
-
-    Args:
-        hint (str): Performance mode. Must be one of:
-            - 'LATENCY': Minimizes time-to-first-token and per-inference execution latency.
-            - 'THROUGHPUT': Maximizes inferences per second by utilizing multiple hardware streams.
-            - 'CUMULATIVE_THROUGHPUT': Aggregates compute across all available device tiles.
-
-    Raises:
-        ValueError: If `hint` is not one of the recognized performance hints.
-
-    Examples:
-        >>> import intel_npu_acceleration as npu
-        >>> npu.set_performance_hint("LATENCY")
-    """
+    """Configure runtime performance hint for compiled NPU executions."""
+    global _CURRENT_PERF_HINT
     valid_hints = {"LATENCY", "THROUGHPUT", "CUMULATIVE_THROUGHPUT"}
     hint_upper = hint.upper()
     if hint_upper not in valid_hints:
         raise ValueError(f"Invalid performance hint '{hint}'. Expected one of: {valid_hints}")
-
+    with _PERF_HINT_LOCK:
+        _CURRENT_PERF_HINT = hint_upper
     if _C is not None and hasattr(_C, "set_performance_hint"):
         try:
             _C.set_performance_hint(hint_upper)
         except Exception as e:
             logger.warning(f"Failed to set performance hint '{hint_upper}': {e}")
+    _apply_to_ov_core({"PERFORMANCE_HINT": hint_upper})
+
+
+def get_performance_hint() -> str:
+    """Return the currently configured performance hint."""
+    with _PERF_HINT_LOCK:
+        return _CURRENT_PERF_HINT
 
 
 def enable_turbo(enable: bool = True) -> None:
-    """Enable or disable Intel NPU Turbo execution mode for burst workloads.
-
-    When enabled, the NPU hardware clock frequency is boosted to its peak performance
-    threshold for maximum compute density.
-
-    Args:
-        enable (bool, optional): True to enable Turbo boost, False to disable. Defaults to True.
-
-    Examples:
-        >>> import intel_npu_acceleration as npu
-        >>> npu.enable_turbo(True)
-    """
+    """Enable or disable Intel NPU Turbo execution mode for burst workloads."""
+    global _CURRENT_TURBO
+    with _TURBO_LOCK:
+        _CURRENT_TURBO = bool(enable)
     if _C is not None and hasattr(_C, "enable_turbo"):
         try:
             _C.enable_turbo(enable)
         except Exception as e:
             logger.warning(f"Failed to set turbo mode to {enable}: {e}")
+    _apply_to_ov_core({"NPU_TURBO": "YES" if enable else "NO"})
+
+
+def get_turbo_state() -> bool | None:
+    """Return the last requested turbo state, or None if never set."""
+    with _TURBO_LOCK:
+        return _CURRENT_TURBO
 
 
 def enable_sda(enable: bool = True) -> None:
@@ -160,6 +202,7 @@ def enable_sda(enable: bool = True) -> None:
             _C.enable_sda(enable)
         except Exception as e:
             logger.warning(f"Failed to set SDA mode to {enable}: {e}")
+    _apply_to_ov_core({"NPU_USE_SDA": "YES" if enable else "NO"})
 
 
 def set_eager_device(device_name: str) -> None:
@@ -233,15 +276,16 @@ def get_device_name(device: int = 0) -> str:
     """
     if not is_available():
         return "No Intel NPU detected"
+    core = _get_ov_core()
+    if core is None:
+        return "Intel(R) AI Boost (NPU)"
     try:
-        import openvino as ov
-        core = ov.Core()
         return core.get_property("NPU", "FULL_DEVICE_NAME")
     except Exception:
         return "Intel(R) AI Boost (NPU)"
 
 
-def get_device_properties(device: int = 0) -> Dict[str, Any]:
+def get_device_properties(device: int = 0) -> dict[str, Any]:
     """Get device configuration and hardware capability metadata.
 
     Args:
@@ -250,15 +294,15 @@ def get_device_properties(device: int = 0) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Dictionary containing device name, optimal streams, and supported properties.
     """
+    available = is_available()
     props = {
-        "name": get_device_name(device),
+        "name": get_device_name(device) if available else "No Intel NPU detected",
         "device_id": device,
-        "is_available": is_available(),
+        "is_available": available,
     }
-    if is_available():
+    if available:
+        core = _get_ov_core()
         try:
-            import openvino as ov
-            core = ov.Core()
             props["optimal_infer_requests"] = core.get_property("NPU", "OPTIMAL_NUMBER_OF_INFER_REQUESTS")
         except Exception:
             props["optimal_infer_requests"] = 1
@@ -282,7 +326,7 @@ def empty_cache() -> None:
     logger.info("NPU memory and model caches purged successfully.")
 
 
-def synchronize(device: Optional[int] = None) -> None:
+def synchronize(device: int | None = None) -> None:
     """Wait for all outstanding asynchronous operations on the NPU to complete.
 
     Equivalent to `torch.cuda.synchronize()` for Intel NPU acceleration.
@@ -294,45 +338,30 @@ def synchronize(device: Optional[int] = None) -> None:
     pass
 
 
-import contextlib
-
-
 @contextlib.contextmanager
-def turbo(enable: bool = True):
-    """Context manager to temporarily enable or disable Intel NPU Turbo boost mode.
-
-    Args:
-        enable (bool, optional): Whether to enable Turbo boost. Defaults to True.
-
-    Examples:
-        >>> import intel_npu_acceleration as npu
-        >>> with npu.turbo():
-        ...     output = model(input_tensor)
-    """
+def turbo(enable: bool = True) -> Iterator[None]:
+    """Context manager to temporarily enable or disable Intel NPU Turbo boost mode."""
+    prev = get_turbo_state()
+    restore_to: bool | None = prev
     try:
         enable_turbo(enable)
         yield
     finally:
-        enable_turbo(not enable)
+        if restore_to is not None:
+            enable_turbo(restore_to)
+        else:
+            enable_turbo(False)
 
 
 @contextlib.contextmanager
-def performance_mode(hint: str = "LATENCY"):
-    """Context manager to temporarily set NPU performance mode ('LATENCY' or 'THROUGHPUT').
-
-    Args:
-        hint (str, optional): Target performance mode. Defaults to 'LATENCY'.
-
-    Examples:
-        >>> import intel_npu_acceleration as npu
-        >>> with npu.performance_mode("THROUGHPUT"):
-        ...     results = [model(batch) for batch in batches]
-    """
+def performance_mode(hint: str = "LATENCY") -> Iterator[None]:
+    """Context manager to temporarily set NPU performance mode."""
+    prev = get_performance_hint()
     try:
         set_performance_hint(hint)
         yield
     finally:
-        set_performance_hint("LATENCY")
+        set_performance_hint(prev)
 
 
 def accelerate(model: Any, example_input: Any = None, **kwargs: Any) -> Any:

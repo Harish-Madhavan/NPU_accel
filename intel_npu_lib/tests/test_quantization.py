@@ -1,7 +1,9 @@
 import unittest
+
 import torch
 import torch.nn as nn
-from intel_npu_acceleration import compile_to_npu
+
+from intel_npu_acceleration import compile_to_npu, quantize
 from intel_npu_acceleration.functional import quantized_linear
 
 
@@ -140,6 +142,43 @@ class TestQuantization(unittest.TestCase):
         except Exception as e:
             self.fail(f"INT4 quantized compilation failed: {e}")
 
+    def test_quantize_api_int8_per_channel(self):
+        torch.manual_seed(42)
+        model = nn.Sequential(nn.Linear(16, 8, bias=False))
+        x = torch.randn(2, 16)
+        orig_out = model(x)
+
+        quantize(model, mode="int8", granularity="per-channel")
+        self.assertEqual(model[0].weight.dtype, torch.int8)
+        self.assertEqual(model[0].weight_scale.shape, (8, 1))
+
+        # Test compiling quantized model
+        compiled_model = compile_to_npu(model, x)
+        compiled_out = compiled_model(x)
+
+        # Output should be close to unquantized output
+        self.assertTrue(torch.allclose(compiled_out, orig_out, atol=0.2, rtol=0.2))
+
+    def test_quantize_api_int4_packed(self):
+        torch.manual_seed(42)
+        model = nn.Sequential(nn.Linear(16, 8, bias=False))
+        x = torch.randn(2, 16)
+        orig_out = model(x)
+
+        quantize(model, mode="int4", granularity="per-channel")
+        self.assertEqual(model[0].weight.dtype, torch.uint8)
+        # 16 in_features packed into 8 uint8 columns
+        self.assertEqual(model[0].weight.shape, (8, 8))
+        self.assertEqual(model[0].weight_scale.shape, (8, 1))
+        self.assertEqual(model[0].weight_zero_point.shape, (8, 1))
+
+        # Test compiling int4 model
+        compiled_model = compile_to_npu(model, x)
+        compiled_out = compiled_model(x)
+
+        self.assertTrue(torch.allclose(compiled_out, orig_out, atol=0.3, rtol=0.3))
+
 
 if __name__ == "__main__":
     unittest.main()
+

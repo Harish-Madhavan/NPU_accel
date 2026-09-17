@@ -1,7 +1,9 @@
+import math
 import unittest
+
 import torch
 import torch.nn as nn
-import math
+
 from intel_npu_acceleration.frontend import compile_to_npu
 
 

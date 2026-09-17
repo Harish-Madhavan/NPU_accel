@@ -2,16 +2,19 @@
 Intel NPU Custom Neural Network Modules and Quantization.
 """
 
-from .stateful_kv import NPUStatefulKVCache
-from .quantized import quantize
 from .modules import (
-    Linear,
+    BCEWithLogitsLoss,
     Conv2d,
-    RMSNorm,
-    LayerNorm,
+    CrossEntropyLoss,
     Embedding,
+    L1Loss,
+    LayerNorm,
+    Linear,
     MSELoss,
+    RMSNorm,
 )
+from .quantized import quantize
+from .stateful_kv import NPUStatefulKVCache
 
 __all__ = [
     "NPUStatefulKVCache",
@@ -22,4 +25,7 @@ __all__ = [
     "LayerNorm",
     "Embedding",
     "MSELoss",
+    "CrossEntropyLoss",
+    "L1Loss",
+    "BCEWithLogitsLoss",
 ]

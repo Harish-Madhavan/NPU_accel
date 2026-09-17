@@ -1,5 +1,7 @@
+from typing import List, Optional
+
 import torch
-from typing import Optional, List
+
 from .utils import _C, _is_proxy
 
 
@@ -16,13 +18,13 @@ def transpose(input: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
     return _C.npu_transpose(input, perm)
 
 
-def reshape(input: torch.Tensor, shape: List[int]) -> torch.Tensor:
+def reshape(input: torch.Tensor, shape: list[int]) -> torch.Tensor:
     if _C is None or _is_proxy(input) or input.numel() == 0:
         return torch.reshape(input, shape)
     return _C.npu_reshape(input, list(shape))
 
 
-def squeeze(input: torch.Tensor, dim: Optional[int] = None) -> torch.Tensor:
+def squeeze(input: torch.Tensor, dim: int | None = None) -> torch.Tensor:
     if _C is None or _is_proxy(input) or input.numel() == 0:
         return torch.squeeze(input, dim) if dim is not None else torch.squeeze(input)
     dims = [dim] if dim is not None else []
@@ -35,7 +37,7 @@ def unsqueeze(input: torch.Tensor, dim: int) -> torch.Tensor:
     return _C.npu_unsqueeze(input, [dim])
 
 
-def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+def cat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
     if dim < 0 and len(tensors) > 0:
         dim = dim + len(tensors[0].shape)
     if (
@@ -47,7 +49,7 @@ def cat(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
     return _C.npu_cat(tensors, dim)
 
 
-def stack(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
+def stack(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
     if dim < 0 and len(tensors) > 0:
         dim = dim + len(tensors[0].shape) + 1
     if (
@@ -60,7 +62,7 @@ def stack(tensors: List[torch.Tensor], dim: int = 0) -> torch.Tensor:
 
 
 def mean(
-    input: torch.Tensor, dim: Optional[List[int]] = None, keepdim: bool = False
+    input: torch.Tensor, dim: list[int] | None = None, keepdim: bool = False
 ) -> torch.Tensor:
     if _C is None or _is_proxy(input) or input.numel() == 0:
         if dim is None:
@@ -81,15 +83,15 @@ def index_select(input: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Te
     return _C.npu_index_select(input, dim, index)
 
 
-def zeros(size: List[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def zeros(size: list[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.zeros(size, dtype=dtype)
 
 
-def ones(size: List[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def ones(size: list[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.ones(size, dtype=dtype)
 
 
-def full(size: List[int], fill_value: float, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def full(size: list[int], fill_value: float, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.full(size, fill_value, dtype=dtype)
 
 

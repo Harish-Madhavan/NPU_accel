@@ -2,7 +2,7 @@ line-length = 120
 target-version = "py310"
 
 [lint]
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "C90", "I", "N", "UP", "B", "A", "C4", "TCH", "TID", "Q"]
 ignore = [
     "E501",  # line too long
     "E402",  # module level import not at top of file
@@ -11,4 +11,22 @@ ignore = [
     "F405",  # name may be undefined from star imports
     "F841",  # local variable assigned but never used
     "E741",  # ambiguous variable name
+    "C901",  # too complex
+    "W191",  # tab indentation
+    "N812",  # lowercase imported as non-lowercase
+    "A001",  # shadowing built-in (standard PyTorch: input)
+    "A002",  # shadowing built-in in argument (standard PyTorch: input)
+    "A004",  # shadowing built-in import (standard PyTorch: compile)
+    "TID252", # relative imports from parent modules
+    "UP035",  # deprecated typing imports
+    "B904",   # raise from in except
 ]
+
+[lint.per-file-ignores]
+"intel_npu_lib/tests/*" = ["N806", "N802", "N803", "N812"]
+"tests/*" = ["N806", "N802", "N803", "N812"]
+"examples/*" = ["N806", "N802", "N803", "N812"]
+
+[lint.isort]
+known-first-party = ["intel_npu_acceleration"]
+

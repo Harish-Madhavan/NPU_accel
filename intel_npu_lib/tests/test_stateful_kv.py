@@ -1,10 +1,13 @@
 import unittest
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+
 from intel_npu_acceleration import compile_to_npu
-from intel_npu_acceleration.functional import NPUStatefulKVCache
 from intel_npu_acceleration.frontend import _GRAPH_CACHE
+from intel_npu_acceleration.functional import NPUStatefulKVCache
+
 
 class TestStatefulKVCache(unittest.TestCase):
     def setUp(self):

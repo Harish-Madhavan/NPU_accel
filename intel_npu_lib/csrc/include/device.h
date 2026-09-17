@@ -108,6 +108,20 @@ public:
     bool isPropertySupported(const std::string& key) const;
 
     /**
+     * @brief Retrieve a cache-key suffix describing the active compile configuration.
+     *
+     * Eager binaries are cached by op/shape/dtype; the performance hint and
+     * eager device also affect compilation, so they must participate in the
+     * key to avoid reusing a stale binary after a hint change.
+     */
+    std::string getCompileConfigKey() const;
+
+    /**
+     * @brief Retrieve the configured eager execution device ("NPU" or "CPU").
+     */
+    std::string getEagerDevice() const;
+
+    /**
      * @brief Retrieve a comma-separated list of all driver-supported property keys.
      */
     std::string getSupportedPropertiesList() const;
@@ -151,7 +165,7 @@ private:
     std::list<std::string> m_access_order;
     const size_t m_max_cache_size = 200;
 
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     bool m_is_available;
     bool m_has_context = false;               ///< True when RemoteContext init succeeded
     bool m_has_zero_context = false;          ///< True when ZeroContext init succeeded
@@ -170,4 +184,6 @@ void set_npu_cache_dir(const std::string& path);
 void set_npu_property(const std::string& key, const std::string& value);
 void set_npu_performance_hint(const std::string& hint);
 void set_npu_eager_device(const std::string& device);
+void set_npu_turbo(bool enable);
+void set_npu_sda(bool enable);
 void clear_cpp_model_cache();

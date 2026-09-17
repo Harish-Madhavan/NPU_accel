@@ -1,13 +1,14 @@
+from intel_npu_acceleration.exceptions import NPUCompilationError
+
 from .compiler import (
+    _GRAPH_CACHE,
+    NPUTracer,
+    clear_graph_cache,
     compile,
     compile_to_npu,
     export_openvino_ir,
-    NPUCompilationError,
-    NPUTracer,
-    _GRAPH_CACHE,
-    clear_graph_cache,
 )
-from .graph_module import NPUGraphModule, NPUDynamicGraphModule
+from .graph_module import NPUDynamicGraphModule, NPUGraphModule
 
 __all__ = [
     "compile",

@@ -5,10 +5,12 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
 
 import time
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
+
 import intel_npu_acceleration as npu_compiler
 import intel_npu_acceleration.functional as n_f
 from intel_npu_acceleration.nn import NPUStatefulKVCache
@@ -94,9 +96,9 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        cache_k: Optional[torch.Tensor] = None,
-        cache_v: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None,
+        cache_k: torch.Tensor | None = None,
+        cache_v: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -174,7 +176,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: torch.Tensor | None,
         cache_k=None,
         cache_v=None,
     ):
@@ -214,7 +216,7 @@ class Llama(nn.Module):
         self,
         tokens: torch.Tensor,
         start_pos: int,
-        kv_cache: Optional[torch.Tensor] = None,
+        kv_cache: torch.Tensor | None = None,
     ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
@@ -382,63 +384,6 @@ class StatefulLlama(nn.Module):
 # =====================================================================
 
 def run_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig):
-    # Convert characters to ASCII integers
-    tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
-    if not tokens:
-        tokens = [32]  # space
-
-    print(f"  Prompt tokens: {tokens}")
-    print(f"  Generated Text : '{prompt}", end="", flush=True)
-
-    # Initialize Cache (N_Layers * 2, B, MaxSeqLen, H, D)
-    kv_cache = torch.zeros(
-        conf.n_layers * 2,
-        1,
-        conf.max_seq_len,
-        conf.n_kv_heads,
-        conf.dim // conf.n_heads,
-    )
-
-    t_start = time.time()
-
-    # 1. Prefill Phase
-    for start_pos, tok_id in enumerate(tokens[:-1]):
-        input_t = torch.tensor([[tok_id]], dtype=torch.long)
-        _, kv_cache = npu_model(input_t, start_pos, kv_cache)
-
-    next_token = tokens[-1]
-    start_pos = len(tokens) - 1
-
-    # 2. Decode Phase
-    latencies = []
-    for step in range(max_gen_len):
-        current_pos = start_pos + step
-        if current_pos >= conf.max_seq_len:
-            break
-
-        input_t = torch.tensor([[next_token]], dtype=torch.long)
-
-        t0 = time.time()
-        logits, kv_cache = npu_model(input_t, current_pos, kv_cache)
-        t1 = time.time()
-        latencies.append((t1 - t0) * 1000.0)
-
-        # Greedy decoding: pick highest logit index
-        next_token = torch.argmax(logits[0, -1]).item()
-
-        # Safe ASCII decode
-        char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
-        print(char, end="", flush=True)
-        time.sleep(0.015)
-
-    t_total = time.time() - t_start
-    avg_step = sum(latencies) / len(latencies) if latencies else 0
-    print(f"'\n  [Metrics] Generation finished in {t_total:.2f}s | Avg decode step: {avg_step:.2f} ms")
-    return avg_step
-
-
-def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig, raw_model: StatefulLlama):
-    # Convert characters to ASCII integers
     tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
     if not tokens:
         tokens = [32]
@@ -446,65 +391,83 @@ def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf:
     print(f"  Prompt tokens: {tokens}")
     print(f"  Generated Text : '{prompt}", end="", flush=True)
 
-    # Reset both compiler execution streams and python fallback cache buffers
+    kv_cache = torch.zeros(
+        conf.n_layers * 2, 1, conf.max_seq_len, conf.n_kv_heads, conf.dim // conf.n_heads,
+    )
+
+    t_start = time.perf_counter()
+    with torch.inference_mode():
+        for start_pos, tok_id in enumerate(tokens[:-1]):
+            input_t = torch.tensor([[tok_id]], dtype=torch.long)
+            _, kv_cache = npu_model(input_t, start_pos, kv_cache)
+
+        next_token = tokens[-1]
+        start_pos = len(tokens) - 1
+        latencies = []
+        for step in range(max_gen_len):
+            current_pos = start_pos + step
+            if current_pos >= conf.max_seq_len:
+                break
+            input_t = torch.tensor([[next_token]], dtype=torch.long)
+            t0 = time.perf_counter()
+            logits, kv_cache = npu_model(input_t, current_pos, kv_cache)
+            latencies.append((time.perf_counter() - t0) * 1000.0)
+            next_token = torch.argmax(logits[0, -1]).item()
+            char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else "."
+            print(char, end="", flush=True)
+
+    t_total = time.perf_counter() - t_start
+    avg_step = sum(latencies) / len(latencies) if latencies else 0
+    print(f"'\n  [Metrics] Generation finished in {t_total:.2f}s | Avg decode step: {avg_step:.2f} ms")
+    return avg_step
+
+
+def run_stateful_text_generation(npu_model, prompt: str, max_gen_len: int, conf: LlamaConfig, raw_model: StatefulLlama):
+    tokens = [ord(c) for c in prompt if ord(c) < conf.vocab_size]
+    if not tokens:
+        tokens = [32]
+
+    print(f"  Prompt tokens: {tokens}")
+    print(f"  Generated Text : '{prompt}", end="", flush=True)
+
     npu_model.reset_states()
     for layer in raw_model.layers:
         layer.attention.cache_k.reset()
         layer.attention.cache_v.reset()
 
-    # Precompute RoPE cos/sin freqs
-    freqs_cos, freqs_sin = precompute_freqs_cis(
-        conf.dim // conf.n_heads, conf.max_seq_len * 2
-    )
+    freqs_cos, freqs_sin = precompute_freqs_cis(conf.dim // conf.n_heads, conf.max_seq_len * 2)
+    t_start = time.perf_counter()
+    with torch.inference_mode():
+        for start_pos, tok_id in enumerate(tokens[:-1]):
+            input_t = torch.tensor([[tok_id]], dtype=torch.long)
+            idx = torch.tensor([start_pos])
+            cos = freqs_cos[idx]
+            sin = freqs_sin[idx]
+            mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
+            mask[0, 0, 0, : start_pos + 1] = 0.0
+            npu_model(input_t, cos, sin, mask)
 
-    t_start = time.time()
+        next_token = tokens[-1]
+        start_pos = len(tokens) - 1
+        latencies = []
+        for step in range(max_gen_len):
+            current_pos = start_pos + step
+            if current_pos >= conf.max_seq_len:
+                break
+            input_t = torch.tensor([[next_token]], dtype=torch.long)
+            idx = torch.tensor([current_pos])
+            cos = freqs_cos[idx]
+            sin = freqs_sin[idx]
+            mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
+            mask[0, 0, 0, : current_pos + 1] = 0.0
+            t0 = time.perf_counter()
+            logits = npu_model(input_t, cos, sin, mask)
+            latencies.append((time.perf_counter() - t0) * 1000.0)
+            next_token = torch.argmax(logits[0, -1]).item()
+            char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else "."
+            print(char, end="", flush=True)
 
-    # 1. Prefill Phase
-    for start_pos, tok_id in enumerate(tokens[:-1]):
-        input_t = torch.tensor([[tok_id]], dtype=torch.long)
-
-        idx = torch.tensor([start_pos])
-        cos = freqs_cos[idx]  # shape: (1, 8)
-        sin = freqs_sin[idx]  # shape: (1, 8)
-
-        # Causal mask: 1 for active positions, -inf for futures
-        mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
-        mask[0, 0, 0, : start_pos + 1] = 0.0
-
-        npu_model(input_t, cos, sin, mask)
-
-    next_token = tokens[-1]
-    start_pos = len(tokens) - 1
-
-    # 2. Decode Phase
-    latencies = []
-    for step in range(max_gen_len):
-        current_pos = start_pos + step
-        if current_pos >= conf.max_seq_len:
-            break
-
-        input_t = torch.tensor([[next_token]], dtype=torch.long)
-
-        idx = torch.tensor([current_pos])
-        cos = freqs_cos[idx]  # shape: (1, 8)
-        sin = freqs_sin[idx]  # shape: (1, 8)
-
-        mask = torch.full((1, 1, 1, conf.max_seq_len), float("-inf"))
-        mask[0, 0, 0, : current_pos + 1] = 0.0
-
-        t0 = time.time()
-        logits = npu_model(input_t, cos, sin, mask)
-        t1 = time.time()
-        latencies.append((t1 - t0) * 1000.0)
-
-        # Greedy decoding
-        next_token = torch.argmax(logits[0, -1]).item()
-
-        char = chr(next_token) if 32 <= next_token <= 126 or next_token in (10, 13) else '.'
-        print(char, end="", flush=True)
-        time.sleep(0.015)
-
-    t_total = time.time() - t_start
+    t_total = time.perf_counter() - t_start
     avg_step = sum(latencies) / len(latencies) if latencies else 0
     print(f"'\n  [Metrics] Generation finished in {t_total:.2f}s | Avg decode step: {avg_step:.2f} ms")
     return avg_step
@@ -540,9 +503,9 @@ def main():
     )
 
     print("\n[Step 1] Compiling Tiny LLaMA FP16 model (Functional Cache) for NPU...")
-    t0 = time.time()
+    t0 = time.perf_counter()
     npu_model_fp16 = npu_compiler.compile_to_npu(model, (compile_input_token, compile_start_pos, compile_cache))
-    print(f"Compilation finished in {time.time() - t0:.2f}s.")
+    print(f"Compilation finished in {time.perf_counter() - t0:.2f}s.")
 
     print("\n[Step 2] Executing Autoregressive Text Generation (NPU FP16 - Functional):")
     fp16_latency = run_text_generation(npu_model_fp16, prompt, max_gen_len, conf)
@@ -573,13 +536,13 @@ def main():
     compile_mask = torch.zeros(1, 1, 1, conf.max_seq_len)
 
     print("\n[Step 4] Compiling Stateful Tiny LLaMA (Zero-Transfer Registers) for NPU...")
-    t0 = time.time()
+    t0 = time.perf_counter()
     npu_model_stateful = npu_compiler.compile_to_npu(
         stateful_model,
         (compile_input_token, compile_cos, compile_sin, compile_mask),
         strict=True,
     )
-    print(f"Compilation finished in {time.time() - t0:.2f}s.")
+    print(f"Compilation finished in {time.perf_counter() - t0:.2f}s.")
 
     print("\n[Step 5] Executing Autoregressive Text Generation (NPU FP16 - Stateful Registers):")
     stateful_latency = run_stateful_text_generation(

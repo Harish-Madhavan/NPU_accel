@@ -149,9 +149,9 @@ Priority 4 (Validation):
 | Compile Transformer blocks to NPU | ✅ **Ready** |
 | Functional KV-cache autoregressive generation | ✅ **Ready** |
 | Stateful (zero-transfer) KV-cache generation | ✅ **Ready** (single-layer tested) |
-| INT8 weight quantization | ✅ **Ready** (simulated) |
-| INT4 weight quantization | ✅ **Ready** (simulated) |
-| Multi-layer stateful mapping (auto) | ❌ **Not implemented** |
+| INT8 weight quantization | ✅ **Ready** (per-channel & per-tensor) |
+| INT4 weight quantization | ✅ **Ready** (packed uint8 with zero-point offsets) |
+| Multi-layer stateful mapping (auto) | ✅ **Ready** (auto-mapped via `stateful=True`) |
 | Real SLM weight loading (HF) | ❌ **Not implemented** |
 | True NNCF PTQ (native NPU precision) | ❌ **Not implemented** |
 | Async/throughput multi-stream inference | ✅ **Ready** |

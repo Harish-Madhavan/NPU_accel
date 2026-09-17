@@ -1,9 +1,11 @@
-import torch
 import unittest
+
+import torch
+
 import intel_npu_acceleration
 from intel_npu_acceleration.frontend import (
-    NPUGraphModule,
     NPUCompilationError,
+    NPUGraphModule,
 )
 
 

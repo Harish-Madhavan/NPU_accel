@@ -8,7 +8,9 @@ optimizations.
 """
 
 import logging
-from typing import List, Any, Callable
+from collections.abc import Callable
+from typing import Any
+
 import torch
 import torch.fx
 
@@ -19,7 +21,7 @@ try:
 
     def _compile_backend(
         gm: torch.fx.GraphModule,
-        example_inputs: List[torch.Tensor],
+        example_inputs: list[torch.Tensor],
         **kwargs: Any
     ) -> Callable[..., Any]:
         """TorchDynamo compiler backend entrypoint for Intel NPU compilation.
@@ -70,7 +72,7 @@ try:
         placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
         used_mask = []
         filtered_inputs = []
-        for node, val in zip(placeholders, example_inputs):
+        for node, val in zip(placeholders, example_inputs, strict=False):
             if len(node.users) == 0:
                 gm.graph.erase_node(node)
                 used_mask.append(False)
@@ -125,5 +127,5 @@ try:
     register_backend(name="intel_npu", compiler_fn=_compile_backend)
     logger.debug("Successfully registered 'npu' and 'intel_npu' TorchDynamo backends.")
 
-except ImportError:
-    pass
+except Exception as e:
+    logger.debug(f"TorchDynamo NPU backend registration skipped: {e}")

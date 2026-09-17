@@ -1,34 +1,36 @@
-import re
 import logging
+from collections import deque
+from typing import Any
+
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
-from typing import Optional, List, Set, Dict, Any
+
+from intel_npu_acceleration.utils import clean_name as clean_node_name
 
 logger = logging.getLogger(__name__)
 
 
-def clean_node_name(n: str) -> str:
-    """Normalize and clean node names for robust placeholder-to-parameter matching."""
-    n = re.sub(r"^[lL]__?", "", n)
-    return re.sub(r"[\d._]+$", "", n).lower()
+def _build_placeholder_maps(
+    all_placeholder_names: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    exact = {name.lower(): idx for idx, name in enumerate(all_placeholder_names)}
+    cleaned = {clean_node_name(name): idx for idx, name in enumerate(all_placeholder_names)}
+    return exact, cleaned
 
 
 def fold_scalar_parameter_inputs(
     ov_model: ov.Model,
     example_input_tuple: tuple,
-    all_placeholder_names: List[str],
+    all_placeholder_names: list[str],
 ) -> ov.Model:
     """
     Replace scalar Parameter inputs with Constant nodes to enable compile-time
     folding of dynamic shapes, slices, and scalar control signals.
     """
-    placeholder_name_to_idx = {
-        name.lower(): idx for idx, name in enumerate(all_placeholder_names)
-    }
-    cleaned_placeholder_to_idx = {
-        clean_node_name(name): idx for idx, name in enumerate(all_placeholder_names)
-    }
+    placeholder_name_to_idx, cleaned_placeholder_to_idx = _build_placeholder_maps(
+        all_placeholder_names
+    )
 
     parameters_to_keep = []
     for i, param in enumerate(ov_model.get_parameters()):
@@ -67,12 +69,12 @@ def fold_scalar_parameter_inputs(
 def reshape_model_inputs_to_static(
     ov_model: ov.Model,
     example_input_tuple: tuple,
-    all_placeholder_names: List[str],
+    all_placeholder_names: list[str],
 ) -> None:
     """
     Reshape remaining non-scalar inputs to static shapes to satisfy NPU upper bound constraints.
     """
-    new_shapes = {}
+    new_shapes: dict[str, list[int]] = {}
     if len(ov_model.inputs) == len(example_input_tuple):
         # Exact 1-to-1 positional correspondence
         for i, inp in enumerate(ov_model.inputs):
@@ -83,12 +85,9 @@ def reshape_model_inputs_to_static(
             else:
                 new_shapes[name] = [1]
     else:
-        placeholder_name_to_idx = {
-            name.lower(): idx for idx, name in enumerate(all_placeholder_names)
-        }
-        cleaned_placeholder_to_idx = {
-            clean_node_name(name): idx for idx, name in enumerate(all_placeholder_names)
-        }
+        placeholder_name_to_idx, cleaned_placeholder_to_idx = _build_placeholder_maps(
+            all_placeholder_names
+        )
 
         for i, inp in enumerate(ov_model.inputs):
             name = inp.any_name
@@ -121,7 +120,7 @@ def reshape_model_inputs_to_static(
 def transform_stateful_kv_cache(
     ov_model: ov.Model,
     stateful: bool,
-    stateful_modules: List[Any],
+    stateful_modules: list[Any],
 ) -> ov.Model:
     """
     Transform functional KV cache Scatter operations into stateful ReadValue / Assign
@@ -225,8 +224,8 @@ def transform_stateful_kv_cache(
     ]
 
     # Perform reachability analysis from outputs and sinks to clean up unused parameters
-    reachable_nodes = set()
-    queue = []
+    reachable_nodes: set[Any] = set()
+    queue: deque = deque()
     for r in results_outputs:
         node = r.get_node() if hasattr(r, "get_node") else r
         if node not in reachable_nodes:
@@ -239,7 +238,7 @@ def transform_stateful_kv_cache(
             queue.append(node)
 
     while queue:
-        curr = queue.pop(0)
+        curr = queue.popleft()
         for inp in curr.inputs():
             src_node = inp.get_source_output().get_node()
             if src_node not in reachable_nodes:
@@ -257,7 +256,7 @@ def transform_stateful_kv_cache(
     )
 
 
-def configure_input_ppp(inp_info: Any, cfg: Dict[str, Any]) -> None:
+def configure_input_ppp(inp_info: Any, cfg: dict[str, Any]) -> None:
     """Configure input pre-processing steps using OpenVINO PrePostProcessor."""
     if "shape" in cfg:
         inp_info.tensor().set_shape(list(cfg["shape"]))
@@ -326,7 +325,7 @@ def configure_input_ppp(inp_info: Any, cfg: Dict[str, Any]) -> None:
         inp_info.preprocess().convert_layout(ov.Layout(cfg["model_layout"]))
 
 
-def configure_output_ppp(out_info: Any, cfg: Dict[str, Any]) -> None:
+def configure_output_ppp(out_info: Any, cfg: dict[str, Any]) -> None:
     """Configure output post-processing steps using OpenVINO PrePostProcessor."""
     if "element_type" in cfg:
         t = cfg["element_type"]
@@ -336,7 +335,7 @@ def configure_output_ppp(out_info: Any, cfg: Dict[str, Any]) -> None:
 
 
 def apply_pre_post_processing(
-    ov_model: ov.Model, preprocess_config: Optional[Dict[str, Any]]
+    ov_model: ov.Model, preprocess_config: dict[str, Any] | None
 ) -> ov.Model:
     """
     Apply OpenVINO PrePostProcessor (PPP) pipeline to offload layout transpositions,
@@ -400,7 +399,7 @@ def optimize_ov_model(ov_model: ov.Model, precision: str = "auto") -> ov.Model:
 
 
 def serialize_openvino_model(
-    ov_model: ov.Model, xml_path: str, bin_path: Optional[str] = None
+    ov_model: ov.Model, xml_path: str, bin_path: str | None = None
 ) -> None:
     """
     Serialize an OpenVINO Model into Intermediate Representation (.xml and .bin).

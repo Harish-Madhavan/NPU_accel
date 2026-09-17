@@ -5,10 +5,13 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
 
 import argparse
+import os
+import sys
 import time
-import math
+
 import numpy as np
 import torch
+
 import intel_npu_acceleration as npu
 
 
@@ -68,6 +71,8 @@ def main():
     parser.add_argument("--size", type=int, default=1024, help="Matrix dimension size (NxN)")
     parser.add_argument("--iters", type=int, default=50, help="Number of benchmark iterations")
     parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations")
+    parser.add_argument("--export-json", type=str, default=None, help="Path to export profiling metrics as JSON")
+    parser.add_argument("--export-markdown", type=str, default=None, help="Path to export profiling report as Markdown")
     args = parser.parse_args()
 
     # Print System Diagnostic Summary
@@ -111,6 +116,60 @@ def main():
     print(f" {'Std Deviation':<18} | {cpu_stats['std']:>12.3f} ms | {npu_stats['std']:>12.3f} ms | -")
     print(f" {'Throughput':<18} | {cpu_gops:>12.2f} GOPS | {npu_gops:>12.2f} GOPS | -")
     print(banner + "\n")
+
+    if args.export_json:
+        import json
+        profile_data = {
+            "workload": {"model": "ProfilerModel", "size": args.size, "iters": args.iters, "warmup": args.warmup},
+            "cpu": {
+                "mean_ms": float(cpu_stats["mean"]),
+                "min_ms": float(cpu_stats["min"]),
+                "max_ms": float(cpu_stats["max"]),
+                "p50_ms": float(cpu_stats["p50"]),
+                "p95_ms": float(cpu_stats["p95"]),
+                "p99_ms": float(cpu_stats["p99"]),
+                "std_ms": float(cpu_stats["std"]),
+                "gops": float(cpu_gops),
+            },
+            "npu": {
+                "mean_ms": float(npu_stats["mean"]),
+                "min_ms": float(npu_stats["min"]),
+                "max_ms": float(npu_stats["max"]),
+                "p50_ms": float(npu_stats["p50"]),
+                "p95_ms": float(npu_stats["p95"]),
+                "p99_ms": float(npu_stats["p99"]),
+                "std_ms": float(npu_stats["std"]),
+                "gops": float(npu_gops),
+            },
+            "speedup_vs_cpu": float(speedup),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.export_json)), exist_ok=True)
+        with open(args.export_json, "w", encoding="utf-8") as f:
+            json.dump(profile_data, f, indent=2)
+        print(f"[Export] Saved profiling metrics JSON to: {args.export_json}")
+
+    if args.export_markdown:
+        os.makedirs(os.path.dirname(os.path.abspath(args.export_markdown)), exist_ok=True)
+        md_text = f"""# Intel NPU Model Profiling Report
+
+- **Workload**: 2-Layer MLP with GELU + SiLU (`ProfilerModel`)
+- **Dimension**: {args.size} x {args.size}
+- **Benchmark Iterations**: {args.iters} (Warmup: {args.warmup})
+
+| Metric | PyTorch CPU | Intel NPU (`torch.compile`) | Speedup / Improvement |
+| :--- | :---: | :---: | :---: |
+| **Mean Latency** | {cpu_stats['mean']:.3f} ms | {npu_stats['mean']:.3f} ms | **{speedup:.2f}x speedup** |
+| **Min Latency** | {cpu_stats['min']:.3f} ms | {npu_stats['min']:.3f} ms | - |
+| **Max Latency** | {cpu_stats['max']:.3f} ms | {npu_stats['max']:.3f} ms | - |
+| **P50 (Median)** | {cpu_stats['p50']:.3f} ms | {npu_stats['p50']:.3f} ms | - |
+| **P95 (95th %ile)** | {cpu_stats['p95']:.3f} ms | {npu_stats['p95']:.3f} ms | - |
+| **P99 (99th %ile)** | {cpu_stats['p99']:.3f} ms | {npu_stats['p99']:.3f} ms | - |
+| **Std Deviation** | {cpu_stats['std']:.3f} ms | {npu_stats['std']:.3f} ms | - |
+| **Throughput** | {cpu_gops:.2f} GOPS | **{npu_gops:.2f} GOPS** | **{speedup:.2f}x** |
+"""
+        with open(args.export_markdown, "w", encoding="utf-8") as f:
+            f.write(md_text)
+        print(f"[Export] Saved profiling report Markdown to: {args.export_markdown}")
 
 
 if __name__ == "__main__":

@@ -13,9 +13,11 @@ import sys
 # Ensure library is importable when run directly from repository
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intel_npu_lib", "src")))
 
-import time
 import argparse
+import time
+
 import torch
+
 import intel_npu_acceleration as npu
 
 

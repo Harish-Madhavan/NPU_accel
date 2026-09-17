@@ -5,12 +5,21 @@ This module defines standardized exceptions for device discovery, runtime execut
 graph compilation, and unsupported operation errors across the library.
 """
 
+__all__ = [
+    "NPUError",
+    "NPURuntimeError",
+    "NPUDeviceError",
+    "NPUCompilationError",
+    "NPUUnsupportedOpError",
+]
+
 
 class NPUError(Exception):
     """Base exception for all Intel NPU Acceleration errors.
 
     All custom exceptions raised by `intel_npu_acceleration` inherit from this base class.
     """
+
     pass
 
 

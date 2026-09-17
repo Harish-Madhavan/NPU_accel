@@ -1,6 +1,8 @@
 import unittest
+
 import torch
 import torch.nn as nn
+
 from intel_npu_acceleration import compile
 
 

@@ -46,6 +46,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_rmsnorm_backward", &npu_rmsnorm_backward, "NPU accelerated RMSNorm Backward");
     m.def("npu_mse_loss", &npu_mse_loss, "NPU accelerated MSE Loss");
     m.def("npu_mse_loss_backward", &npu_mse_loss_backward, "NPU accelerated MSE Loss Backward");
+    m.def("npu_cross_entropy_loss", &npu_cross_entropy_loss, "NPU accelerated Cross Entropy Loss");
+    m.def("npu_cross_entropy_loss_backward", &npu_cross_entropy_loss_backward,
+          "NPU accelerated Cross Entropy Loss Backward");
+    m.def("npu_l1_loss", &npu_l1_loss, "NPU accelerated L1 Loss");
+    m.def("npu_l1_loss_backward", &npu_l1_loss_backward, "NPU accelerated L1 Loss Backward");
     m.def("npu_adam_step", &npu_adam_step, "NPU accelerated Adam Optimizer Step");
     m.def("npu_sgd_step", &npu_sgd_step, "NPU accelerated SGD Optimizer Step");
     m.def("set_cache_dir", &set_npu_cache_dir, "Set OpenVINO disk cache directory");
@@ -53,6 +58,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_performance_hint", &set_npu_performance_hint,
           "Set performance hint (LATENCY, THROUGHPUT)");
     m.def("set_eager_device", &set_npu_eager_device, "Set device for eager operations (CPU, NPU)");
+    m.def("enable_turbo", &set_npu_turbo, "Enable/disable NPU Turbo boost mode");
+    m.def("enable_sda", &set_npu_sda, "Enable/disable Shared Device Address zero-copy transfers");
     m.def("clear_cpp_model_cache", &clear_cpp_model_cache, "Clear in-memory C++ model cache");
     m.def("get_cache_version", []() {
         return NPUBackend::getInstance().getCacheVersion();

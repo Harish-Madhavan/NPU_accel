@@ -1,9 +1,11 @@
-import unittest
 import os
 import tempfile
+import unittest
+
+import openvino as ov
 import torch
 import torch.nn as nn
-import openvino as ov
+
 import intel_npu_acceleration as npu
 from intel_npu_acceleration.frontend import export_openvino_ir
 
@@ -117,8 +119,9 @@ class TestOpenVINOFeatures(unittest.TestCase):
 
     def test_optimize_ov_model(self):
         import numpy as np
-        from intel_npu_acceleration.frontend.transformations import optimize_ov_model
         import openvino.opset13 as ops
+
+        from intel_npu_acceleration.frontend.transformations import optimize_ov_model
 
         # Construct a graph with constant addition that can be folded: const(2) + const(3)
         const1 = ops.constant(np.array([2.0], dtype=np.float32))
