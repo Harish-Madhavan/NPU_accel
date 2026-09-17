@@ -46,6 +46,8 @@ class TestPyTorchBackendConformance(unittest.TestCase):
     def test_torch_npu_module_apis(self):
         """Verify the full torch.npu API surface mirroring torch.cuda / torch.xpu."""
         self.assertTrue(hasattr(torch, "npu"))
+        if not npu.is_available():
+            self.skipTest("Intel NPU not available — skipping NPU-specific test")
         self.assertTrue(torch.npu.is_available())
         self.assertGreaterEqual(torch.npu.device_count(), 1)
         self.assertEqual(torch.npu.current_device(), 0)
@@ -139,7 +141,9 @@ class TestPyTorchBackendConformance(unittest.TestCase):
     def test_torch_backends_npu(self):
         """Verify torch.backends.npu properties, version, and optimization flags."""
         self.assertTrue(hasattr(torch.backends, "npu"))
-        self.assertTrue(torch.backends.npu.is_available())
+        # Availability must mirror the library probe in every environment
+        # (True on NPU hardware, False on hardware-less CI runners).
+        self.assertEqual(torch.backends.npu.is_available(), npu.is_available())
         self.assertEqual(torch.backends.npu.version(), "0.2.0")
 
         self.assertFalse(torch.backends.npu.matmul.allow_tf32)
@@ -164,6 +168,8 @@ class TestPyTorchBackendConformance(unittest.TestCase):
 
         import torch.accelerator as acc
 
+        if not npu.is_available():
+            self.skipTest("Intel NPU not available — skipping NPU-specific test")
         self.assertTrue(acc.is_available())
         self.assertGreaterEqual(acc.device_count(), 1)
         self.assertEqual(str(acc.current_accelerator()), "npu")
