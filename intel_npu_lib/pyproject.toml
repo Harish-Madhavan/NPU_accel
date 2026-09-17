@@ -2,7 +2,7 @@
 # NOTE: torch + openvino are required at *build* time because setup.py uses
 # torch.utils.cpp_extension and links against OpenVINO headers/libs.
 # CI pre-installs them, then builds with --no-build-isolation.
-requires = ["setuptools>=61", "wheel", "torch>=2.1", "openvino>=2024.0.0"]
+requires = ["setuptools>=77", "wheel", "torch>=2.1", "openvino>=2024.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,7 +14,7 @@ description = "PyTorch acceleration library for Intel NPU — Level Zero / OpenV
 # that links to the full repo-root documentation).
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 keywords = ["intel", "npu", "openvino", "pytorch", "level-zero"]
 classifiers = [
     "Programming Language :: Python :: 3",

@@ -34,16 +34,22 @@ from setuptools import setup
 
 
 def get_sources():
-    """Return the ordered list of C++ sources for the ``_C`` extension."""
-    csrc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+    """Return the ordered list of C++ sources for the ``_C`` extension.
+
+    Paths MUST be '/'-separated and relative to this directory: modern
+    setuptools rejects absolute paths (``editable_wheel`` / ``bdist_wheel``
+    fail with "setup script specifies an absolute path"), even though the
+    legacy ``setup.py build_ext --inplace`` path tolerates them.
+    """
     sources = [
-        os.path.join(csrc_dir, "bindings.cpp"),
-        os.path.join(csrc_dir, "device.cpp"),
-        os.path.join(csrc_dir, "ops.cpp"),
+        "csrc/bindings.cpp",
+        "csrc/device.cpp",
+        "csrc/ops.cpp",
     ]
-    missing = [s for s in sources if not os.path.isfile(s)]
+    here = os.path.dirname(os.path.abspath(__file__))
+    missing = [s for s in sources if not os.path.isfile(os.path.join(here, s))]
     if missing:
-        raise FileNotFoundError(f"C++ sources missing: {missing}")
+        raise FileNotFoundError(f"C++ sources missing under {here}: {missing}")
     return sources
 
 

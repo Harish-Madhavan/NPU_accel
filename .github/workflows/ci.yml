@@ -56,7 +56,9 @@ jobs:
         pip install ninja pytest pytest-cov build ruff
         cd intel_npu_lib
         python setup.py build_ext --inplace
-        pip install --no-build-isolation --no-deps -e .
+        # Reuse the inplace-built _C binary instead of compiling a second time:
+        # the editable install maps the package to src/, where the .pyd lives.
+        NPU_NO_BUILD_EXT=1 pip install --no-build-isolation --no-deps -e .
       shell: bash
         
     - name: Run linter
