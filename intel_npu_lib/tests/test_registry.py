@@ -1,63 +1,71 @@
 import operator
-import unittest
 
+import pytest
 import torch
 
 import intel_npu_acceleration.functional as npu_func
 from intel_npu_acceleration.registry import OpRegistry
 
 
-class TestOpRegistry(unittest.TestCase):
-    def test_supported_functions(self):
+@pytest.mark.parametrize(
+    "fn",
+    [
         # Math & elementwise
-        self.assertTrue(OpRegistry.get_function(torch.add))
-        self.assertTrue(OpRegistry.get_function(torch.sub))
-        self.assertTrue(OpRegistry.get_function(torch.mul))
-        self.assertTrue(OpRegistry.get_function(torch.div))
-        self.assertTrue(OpRegistry.get_function(torch.neg))
-        self.assertTrue(OpRegistry.get_function(torch.matmul))
-
+        torch.add,
+        torch.sub,
+        torch.mul,
+        torch.div,
+        torch.neg,
+        torch.matmul,
         # Functional mappings
-        self.assertTrue(OpRegistry.get_function(npu_func.add))
-        self.assertTrue(OpRegistry.get_function(npu_func.linear))
-        self.assertTrue(OpRegistry.get_function(npu_func.rmsnorm))
-        self.assertTrue(OpRegistry.get_function(npu_func.update_kv_cache))
-        self.assertTrue(OpRegistry.get_function(npu_func.quantized_linear))
-
+        npu_func.add,
+        npu_func.linear,
+        npu_func.rmsnorm,
+        npu_func.update_kv_cache,
+        npu_func.quantized_linear,
         # NN activations & normalizations
-        self.assertTrue(OpRegistry.get_function(torch.nn.functional.relu))
-        self.assertTrue(OpRegistry.get_function(torch.nn.functional.gelu))
-        self.assertTrue(OpRegistry.get_function(torch.nn.functional.silu))
-        self.assertTrue(OpRegistry.get_function(torch.nn.functional.softmax))
-        self.assertTrue(OpRegistry.get_function(torch.nn.functional.layer_norm))
-
-    def test_supported_methods(self):
-        self.assertTrue(OpRegistry.get_method("add"))
-        self.assertTrue(OpRegistry.get_method("matmul"))
-        self.assertTrue(OpRegistry.get_method("transpose"))
-        self.assertTrue(OpRegistry.get_method("reshape"))
-        self.assertTrue(OpRegistry.get_method("view"))
-        self.assertTrue(OpRegistry.get_method("contiguous"))
-        self.assertTrue(OpRegistry.get_method("clone"))
-
-        # Unsupported method
-        self.assertIsNone(OpRegistry.get_method("non_existent_method_xyz"))
-
-    def test_supported_modules(self):
-        self.assertTrue(OpRegistry.get_module(torch.nn.Linear))
-        self.assertTrue(OpRegistry.get_module(torch.nn.ReLU))
-        self.assertTrue(OpRegistry.get_module(torch.nn.GELU))
-        self.assertTrue(OpRegistry.get_module(torch.nn.SiLU))
-        self.assertTrue(OpRegistry.get_module(torch.nn.LayerNorm))
-        self.assertTrue(OpRegistry.get_module(torch.nn.Conv2d))
-        self.assertTrue(OpRegistry.get_module(torch.nn.Embedding))
-        self.assertTrue(OpRegistry.get_module(npu_func.NPUStatefulKVCache))
-
-        # Unsupported custom module
-        class UnsupportedCustomModule(torch.nn.Module):
-            pass
-        self.assertIsNone(OpRegistry.get_module(UnsupportedCustomModule))
+        torch.nn.functional.relu,
+        torch.nn.functional.gelu,
+        torch.nn.functional.silu,
+        torch.nn.functional.softmax,
+        torch.nn.functional.layer_norm,
+    ],
+)
+def test_supported_functions(fn):
+    assert OpRegistry.get_function(fn)
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize(
+    "name",
+    ["add", "matmul", "transpose", "reshape", "view", "contiguous", "clone"],
+)
+def test_supported_methods(name):
+    assert OpRegistry.get_method(name)
+
+
+def test_unsupported_method():
+    assert OpRegistry.get_method("non_existent_method_xyz") is None
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        torch.nn.Linear,
+        torch.nn.ReLU,
+        torch.nn.GELU,
+        torch.nn.SiLU,
+        torch.nn.LayerNorm,
+        torch.nn.Conv2d,
+        torch.nn.Embedding,
+        npu_func.NPUStatefulKVCache,
+    ],
+)
+def test_supported_modules(module):
+    assert OpRegistry.get_module(module)
+
+
+def test_unsupported_module():
+    class UnsupportedCustomModule(torch.nn.Module):
+        pass
+
+    assert OpRegistry.get_module(UnsupportedCustomModule) is None

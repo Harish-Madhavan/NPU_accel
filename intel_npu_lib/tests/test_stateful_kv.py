@@ -1,18 +1,13 @@
-import unittest
-
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
 from intel_npu_acceleration import compile_to_npu
-from intel_npu_acceleration.frontend import _GRAPH_CACHE
 from intel_npu_acceleration.functional import NPUStatefulKVCache
 
 
-class TestStatefulKVCache(unittest.TestCase):
-    def setUp(self):
-        _GRAPH_CACHE.clear()
-
+class TestStatefulKVCache:
     def test_stateful_kv_correctness(self):
         """
         Verify that the NPUStatefulKVCache compiles and retains state across
@@ -43,7 +38,7 @@ class TestStatefulKVCache(unittest.TestCase):
         try:
             model_npu = compile_to_npu(model_cpu, x_example, strict=True)
         except Exception as e:
-            self.fail(f"Compilation of stateful model failed: {e}")
+            pytest.fail(f"Compilation of stateful model failed: {e}")
 
         # Reset CPU and NPU states to synchronize after compilation tracing mutation
         model_npu.reset_states()
@@ -62,8 +57,7 @@ class TestStatefulKVCache(unittest.TestCase):
             out_npu = model_npu(step_tensor)
 
             # Assert outputs match on this step
-            self.assertTrue(
-                torch.allclose(out_npu, out_cpu, atol=1e-3, rtol=1e-3),
+            assert torch.allclose(out_npu, out_cpu, atol=1e-3, rtol=1e-3), (
                 f"Mismatch at step {step}: NPU output not matching CPU eager output."
             )
 
@@ -72,11 +66,11 @@ class TestStatefulKVCache(unittest.TestCase):
         final_cache_npu = out_npu  # The last returned NPU output
 
         # Assert full cache matching
-        self.assertTrue(torch.allclose(final_cache_npu, final_cache_cpu, atol=1e-3, rtol=1e-3))
+        assert torch.allclose(final_cache_npu, final_cache_cpu, atol=1e-3, rtol=1e-3)
         # Ensure first 4 slots are populated with the inputs, and the rest (4..16) are zeros
         all_steps_concat = torch.cat(step_tensors, dim=1)
-        self.assertTrue(torch.allclose(final_cache_npu[:, :4], all_steps_concat, atol=1e-3, rtol=1e-3))
-        self.assertEqual(torch.sum(final_cache_npu[:, 4:]), 0.0)
+        assert torch.allclose(final_cache_npu[:, :4], all_steps_concat, atol=1e-3, rtol=1e-3)
+        assert torch.sum(final_cache_npu[:, 4:]) == 0.0
 
     def test_stateful_kv_reset(self):
         """
@@ -110,7 +104,7 @@ class TestStatefulKVCache(unittest.TestCase):
         model_npu(step_tensor_1)
         out_before_reset = model_npu(step_tensor_2)
 
-        self.assertNotEqual(torch.sum(out_before_reset), 0.0)
+        assert torch.sum(out_before_reset) != 0.0
 
         # Reset states
         model_npu.reset_states()
@@ -120,10 +114,10 @@ class TestStatefulKVCache(unittest.TestCase):
         out_after_reset = model_npu(step_tensor_1)
         out_cpu_after_reset = model_cpu(step_tensor_1)
 
-        self.assertTrue(torch.allclose(out_after_reset, out_cpu_after_reset, atol=1e-3, rtol=1e-3))
+        assert torch.allclose(out_after_reset, out_cpu_after_reset, atol=1e-3, rtol=1e-3)
         # Verify position 0 is filled with step_tensor_1, rest is zero
-        self.assertTrue(torch.allclose(out_after_reset[:, :1], step_tensor_1, atol=1e-3, rtol=1e-3))
-        self.assertEqual(torch.sum(out_after_reset[:, 1:]), 0.0)
+        assert torch.allclose(out_after_reset[:, :1], step_tensor_1, atol=1e-3, rtol=1e-3)
+        assert torch.sum(out_after_reset[:, 1:]) == 0.0
 
     def test_double_buffered_output_safety(self):
         """
@@ -147,14 +141,14 @@ class TestStatefulKVCache(unittest.TestCase):
         # Execution 1
         res1 = compiled(torch.tensor([[1.0, 1.0], [1.0, 1.0]]), torch.tensor([[2.0, 2.0], [2.0, 2.0]]))
         # res1 points directly to the active double buffer (e.g. buffer 0)
-        self.assertTrue(torch.allclose(res1, torch.tensor([[3.0, 3.0], [3.0, 3.0]])))
+        assert torch.allclose(res1, torch.tensor([[3.0, 3.0], [3.0, 3.0]]))
 
         # Execution 2 (uses other double buffer, e.g. buffer 1)
         res2 = compiled(torch.tensor([[5.0, 5.0], [5.0, 5.0]]), torch.tensor([[10.0, 10.0], [10.0, 10.0]]))
 
         # Verify res1 was NOT overwritten and still contains the values from execution 1
-        self.assertTrue(torch.allclose(res1, torch.tensor([[3.0, 3.0], [3.0, 3.0]])))
-        self.assertTrue(torch.allclose(res2, torch.tensor([[15.0, 15.0], [15.0, 15.0]])))
+        assert torch.allclose(res1, torch.tensor([[3.0, 3.0], [3.0, 3.0]]))
+        assert torch.allclose(res2, torch.tensor([[15.0, 15.0], [15.0, 15.0]]))
 
     def test_auto_stateful_mapping(self):
         """
@@ -182,7 +176,7 @@ class TestStatefulKVCache(unittest.TestCase):
         try:
             model_npu = compile_to_npu(model_cpu, (new_kv_ex, cache_ex, pos_ex), stateful=True)
         except Exception as e:
-            self.fail(f"Compilation of auto-stateful functional model failed: {e}")
+            pytest.fail(f"Compilation of auto-stateful functional model failed: {e}")
 
         # The auto-stateful mapping converts the model signature from 3 parameters to 2 compiled parameter inputs (new_kv, position)
         # However, the user calling interface accepts the original 3 arguments dynamically, discarding/ignoring the cache argument.
@@ -205,8 +199,7 @@ class TestStatefulKVCache(unittest.TestCase):
             out_npu = model_npu(step_tensor, cache_ex, step)
 
             # NPU output returns the updated stateful cache! Let's assert they match!
-            self.assertTrue(
-                torch.allclose(out_npu[:, :step+1], out_cpu[:, :step+1], atol=1e-3, rtol=1e-3),
+            assert torch.allclose(out_npu[:, :step+1], out_cpu[:, :step+1], atol=1e-3, rtol=1e-3), (
                 f"Mismatch at step {step}: NPU auto-stateful output not matching CPU eager output."
             )
 
@@ -251,9 +244,8 @@ class TestStatefulKVCache(unittest.TestCase):
 
         try:
             model_npu = compile_to_npu(model_cpu, (new_kv_ex, cache_ex, pos_ex), stateful=True)
-            self.assertTrue(True)
         except Exception as e:
-            self.fail(f"Compilation of multi-layer auto-stateful functional LLaMA failed: {e}")
+            pytest.fail(f"Compilation of multi-layer auto-stateful functional LLaMA failed: {e}")
 
         # The auto-stateful pipeline skips compiling the top-level parent cache placeholder as a model Parameter.
         # Ensure model runs cleanly sequential step-by-step
@@ -275,8 +267,7 @@ class TestStatefulKVCache(unittest.TestCase):
             out_npu = model_npu(step_tensor, cache_ex, step)
 
             # Assert parity on all sliced states
-            self.assertTrue(
-                torch.allclose(out_npu[:, :, :step+1], out_cpu[:, :, :step+1], atol=1e-3, rtol=1e-3),
+            assert torch.allclose(out_npu[:, :, :step+1], out_cpu[:, :, :step+1], atol=1e-3, rtol=1e-3), (
                 f"Mismatch at step {step} of multi-layer auto-stateful generation."
             )
 
@@ -284,10 +275,5 @@ class TestStatefulKVCache(unittest.TestCase):
         model_npu.reset_states()
         out_after_reset = model_npu(step_tensors[0], cache_ex, 0)
         out_cpu_after_reset = model_cpu(step_tensors[0], cache_ex, 0)
-        self.assertTrue(torch.allclose(out_after_reset[:, :, :1], out_cpu_after_reset[:, :, :1], atol=1e-3, rtol=1e-3))
-        self.assertEqual(torch.sum(out_after_reset[:, :, 1:]), 0.0)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
+        assert torch.allclose(out_after_reset[:, :, :1], out_cpu_after_reset[:, :, :1], atol=1e-3, rtol=1e-3)
+        assert torch.sum(out_after_reset[:, :, 1:]) == 0.0

@@ -24,3 +24,17 @@ def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def div(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _binary_op(a, b, torch.div, _C.npu_div if _C else None)
+
+
+def pow(a: torch.Tensor, exponent) -> torch.Tensor:
+    if not isinstance(exponent, torch.Tensor):
+        exponent = torch.full((), exponent, dtype=a.dtype, device=a.device)
+    return _binary_op(a, exponent, torch.pow, _C.npu_pow if _C else None)
+
+
+def where(condition: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if _C is None or _is_proxy(condition, a, b):
+        return torch.where(condition, a, b)
+    if a.dtype != b.dtype:
+        a, b, _ = _promote_binary(a, b)
+    return _C.npu_where(condition, a, b)

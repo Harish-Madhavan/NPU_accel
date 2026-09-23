@@ -14,6 +14,14 @@ from . import _functional as F_npu
 __all__ = ["NPUAdam", "NPUSGD", "clip_grad_norm_"]
 
 
+def _run_closure(closure: Callable[[], float] | None) -> float | None:
+    """Evaluate the optimizer closure with grads enabled, if one was given."""
+    if closure is None:
+        return None
+    with torch.enable_grad():
+        return closure()
+
+
 class NPUAdam(torch.optim.Optimizer):
     """Adam optimizer with fused Level Zero NPU kernel step execution.
 
@@ -73,10 +81,7 @@ class NPUAdam(torch.optim.Optimizer):
         Returns:
             Optional[float]: The loss value returned by the closure, if provided.
         """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = _run_closure(closure)
 
         for group in self.param_groups:
             lr = group["lr"]
@@ -168,10 +173,7 @@ class NPUSGD(torch.optim.Optimizer):
         Returns:
             Optional[float]: The loss value returned by the closure, if provided.
         """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = _run_closure(closure)
 
         for group in self.param_groups:
             lr = group["lr"]
@@ -207,6 +209,9 @@ def clip_grad_norm_(
 ) -> torch.Tensor:
     """Clips gradient norm of an iterable of parameters.
 
+    Delegates to the PyTorch standard implementation so NPU training clips
+    bit-identically to CPU/CUDA training.
+
     Args:
         parameters: Iterable of Tensors or a single Tensor that will have gradients normalized.
         max_norm (float): Max norm of the gradients.
@@ -216,28 +221,7 @@ def clip_grad_norm_(
     Returns:
         torch.Tensor: Total norm of the parameter gradients.
     """
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    grads = [p.grad for p in parameters if p.grad is not None]
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    if len(grads) == 0:
-        return torch.tensor(0.0)
-
-    if norm_type == float("inf"):
-        norms = [g.detach().abs().max() for g in grads]
-        total_norm = torch.stack(norms).max() if len(norms) > 0 else torch.tensor(0.0)
-    else:
-        total_norm = torch.norm(torch.stack([torch.norm(g.detach(), norm_type) for g in grads]), norm_type)
-
-    if error_if_nonfinite and (torch.isnan(total_norm) or torch.isinf(total_norm)):
-        raise RuntimeError(
-            f"The total norm of order {norm_type} for gradients is non-finite ({total_norm}), so it cannot be clipped."
-        )
-
-    clip_coef = max_norm / (total_norm + 1e-6)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    for g in grads:
-        g.detach().mul_(clip_coef_clamped)
-    return total_norm
+    return torch.nn.utils.clip_grad_norm_(
+        parameters, max_norm, norm_type, error_if_nonfinite
+    )
 

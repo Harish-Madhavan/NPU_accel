@@ -74,3 +74,60 @@ def _promote_binary(a: torch.Tensor, b: torch.Tensor):
         return a, b, a.dtype
     target = torch.promote_types(a.dtype, b.dtype)
     return a.to(target), b.to(target), target
+
+
+# Sentinel returned by _try_npu when the hardware path is unavailable.
+_MISS: Any = object()
+
+_REDUCTION_CODES = {"none": 0, "mean": 1, "sum": 2}
+
+
+def _reduction_code(reduction: str) -> int:
+    """Map a PyTorch reduction string to the integer code the C++ extension expects."""
+    return _REDUCTION_CODES.get(reduction, 1)
+
+
+def _try_npu(method: str, *args: Any) -> Any:
+    """Call ``_C.<method>(*args)``; return ``_MISS`` unless the NPU path succeeds.
+
+    Centralizes the dispatch guard repeated by every op: skip when the
+    extension is missing (or lacks the method), when tracing/proxy tensors
+    are present, or when the native call raises — the caller then runs its
+    pure-PyTorch fallback.
+    """
+    if _C is None or _is_proxy(*args):
+        return _MISS
+    fn = getattr(_C, method, None)
+    if fn is None:
+        return _MISS
+    try:
+        return fn(*args)
+    except Exception:
+        return _MISS
+
+
+def _or_empty(t: torch.Tensor | None, dtype: torch.dtype, device: torch.device | None = None) -> torch.Tensor:
+    """Return ``t``, or an empty placeholder tensor the C++ extension treats as "absent".
+
+    The native kernels take tensors (not ``None``) for optional bias /
+    mask / scale arguments; an empty tensor signals "not provided".
+    """
+    if t is not None:
+        return t
+    if device is None:
+        return torch.empty(0, dtype=dtype)
+    return torch.empty(0, dtype=dtype, device=device)
+
+
+def unpack_int4_packed(weight_u8: torch.Tensor) -> torch.Tensor:
+    """Unpack nibble-interleaved uint8 weights to a float row-major matrix.
+
+    Each byte packs two 4-bit values (low nibble = even element, high nibble
+    = odd element). Shared by the eager quantized-linear fallback and the
+    graph-mode dequantization pass so both paths unpack identically.
+    """
+    # Cast to int32 first: the NPU Floor op has no unsigned element types.
+    w_s32 = weight_u8.to(torch.int32)
+    w_odd = torch.floor_divide(w_s32, 16)
+    w_even = w_s32 - w_odd * 16
+    return torch.stack([w_even, w_odd], dim=-1).view(weight_u8.shape[0], -1).float()

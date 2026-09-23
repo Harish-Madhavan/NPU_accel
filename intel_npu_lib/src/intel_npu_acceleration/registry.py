@@ -22,7 +22,9 @@ _SUPPORTED_FUNCTIONS = {
     npu_func.relu, npu_func.gelu, npu_func.silu, npu_func.hardsigmoid, npu_func.hardswish, npu_func.softmax,
     torch.transpose, torch.reshape, torch.squeeze, torch.unsqueeze, torch.cat, torch.stack, torch.mean,
     torch.sin, torch.cos, torch.rsqrt, torch.pow, torch.where, torch.exp, torch.sqrt, torch.abs,
-    torch.flatten, torch.clone, torch.triu, torch.arange,
+    torch.flatten, torch.clone, torch.triu, torch.arange, torch.clamp,
+    npu_func.sin, npu_func.cos, npu_func.exp, npu_func.sqrt, npu_func.abs, npu_func.rsqrt,
+    npu_func.pow, npu_func.clamp, npu_func.where, npu_func.triu, npu_func.flatten,
     npu_func.transpose, npu_func.reshape, npu_func.squeeze, npu_func.unsqueeze, npu_func.cat,
     npu_func.stack, npu_func.mean, npu_func.index_select, npu_func.zeros, npu_func.ones, npu_func.full,
     npu_func.identity, npu_func.dropout,
@@ -87,14 +89,7 @@ class OpRegistry:
     def get_module(cls, module_type: Any) -> bool | None:
         return True if cls.is_module_supported(module_type) else None
 
-    @classmethod
-    def is_supported_function(cls, target: Any) -> bool:
-        return cls.is_function_supported(target)
-
-    @classmethod
-    def is_supported_method(cls, name: str) -> bool:
-        return cls.is_method_supported(name)
-
-    @classmethod
-    def is_supported_module(cls, module_type: Any) -> bool:
-        return cls.is_module_supported(module_type)
+    # Pure aliases of the canonical is_*_supported predicates above.
+    is_supported_function = is_function_supported
+    is_supported_method = is_method_supported
+    is_supported_module = is_module_supported

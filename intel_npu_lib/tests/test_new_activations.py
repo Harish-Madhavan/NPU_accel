@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -40,12 +39,7 @@ class HardActivationsModel(nn.Module):
         return hw2
 
 
-class TestNewActivations(unittest.TestCase):
-    def setUp(self):
-        # Clean the compiler graph cache before each test
-        import intel_npu_acceleration.frontend as frontend
-        frontend._GRAPH_CACHE.clear()
-
+class TestNewActivations:
     def test_standard_act_modules(self):
         model = StandardActModules()
         model.eval()
@@ -55,12 +49,12 @@ class TestNewActivations(unittest.TestCase):
         try:
             npu_model = compile(model, x, strict=True)
         except Exception as e:
-            self.fail(f"Compilation failed for standard module activations: {e}")
+            pytest.fail(f"Compilation failed for standard module activations: {e}")
 
         out_cpu = model(x)
         out_npu = npu_model(x)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
 
     def test_hard_activations(self):
         model = HardActivationsModel()
@@ -71,13 +65,9 @@ class TestNewActivations(unittest.TestCase):
         try:
             npu_model = compile(model, x, strict=True)
         except Exception as e:
-            self.fail(f"Compilation failed for Hardsigmoid and Hardswish: {e}")
+            pytest.fail(f"Compilation failed for Hardsigmoid and Hardswish: {e}")
 
         out_cpu = model(x)
         out_npu = npu_model(x)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)

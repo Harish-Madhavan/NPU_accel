@@ -28,7 +28,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_index_select", &npu_index_select, "NPU accelerated Index Select");
     m.def("npu_scaled_dot_product_attention", &npu_scaled_dot_product_attention,
           "NPU Scaled Dot Product Attention");
+    m.def("npu_scaled_dot_product_attention_backward", &npu_scaled_dot_product_attention_backward,
+          "NPU Scaled Dot Product Attention Backward");
     m.def("npu_conv2d", &npu_conv2d, "NPU accelerated Conv2d");
+    m.def("npu_conv2d_backward", &npu_conv2d_backward, "NPU accelerated Conv2d Backward");
     m.def("npu_max_pool2d", &npu_max_pool2d, "NPU accelerated MaxPool2d");
     m.def("npu_update_kv_cache", &npu_update_kv_cache, "NPU accelerated KV cache update");
     m.def("npu_rotary_embedding", &npu_rotary_embedding,
@@ -53,6 +56,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_l1_loss_backward", &npu_l1_loss_backward, "NPU accelerated L1 Loss Backward");
     m.def("npu_adam_step", &npu_adam_step, "NPU accelerated Adam Optimizer Step");
     m.def("npu_sgd_step", &npu_sgd_step, "NPU accelerated SGD Optimizer Step");
+    m.def("npu_sin", &npu_sin, "NPU accelerated Sine");
+    m.def("npu_cos", &npu_cos, "NPU accelerated Cosine");
+    m.def("npu_exp", &npu_exp, "NPU accelerated Exponential");
+    m.def("npu_sqrt", &npu_sqrt, "NPU accelerated Square Root");
+    m.def("npu_abs", &npu_abs, "NPU accelerated Absolute Value");
+    m.def("npu_sign", &npu_sign, "NPU accelerated Sign");
+    m.def("npu_rsqrt", &npu_rsqrt, "NPU accelerated Reciprocal Square Root");
+    m.def("npu_pow", &npu_pow, "NPU accelerated Power");
+    m.def("npu_clamp", &npu_clamp, "NPU accelerated Clamp");
+    m.def("npu_where", &npu_where, "NPU accelerated Where/Select");
+    m.def("npu_triu", &npu_triu, "NPU accelerated Upper Triangular");
+    m.def("npu_sin_backward", &npu_sin_backward, "NPU accelerated Sine Backward");
+    m.def("npu_cos_backward", &npu_cos_backward, "NPU accelerated Cosine Backward");
+    m.def("npu_exp_backward", &npu_exp_backward, "NPU accelerated Exponential Backward");
+    m.def("npu_sqrt_backward", &npu_sqrt_backward, "NPU accelerated Square Root Backward");
+    m.def("npu_abs_backward", &npu_abs_backward, "NPU accelerated Absolute Value Backward");
+    m.def("npu_rsqrt_backward", &npu_rsqrt_backward, "NPU accelerated Reciprocal Square Root Backward");
+    m.def("npu_pow_backward", &npu_pow_backward, "NPU accelerated Power Backward");
+    m.def("npu_clamp_backward", &npu_clamp_backward, "NPU accelerated Clamp Backward");
+    m.def("npu_where_backward", &npu_where_backward, "NPU accelerated Where Backward");
+    m.def("npu_triu_backward", &npu_triu_backward, "NPU accelerated Upper Triangular Backward");
+    m.def("npu_max_pool2d_backward", &npu_max_pool2d_backward, "NPU accelerated MaxPool2d Backward");
     m.def("set_cache_dir", &set_npu_cache_dir, "Set OpenVINO disk cache directory");
     m.def("set_property", &set_npu_property, "Set global NPU property (Level Zero optimizations)");
     m.def("set_performance_hint", &set_npu_performance_hint,

@@ -231,4 +231,10 @@ Run the full automated test suite:
 ```powershell
 pytest
 ```
-* **Status**: 148 tests passing with 0 warnings (upstream `torch.jit.trace` deprecation warnings from OpenVINO conversion are suppressed both in-library and via pytest `filterwarnings`).
+* **Status**: 259 tests passing with 0 warnings (upstream `torch.jit.trace` deprecation warnings from OpenVINO conversion are suppressed both in-library and via pytest `filterwarnings`).
+
+---
+
+## 🗺️ Roadmap
+
+See [`intel_npu_lib/ROADMAP.md`](intel_npu_lib/ROADMAP.md) for the audited current-state inventory, the "proper backend" definition of done, and phased milestones (conformance, packaging, performance gating, model coverage, training, docs, ecosystem).

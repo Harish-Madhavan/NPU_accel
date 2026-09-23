@@ -17,6 +17,17 @@ __all__ = [
     "relu",
     "gelu",
     "silu",
+    "sin",
+    "cos",
+    "exp",
+    "sqrt",
+    "abs",
+    "rsqrt",
+    "pow",
+    "clamp",
+    "where",
+    "triu",
+    "flatten",
     "softmax",
     "rmsnorm",
     "layer_norm",
@@ -68,6 +79,17 @@ linear = F_auto.linear
 relu = F_auto.relu
 gelu = F_auto.gelu
 silu = F_auto.silu
+sin = F_auto.sin
+cos = F_auto.cos
+exp = F_auto.exp
+sqrt = F_auto.sqrt
+abs = F_auto.abs
+rsqrt = F_auto.rsqrt
+pow = F_auto.pow
+clamp = F_auto.clamp
+where = F_auto.where
+triu = F_auto.triu
+flatten = F_auto.flatten
 softmax = F_auto.softmax
 rmsnorm = F_auto.rmsnorm
 layer_norm = F_auto.layer_norm
@@ -84,6 +106,7 @@ cross_entropy_loss = F_auto.cross_entropy_loss
 l1_loss = F_auto.l1_loss
 bce_with_logits_loss = F_auto.bce_with_logits_loss
 conv2d = F_auto.conv2d
+max_pool2d = F_auto.max_pool2d
 scaled_dot_product_attention = F_auto.scaled_dot_product_attention
 
 # --- Structural & Eager NPU Operations ---
@@ -93,7 +116,6 @@ index_select = F_base.index_select
 zeros = F_base.zeros
 ones = F_base.ones
 full = F_base.full
-max_pool2d = F_base.max_pool2d
 update_kv_cache = F_base.update_kv_cache
 rotary_embedding = F_base.rotary_embedding
 quantized_linear = F_base.quantized_linear

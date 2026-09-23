@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -39,7 +38,7 @@ class TransformerBlock(nn.Module):
         return x + residual
 
 
-class TestTransformer(unittest.TestCase):
+class TestTransformer:
     def test_block(self):
         dim = 32
         hidden_dim = 64
@@ -52,13 +51,9 @@ class TestTransformer(unittest.TestCase):
             # Compile the standard PyTorch model for NPU
             npu_model = compile_to_npu(model, x)
         except Exception as e:
-            self.fail(f"Compilation failed: {e}")
+            pytest.fail(f"Compilation failed: {e}")
 
         out_npu = npu_model(x)
         out_cpu = model(x)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)

@@ -1,80 +1,61 @@
-import io
-import sys
-import unittest
+from unittest.mock import patch
+
+import pytest
 
 import intel_npu_acceleration as npu
 from intel_npu_acceleration.info import get_system_info, print_info
 
 
-class TestSystemInfoCLI(unittest.TestCase):
+class TestSystemInfoCLI:
     def test_get_system_info_structure(self):
         info = get_system_info()
-        self.assertIsInstance(info, dict)
-        self.assertIn("os", info)
-        self.assertIn("python_version", info)
-        self.assertIn("pytorch_version", info)
-        self.assertIn("openvino_available", info)
-        self.assertIn("openvino_version", info)
-        self.assertIn("npu_available", info)
-        self.assertIn("cache_dir", info)
-        self.assertIn("cache_size_mb", info)
-        self.assertIn("cache_file_count", info)
-        self.assertIn("in_memory_graph_cache_count", info)
-        self.assertIn("torch_npu_registered", info)
-        self.assertIn("torch_backends_npu_registered", info)
-        self.assertIn("dynamo_npu_registered", info)
-        self.assertIn("accelerator_available", info)
+        assert isinstance(info, dict)
+        for key in [
+            "os",
+            "python_version",
+            "pytorch_version",
+            "openvino_available",
+            "openvino_version",
+            "npu_available",
+            "cache_dir",
+            "cache_size_mb",
+            "cache_file_count",
+            "in_memory_graph_cache_count",
+            "torch_npu_registered",
+            "torch_backends_npu_registered",
+            "dynamo_npu_registered",
+            "accelerator_available",
+        ]:
+            assert key in info
 
-    def test_print_info_stdout(self):
-        captured_output = io.StringIO()
-        sys.stdout = captured_output
-        try:
-            print_info()
-        finally:
-            sys.stdout = sys.__stdout__
+    def test_print_info_stdout(self, capsys):
+        print_info()
+        output_str = capsys.readouterr().out
+        assert "INTEL NPU ACCELERATION LIBRARY - DIAGNOSTIC REPORT" in output_str
+        assert "Python Version" in output_str
+        assert "PyTorch Version" in output_str
 
-        output_str = captured_output.getvalue()
-        self.assertIn("INTEL NPU ACCELERATION LIBRARY - DIAGNOSTIC REPORT", output_str)
-        self.assertIn("Python Version", output_str)
-        self.assertIn("PyTorch Version", output_str)
-
-    def test_cli_version_flag(self):
-        from unittest.mock import patch
-
+    def test_cli_version_flag(self, capsys):
         from intel_npu_acceleration.__main__ import main
 
-        captured_output = io.StringIO()
         with patch("sys.argv", ["intel_npu_acceleration", "--version"]):
-            with patch("sys.stdout", captured_output):
-                with self.assertRaises(SystemExit) as cm:
-                    main()
-                self.assertEqual(cm.exception.code, 0)
-        self.assertIn("intel_npu_acceleration", captured_output.getvalue())
-
-    def test_cli_clear_cache_flag(self):
-        from unittest.mock import patch
-
-        from intel_npu_acceleration.__main__ import main
-
-        captured_output = io.StringIO()
-        with patch("sys.argv", ["intel_npu_acceleration", "--clear-cache"]):
-            with patch("sys.stdout", captured_output):
-                with self.assertRaises(SystemExit) as cm:
-                    main()
-                self.assertEqual(cm.exception.code, 0)
-        self.assertIn("Cleared cache directory", captured_output.getvalue())
-
-    def test_cli_info_flag(self):
-        from unittest.mock import patch
-
-        from intel_npu_acceleration.__main__ import main
-
-        captured_output = io.StringIO()
-        with patch("sys.argv", ["intel_npu_acceleration", "--info"]):
-            with patch("sys.stdout", captured_output):
+            with pytest.raises(SystemExit) as exc_info:
                 main()
-        self.assertIn("INTEL NPU ACCELERATION LIBRARY - DIAGNOSTIC REPORT", captured_output.getvalue())
+            assert exc_info.value.code == 0
+        assert "intel_npu_acceleration" in capsys.readouterr().out
 
+    def test_cli_clear_cache_flag(self, capsys):
+        from intel_npu_acceleration.__main__ import main
 
-if __name__ == "__main__":
-    unittest.main()
+        with patch("sys.argv", ["intel_npu_acceleration", "--clear-cache"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+        assert "Cleared cache directory" in capsys.readouterr().out
+
+    def test_cli_info_flag(self, capsys):
+        from intel_npu_acceleration.__main__ import main
+
+        with patch("sys.argv", ["intel_npu_acceleration", "--info"]):
+            main()
+        assert "INTEL NPU ACCELERATION LIBRARY - DIAGNOSTIC REPORT" in capsys.readouterr().out

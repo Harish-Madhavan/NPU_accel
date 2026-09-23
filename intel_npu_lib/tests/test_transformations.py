@@ -1,8 +1,7 @@
-import unittest
-
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
+import pytest
 import torch
 import torch.nn as nn
 
@@ -17,13 +16,20 @@ from intel_npu_acceleration.frontend.transformations import (
 )
 
 
-class TestTransformations(unittest.TestCase):
-    def test_clean_node_name(self):
-        self.assertEqual(clean_node_name("l_x_1"), "x")
-        self.assertEqual(clean_node_name("L__tokens_0"), "tokens")
-        self.assertEqual(clean_node_name("arg_0.1"), "arg")
-        self.assertEqual(clean_node_name("my_input"), "my_input")
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("l_x_1", "x"),
+        ("L__tokens_0", "tokens"),
+        ("arg_0.1", "arg"),
+        ("my_input", "my_input"),
+    ],
+)
+def test_clean_node_name(raw, expected):
+    assert clean_node_name(raw) == expected
 
+
+class TestTransformations:
     def test_fold_scalar_parameter_inputs(self):
         # Create an OV model with 1 scalar int parameter and 1 tensor float parameter
         p_scalar = ops.parameter(ov.Shape([]), ov.Type.i64)
@@ -42,8 +48,8 @@ class TestTransformations(unittest.TestCase):
         folded_model = fold_scalar_parameter_inputs(ov_model, example_inputs, placeholder_names)
 
         # After folding, only 1 parameter (the tensor 'x') should remain!
-        self.assertEqual(len(folded_model.get_parameters()), 1)
-        self.assertEqual(folded_model.get_parameters()[0].get_friendly_name(), "x")
+        assert len(folded_model.get_parameters()) == 1
+        assert folded_model.get_parameters()[0].get_friendly_name() == "x"
 
     def test_reshape_model_inputs_to_static(self):
         p_dynamic = ops.parameter(ov.PartialShape([-1, 16]), ov.Type.f32)
@@ -54,7 +60,7 @@ class TestTransformations(unittest.TestCase):
         placeholder_names = ["x"]
 
         reshape_model_inputs_to_static(ov_model, example_inputs, placeholder_names)
-        self.assertEqual(list(ov_model.inputs[0].get_shape()), [4, 16])
+        assert list(ov_model.inputs[0].get_shape()) == [4, 16]
 
     def test_ppp_configuration_helpers(self):
         param = ops.parameter(ov.Shape([1, 3, 64, 64]), ov.Type.f32, "input")
@@ -77,9 +83,5 @@ class TestTransformations(unittest.TestCase):
         configure_output_ppp(ppp.output(0), {"element_type": "f32"})
 
         processed_model = ppp.build()
-        self.assertEqual(list(processed_model.inputs[0].get_shape()), [1, 64, 64, 3])
-        self.assertEqual(processed_model.inputs[0].get_element_type(), ov.Type.u8)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert list(processed_model.inputs[0].get_shape()) == [1, 64, 64, 3]
+        assert processed_model.inputs[0].get_element_type() == ov.Type.u8

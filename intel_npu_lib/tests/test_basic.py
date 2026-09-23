@@ -1,12 +1,10 @@
-import unittest
-
 import torch
 
 import intel_npu_acceleration
 from tests.helpers import assert_allclose
 
 
-class TestIntelNPULib(unittest.TestCase):
+class TestIntelNPULib:
     def test_basic_ops(self):
         a = torch.randn(10, 10)
         b = torch.randn(10, 10)
@@ -71,19 +69,19 @@ class TestIntelNPULib(unittest.TestCase):
 
     def test_cache_management(self):
         size, count = intel_npu_acceleration.get_cache_size()
-        self.assertIsInstance(size, int)
-        self.assertIsInstance(count, int)
+        assert isinstance(size, int)
+        assert isinstance(count, int)
         intel_npu_acceleration.clean_old_cache(max_size_mb=10, max_files=5)
         intel_npu_acceleration.clear_cache()
         from intel_npu_acceleration.frontend.compiler import _GRAPH_CACHE
 
         intel_npu_acceleration.clear_graph_cache()
-        self.assertEqual(len(_GRAPH_CACHE), 0)
+        assert len(_GRAPH_CACHE) == 0
         new_size, new_count = intel_npu_acceleration.get_cache_size()
-        self.assertLessEqual(new_size, size)
-        self.assertLessEqual(new_count, count)
+        assert new_size <= size
+        assert new_count <= count
         v0 = intel_npu_acceleration.get_cache_version()
-        self.assertIsInstance(v0, int)
+        assert isinstance(v0, int)
 
     def test_quantize_api(self):
         class SimpleLinearModel(torch.nn.Module):
@@ -98,8 +96,8 @@ class TestIntelNPULib(unittest.TestCase):
         from intel_npu_acceleration import quantize
 
         quantized = quantize(model)
-        self.assertEqual(quantized.fc.weight.dtype, torch.int8)
-        self.assertTrue(hasattr(quantized.fc, "weight_scale"))
+        assert quantized.fc.weight.dtype == torch.int8
+        assert hasattr(quantized.fc, "weight_scale")
         x = torch.randn(2, 8)
         compiled = intel_npu_acceleration.compile(quantized, x)
         w_float = quantized.fc.weight.float() * quantized.fc.weight_scale
@@ -134,8 +132,8 @@ class TestIntelNPULib(unittest.TestCase):
         }
         compiled = intel_npu_acceleration.compile(model, x_traced, preprocess_config=preprocess_config)
         out = compiled(x_runtime)
-        self.assertEqual(list(out.shape), [1, 3, 224, 224])
-        self.assertEqual(out.dtype, torch.float32)
+        assert list(out.shape) == [1, 3, 224, 224]
+        assert out.dtype == torch.float32
 
     def test_pytorch_compile(self):
         class StandardModel(torch.nn.Module):
@@ -151,7 +149,3 @@ class TestIntelNPULib(unittest.TestCase):
             model, backend="npu", options={"clone_outputs": False, "performance_hint": "THROUGHPUT"}
         )
         assert_allclose(compiled_opt(x, y), model(x, y))
-
-
-if __name__ == "__main__":
-    unittest.main()

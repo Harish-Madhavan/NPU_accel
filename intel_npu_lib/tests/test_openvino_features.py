@@ -1,6 +1,5 @@
 import os
 import tempfile
-import unittest
 
 import openvino as ov
 import torch
@@ -8,22 +7,12 @@ import torch.nn as nn
 
 import intel_npu_acceleration as npu
 from intel_npu_acceleration.frontend import export_openvino_ir
+from tests.helpers import make_simple_mlp
 
 
-class SimpleMLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(16, 32)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(32, 8)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class TestOpenVINOFeatures(unittest.TestCase):
+class TestOpenVINOFeatures:
     def test_export_openvino_ir(self):
-        model = SimpleMLP().eval()
+        model = make_simple_mlp(16, 32, 8).eval()
         x = torch.randn(2, 16)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -31,19 +20,19 @@ class TestOpenVINOFeatures(unittest.TestCase):
             bin_path = os.path.join(tmp_dir, "simple_mlp.bin")
 
             exported = export_openvino_ir(model, x, xml_path, bin_path)
-            self.assertEqual(exported, xml_path)
-            self.assertTrue(os.path.exists(xml_path))
-            self.assertTrue(os.path.exists(bin_path))
+            assert exported == xml_path
+            assert os.path.exists(xml_path)
+            assert os.path.exists(bin_path)
 
             # Verify that OpenVINO can load and inspect the exported IR
             core = ov.Core()
             ov_model = core.read_model(xml_path, bin_path)
-            self.assertIsNotNone(ov_model)
-            self.assertEqual(len(ov_model.inputs), 1)
-            self.assertEqual(len(ov_model.outputs), 1)
+            assert ov_model is not None
+            assert len(ov_model.inputs) == 1
+            assert len(ov_model.outputs) == 1
 
     def test_profiling_info_accessible(self):
-        model = SimpleMLP().eval()
+        model = make_simple_mlp(16, 32, 8).eval()
         x = torch.randn(2, 16)
 
         compiled_model = npu.compile(model, x)
@@ -51,7 +40,7 @@ class TestOpenVINOFeatures(unittest.TestCase):
 
         if hasattr(compiled_model, "get_profiling_info"):
             prof_info = compiled_model.get_profiling_info(0)
-            self.assertIsInstance(prof_info, list)
+            assert isinstance(prof_info, list)
 
     def test_export_openvino_ir_with_ppp(self):
         class ConvNet(nn.Module):
@@ -80,13 +69,13 @@ class TestOpenVINOFeatures(unittest.TestCase):
             bin_path = os.path.join(tmp_dir, "convnet_ppp.bin")
 
             export_openvino_ir(model, x_traced, xml_path, bin_path, preprocess_config=preprocess_config)
-            self.assertTrue(os.path.exists(xml_path))
+            assert os.path.exists(xml_path)
 
             core = ov.Core()
             ov_model = core.read_model(xml_path, bin_path)
             # The input tensor on the exported model should have the NHWC shape [1, 32, 32, 3] and u8 type
-            self.assertEqual(list(ov_model.inputs[0].get_shape()), [1, 32, 32, 3])
-            self.assertEqual(ov_model.inputs[0].get_element_type(), ov.Type.u8)
+            assert list(ov_model.inputs[0].get_shape()) == [1, 32, 32, 3]
+            assert ov_model.inputs[0].get_element_type() == ov.Type.u8
 
     def test_export_openvino_ir_stateful(self):
         from intel_npu_acceleration import NPUStatefulKVCache
@@ -109,13 +98,13 @@ class TestOpenVINOFeatures(unittest.TestCase):
             bin_path = os.path.join(tmp_dir, "stateful_model.bin")
 
             export_openvino_ir(model, x, xml_path, bin_path, stateful=True)
-            self.assertTrue(os.path.exists(xml_path))
+            assert os.path.exists(xml_path)
 
             core = ov.Core()
             ov_model = core.read_model(xml_path, bin_path)
             # Verify that state variables exist in the model
             var_ids = [v.get_info().variable_id for v in ov_model.get_variables()]
-            self.assertTrue(len(var_ids) > 0)
+            assert len(var_ids) > 0
 
     def test_optimize_ov_model(self):
         import numpy as np
@@ -132,10 +121,6 @@ class TestOpenVINOFeatures(unittest.TestCase):
         ov_model = ov.Model([mul_node], [param], "ConstantFoldTest")
 
         optimized = optimize_ov_model(ov_model)
-        self.assertIsNotNone(optimized)
-        self.assertEqual(len(optimized.get_parameters()), 1)
-        self.assertEqual(len(optimized.get_results()), 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert optimized is not None
+        assert len(optimized.get_parameters()) == 1
+        assert len(optimized.get_results()) == 1

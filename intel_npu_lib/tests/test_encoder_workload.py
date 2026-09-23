@@ -1,6 +1,6 @@
 import math
-import unittest
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -70,9 +70,8 @@ class EncoderLayer(nn.Module):
         return x
 
 
-class TestEncoderWorkload(unittest.TestCase):
+class TestEncoderWorkload:
     def test_encoder_block(self):
-        torch.manual_seed(42)
         hidden_size = 64
         num_heads = 4
         ffn_dim = 256
@@ -85,13 +84,9 @@ class TestEncoderWorkload(unittest.TestCase):
         try:
             npu_model = compile_to_npu(model, (x, mask))
         except Exception as e:
-            self.fail(f"Compilation failed: {e}")
+            pytest.fail(f"Compilation failed: {e}")
 
         out_npu = npu_model(x, mask)
         out_cpu = model(x, mask)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)

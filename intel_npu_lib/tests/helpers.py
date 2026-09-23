@@ -37,11 +37,13 @@ def make_small_mlp(in_features=16, hidden=32, out_features=8):
     return nn.Sequential(nn.Linear(in_features, hidden), nn.ReLU(), nn.Linear(hidden, out_features))
 
 
-def make_conv_model(in_channels=3, out_channels=8, kernel=3):
+def make_conv_model(in_channels=3, out_channels=8, kernel=3, padding=0):
     class SimpleCVModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel, bias=False)
+            self.conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size=kernel, padding=padding, bias=False
+            )
             nn.init.ones_(self.conv.weight)
 
         def forward(self, x):

@@ -295,7 +295,23 @@ class Embedding(nn.Module):
         return F_npu.embedding(input, self.weight)
 
 
-class MSELoss(nn.Module):
+class _NPULossBase(nn.Module):
+    """Shared base for NPU losses taking ``(input, target)`` with a ``reduction``.
+
+    Subclasses only set ``_loss_fn`` to the corresponding ``F_npu`` function.
+    """
+
+    _loss_fn = staticmethod(F_npu.mse_loss)
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self._loss_fn(input, target, reduction=self.reduction)
+
+
+class MSELoss(_NPULossBase):
     """NPU-accelerated Mean Squared Error Loss layer.
 
     Measures the element-wise mean squared error (squared L2 norm) between
@@ -314,37 +330,19 @@ class MSELoss(nn.Module):
         >>> loss.backward()
     """
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        self.reduction = reduction
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute MSE loss on NPU."""
-        return F_npu.mse_loss(input, target, reduction=self.reduction)
+    _loss_fn = staticmethod(F_npu.mse_loss)
 
 
-class CrossEntropyLoss(nn.Module):
+class CrossEntropyLoss(_NPULossBase):
     """NPU-accelerated Cross Entropy Loss."""
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        self.reduction = reduction
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute Cross Entropy loss on NPU."""
-        return F_npu.cross_entropy_loss(input, target, reduction=self.reduction)
+    _loss_fn = staticmethod(F_npu.cross_entropy_loss)
 
 
-class L1Loss(nn.Module):
+class L1Loss(_NPULossBase):
     """NPU-accelerated L1 Loss (Mean Absolute Error)."""
 
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        self.reduction = reduction
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute L1 loss on NPU."""
-        return F_npu.l1_loss(input, target, reduction=self.reduction)
+    _loss_fn = staticmethod(F_npu.l1_loss)
 
 
 class BCEWithLogitsLoss(nn.Module):

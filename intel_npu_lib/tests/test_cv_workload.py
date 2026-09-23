@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -41,9 +40,8 @@ class ResNetBlock(nn.Module):
         return out
 
 
-class TestCVWorkload(unittest.TestCase):
+class TestCVWorkload:
     def test_resnet_block(self):
-        torch.manual_seed(42)
         in_channels = 64
         out_channels = 128
         model = ResNetBlock(in_channels, out_channels, stride=2)
@@ -54,14 +52,10 @@ class TestCVWorkload(unittest.TestCase):
         try:
             npu_model = compile_to_npu(model, x)
         except Exception as e:
-            self.fail(f"Compilation failed: {e}")
+            pytest.fail(f"Compilation failed: {e}")
 
         out_npu = npu_model(x)
         out_cpu = model(x)
 
         # CV models can have larger discrepancies due to accumulation
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)

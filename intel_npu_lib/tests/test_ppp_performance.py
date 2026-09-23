@@ -1,31 +1,20 @@
 import logging
-import unittest
 
-import numpy as np
+import pytest
 import torch
-import torch.nn as nn
 
 from intel_npu_acceleration.frontend import (
     _GRAPH_CACHE,
     compile_to_npu,
 )
+from tests.helpers import make_conv_model
 
 
-class SimpleCVModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Conv2d(3, 8, kernel_size=3, padding=1, bias=False)
-        # Use simple constant weights to make the math predictable
-        nn.init.ones_(self.conv.weight)
-
-    def forward(self, x):
-        return self.conv(x)
-
-class TestNPUHardwarePPP(unittest.TestCase):
-    def setUp(self):
+class TestNPUHardwarePPP:
+    def setup_method(self):
         # Clear cache before each test
         _GRAPH_CACHE.clear()
-        self.model = SimpleCVModel()
+        self.model = make_conv_model(3, 8, 3, padding=1)
         self.model.eval()
 
     def test_ppp_offloading_correctness(self):
@@ -57,12 +46,11 @@ class TestNPUHardwarePPP(unittest.TestCase):
                 preprocess_config=preprocess_config,
             )
         except Exception as e:
-            self.fail(f"Compilation with PPP config failed: {e}")
+            pytest.fail(f"Compilation with PPP config failed: {e}")
 
         # Construct actual test input: a 32x32 image with 3 channels in NHWC format, of type uint8
         # Fill with specific pattern to verify normalization and transposition
-        np_input = np.random.randint(0, 256, (1, 32, 32, 3), dtype=np.uint8)
-        input_tensor_u8 = torch.from_numpy(np_input)
+        input_tensor_u8 = torch.randint(0, 256, (1, 32, 32, 3), dtype=torch.uint8)
 
         # 1. Forward pass using NPU Hardware PPP (expects NHWC u8 tensor)
         out_npu = compiled_model(input_tensor_u8)
@@ -82,9 +70,8 @@ class TestNPUHardwarePPP(unittest.TestCase):
             out_cpu = self.model(input_normalized)
 
         # Assert outputs are mathematically close
-        self.assertTrue(
-            torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2),
-            f"NPU PPP output {out_npu[0, 0, :2, :2]} not matching CPU manual PPP output {out_cpu[0, 0, :2, :2]}",
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2), (
+            f"NPU PPP output {out_npu[0, 0, :2, :2]} not matching CPU manual PPP output {out_cpu[0, 0, :2, :2]}"
         )
 
     def test_cache_key_robustness(self):
@@ -116,36 +103,36 @@ class TestNPUHardwarePPP(unittest.TestCase):
 
         # 1. Compile with no config
         compile_to_npu(self.model, x_example, preprocess_config=config_none)
-        self.assertEqual(len(_GRAPH_CACHE), 1)
+        assert len(_GRAPH_CACHE) == 1
         key_none = list(_GRAPH_CACHE.keys())[0]
 
         # 2. Compile with config A
         compile_to_npu(self.model, x_example, preprocess_config=config_a)
-        self.assertEqual(len(_GRAPH_CACHE), 2)
+        assert len(_GRAPH_CACHE) == 2
         key_a = list(_GRAPH_CACHE.keys())[1]
-        self.assertNotEqual(key_none, key_a)
+        assert key_none != key_a
 
         # 3. Compile with config B (different mean/scale)
         compile_to_npu(self.model, x_example, preprocess_config=config_b)
-        self.assertEqual(len(_GRAPH_CACHE), 3)
+        assert len(_GRAPH_CACHE) == 3
         key_b = list(_GRAPH_CACHE.keys())[2]
-        self.assertNotEqual(key_a, key_b)
-        self.assertNotEqual(key_none, key_b)
+        assert key_a != key_b
+        assert key_none != key_b
 
         # 4. Compile with config A again (should trigger cache hit)
         compile_to_npu(self.model, x_example, preprocess_config=config_a)
-        self.assertEqual(len(_GRAPH_CACHE), 3)  # Cache size should remain 3
+        assert len(_GRAPH_CACHE) == 3  # Cache size should remain 3
 
-    def test_performance_intelligence_logging(self):
+    def test_performance_intelligence_logging(self, caplog):
         """
         Verify that the compiler emits the performance intelligence tips
         exactly when single-stream latency config is used.
         """
         x_example = torch.randn(1, 3, 32, 32)
-        logger = logging.getLogger("intel_npu_acceleration.frontend")
+        logger_name = "intel_npu_acceleration.frontend"
 
         # 1. Compile in LATENCY mode with single stream - should log the tip
-        with self.assertLogs(logger, level="INFO") as log_capture:
+        with caplog.at_level(logging.INFO, logger=logger_name):
             compile_to_npu(
                 self.model,
                 x_example,
@@ -154,13 +141,15 @@ class TestNPUHardwarePPP(unittest.TestCase):
             )
             # Ensure the specific performance warning tip is printed
             found_tip = any(
-                "[NPU Intelligence] Configuration: LATENCY mode" in msg
-                for msg in log_capture.output
+                "[NPU Intelligence] Configuration: LATENCY mode" in record.message
+                for record in caplog.records
             )
-            self.assertTrue(found_tip, "Performance Intelligence tip was not logged!")
+            assert found_tip, "Performance Intelligence tip was not logged!"
+
+        caplog.clear()
 
         # 2. Compile in THROUGHPUT mode with multiple streams - should NOT log the tip
-        with self.assertLogs(logger, level="INFO") as log_capture:
+        with caplog.at_level(logging.INFO, logger=logger_name):
             compile_to_npu(
                 self.model,
                 x_example,
@@ -169,10 +158,6 @@ class TestNPUHardwarePPP(unittest.TestCase):
             )
             # Ensure the specific performance warning tip is NOT printed
             found_tip = any(
-                "[NPU Intelligence]" in msg
-                for msg in log_capture.output
+                "[NPU Intelligence]" in record.message for record in caplog.records
             )
-            self.assertFalse(found_tip, "Performance Intelligence tip was logged unexpectedly in THROUGHPUT mode!")
-
-if __name__ == "__main__":
-    unittest.main()
+            assert not found_tip, "Performance Intelligence tip was logged unexpectedly in THROUGHPUT mode!"

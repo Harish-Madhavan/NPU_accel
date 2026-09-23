@@ -2,8 +2,6 @@
 Unit tests for out-of-the-box, seamless PyTorch integration and convenience APIs.
 """
 
-import unittest
-
 import torch
 import torch.nn as nn
 from torch.testing import assert_close
@@ -11,25 +9,22 @@ from torch.testing import assert_close
 import intel_npu_acceleration as npu
 
 
-class TestSeamlessIntegration(unittest.TestCase):
+class TestSeamlessIntegration:
     """
     Test suite for seamless PyTorch integration, device querying, context managers,
     and nn.Module convenience extensions.
     """
 
-    def setUp(self):
-        npu.empty_cache()
-
     def test_device_properties_and_querying(self):
         """Verify device query functions work reliably."""
-        self.assertIn(npu.device_count(), [0, 1])
-        self.assertEqual(npu.current_device(), 0)
+        assert npu.device_count() in [0, 1]
+        assert npu.current_device() == 0
         name = npu.get_device_name()
-        self.assertIsInstance(name, str)
+        assert isinstance(name, str)
         props = npu.get_device_properties()
-        self.assertIn("name", props)
-        self.assertIn("device_id", props)
-        self.assertIn("is_available", props)
+        assert "name" in props
+        assert "device_id" in props
+        assert "is_available" in props
 
     def test_empty_cache_and_synchronize(self):
         """Verify empty_cache and synchronize execute cleanly without errors."""
@@ -60,21 +55,17 @@ class TestSeamlessIntegration(unittest.TestCase):
         x = torch.randn(2, 16)
         compiled_model = npu.accelerate(model, example_input=x)
         out = compiled_model(x)
-        self.assertEqual(out.shape, (2, 2))
+        assert out.shape == (2, 2)
 
     def test_module_convenience_extensions(self):
         """Verify model.to_npu() and model.compile_npu() monkey patches."""
         model = nn.Linear(8, 4)
         # to_npu should return self
         res = model.to_npu()
-        self.assertIs(res, model)
+        assert res is model
 
         # compile_npu should compile the module
         x = torch.randn(1, 8)
         npu_mod = model.compile_npu(example_input=x)
         out = npu_mod(x)
-        self.assertEqual(out.shape, (1, 4))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert out.shape == (1, 4)

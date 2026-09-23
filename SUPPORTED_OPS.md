@@ -40,12 +40,14 @@ The library operates on three unified levels:
 | `torch.mul` / `*` | ✅ | ✅ | ✅ | Automatic dtype promotion and unbroadcasting |
 | `torch.div` / `/` | ✅ | ✅ | ✅ | |
 | `torch.neg` / `-` | ✅ | ✅ | ✅ | |
-| `torch.pow` / `**` | ✅ | ✅ | ✅ | |
-| `torch.sin`, `torch.cos` | ✅ | ✅ | ✅ | |
-| `torch.rsqrt` | ✅ | ✅ | ✅ | |
-| `torch.clamp`, `hardtanh` | ✅ | ✅ | ✅ | |
-| `torch.where` | ✅ | ✅ | ✅ | |
-| `torch.triu` | ✅ | ✅ | ✅ | |
+| `torch.pow` / `**` | ✅ | ✅ | ✅ | Scalar + tensor exponents (exponent gradients via CPU fallback) |
+| `torch.sin`, `torch.cos` | ✅ | ✅ | ✅ | Native Sin/Cos kernels + composed backward |
+| `torch.exp`, `torch.sqrt`, `torch.abs` | ✅ | ✅ | ✅ | Native Exp/Sqrt/Abs kernels + composed backward |
+| `torch.rsqrt` | ✅ | ✅ | ✅ | Via Power(x, -0.5) kernel |
+| `torch.clamp`, `hardtanh` | ✅ | ✅ | ✅ | Native Clamp kernel; gradient masked to [min, max] on NPU |
+| `torch.where` | ✅ | ✅ | ✅ | Native Select kernel; mask-multiply backward on NPU |
+| `torch.triu` | ✅ | ✅ | ✅ | Masked-multiply kernel (mask is shape-static metadata) |
+| `torch.flatten` | ✅ | ✅ | ✅ | Via NPU reshape with autograd shape restore |
 
 ### 2. Matrix, Linear, & Vision Operations
 | PyTorch Operation | Eager C++ Level Zero | Graph Mode (`torch.compile`) | Autograd Backward on NPU | Notes |
@@ -53,7 +55,7 @@ The library operates on three unified levels:
 | `torch.matmul`, `torch.mm` | ✅ | ✅ | ✅ | Level Zero accelerated $g_A = g_{out} B^T, g_B = A^T g_{out}$ |
 | `torch.nn.functional.linear` | ✅ | ✅ | ✅ | Level Zero accelerated $g_x = g_{out} W, g_W = g_{out}^T x, g_b = \sum g_{out}$ |
 | `torch.nn.functional.conv2d` | ✅ | ✅ | ✅ | Multi-group and strided 2D convolution |
-| `torch.nn.functional.max_pool2d` | ✅ | ✅ | ✅ | |
+| `torch.nn.functional.max_pool2d` | ✅ | ✅ | ✅ | Tiled pools via argmax-mask kernel; overlapping/padded via CPU fallback |
 | `torch.nn.functional.avg_pool2d` | ✅ | ✅ | ✅ | |
 | `scaled_dot_product_attention` | ✅ | ✅ | ✅ | Native hardware SDPA with causal masking support |
 
@@ -102,7 +104,8 @@ The library operates on three unified levels:
 | `torch.npu.Stream()`, `torch.npu.Event()` | ✅ | Stream command queue management and timing events |
 | `torch.npu.stream(s)`, `torch.npu.device(d)` | ✅ | Stream and device context managers |
 | `torch.npu.amp.autocast("npu")` | ✅ | Automatic mixed precision (FP16 / BF16) execution |
-| `torch.backends.npu.*` | ✅ | Performance flags (`allow_tf32`, `flash_sdp_enabled`, `version`) |
+| `torch.npu.amp.custom_fwd` / `custom_bwd` | ✅ | Autocast-aware decorators for custom autograd Functions (torch≥2.4) |
+| `torch.backends.npu.*` | ✅ | Availability (`is_available`), build flag (`is_built`), performance flags (`allow_tf32`, `flash_sdp_enabled`, `version`) |
 | `torch.accelerator.*` (PyTorch 2.4+) | ✅ | Universal accelerator bridge (`synchronize`, `empty_cache`, `current_accelerator`, `streams`) |
 | `torch.Tensor.to("npu")`, `torch.Tensor.npu()` | ✅ | Zero-copy Unified System Memory (USM) tensor management |
 | `torch.Tensor.is_npu` | ✅ | Tensor device type introspection property |

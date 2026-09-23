@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -14,7 +13,7 @@ class FunctionalKVUpdate(nn.Module):
         return update_kv_cache(cache, update, start_pos)
 
 
-class TestKVCache(unittest.TestCase):
+class TestKVCache:
     def test_kv_update(self):
         model = FunctionalKVUpdate()
         model.eval()
@@ -34,17 +33,17 @@ class TestKVCache(unittest.TestCase):
             # FX traces 'start_pos' as input node.
             npu_model = compile_to_npu(model, (cache, update, start_pos))
         except Exception as e:
-            self.fail(f"Compilation failed: {e}")
+            pytest.fail(f"Compilation failed: {e}")
 
         out_npu = npu_model(cache, update, start_pos)
         out_cpu = model(cache, update, start_pos)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-3, rtol=1e-3))
+        assert torch.allclose(out_npu, out_cpu, atol=1e-3, rtol=1e-3)
 
         # Verify logic
         expected = cache.clone()
         expected[:, start_pos : start_pos + seq_len] = update
-        self.assertTrue(torch.allclose(out_npu, expected, atol=1e-3, rtol=1e-3))
+        assert torch.allclose(out_npu, expected, atol=1e-3, rtol=1e-3)
 
     def test_kv_update_eager(self):
         # Test direct eager execution with the functional interface
@@ -60,17 +59,11 @@ class TestKVCache(unittest.TestCase):
 
         expected = cache.clone()
         expected[:, start_pos : start_pos + seq_len] = update
-        self.assertTrue(torch.allclose(out_eager, expected, atol=1e-3, rtol=1e-3))
+        assert torch.allclose(out_eager, expected, atol=1e-3, rtol=1e-3)
 
         # 2. Test eager update with float16
         cache_f16 = cache.half()
         update_f16 = update.half()
         out_eager_f16 = update_kv_cache(cache_f16, update_f16, start_pos)
-        self.assertEqual(out_eager_f16.dtype, torch.float16)
-        self.assertTrue(
-            torch.allclose(out_eager_f16.float(), expected, atol=1e-2, rtol=1e-2)
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert out_eager_f16.dtype == torch.float16
+        assert torch.allclose(out_eager_f16.float(), expected, atol=1e-2, rtol=1e-2)

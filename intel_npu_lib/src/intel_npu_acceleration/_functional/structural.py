@@ -83,6 +83,12 @@ def index_select(input: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Te
     return _C.npu_index_select(input, dim, index)
 
 
+def triu(input: torch.Tensor, diagonal: int = 0) -> torch.Tensor:
+    if _C is None or _is_proxy(input):
+        return torch.triu(input, diagonal)
+    return _C.npu_triu(input, diagonal)
+
+
 def zeros(size: list[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.zeros(size, dtype=dtype)
 

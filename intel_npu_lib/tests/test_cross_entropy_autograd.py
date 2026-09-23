@@ -1,5 +1,3 @@
-import unittest
-
 import torch
 from torch.testing import assert_close
 
@@ -7,10 +5,7 @@ import intel_npu_acceleration as npu
 from intel_npu_acceleration.optim import clip_grad_norm_
 
 
-class TestCrossEntropyAutograd(unittest.TestCase):
-    def setUp(self):
-        torch.manual_seed(42)
-
+class TestCrossEntropyAutograd:
     def test_cross_entropy_forward_backward_indices(self):
         batch_size = 4
         num_classes = 10
@@ -105,7 +100,3 @@ class TestCrossEntropyAutograd(unittest.TestCase):
         assert_close(norm_npu, norm_cpu, atol=1e-4, rtol=1e-4)
         assert_close(p1_npu.grad, p1_cpu.grad, atol=1e-4, rtol=1e-4)
         assert_close(p2_npu.grad, p2_cpu.grad, atol=1e-4, rtol=1e-4)
-
-
-if __name__ == "__main__":
-    unittest.main()

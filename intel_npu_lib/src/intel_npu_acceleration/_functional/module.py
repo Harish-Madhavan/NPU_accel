@@ -1,9 +1,21 @@
+import math
 import warnings
 from typing import List, Optional
 
 import torch
 
-from .utils import _C, _is_proxy, _promote_binary, _restore_dtype, _to_pair
+from .utils import (
+    _C,
+    _MISS,
+    _is_proxy,
+    _or_empty,
+    _promote_binary,
+    _reduction_code,
+    _restore_dtype,
+    _to_pair,
+    _try_npu,
+    unpack_int4_packed,
+)
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -23,10 +35,8 @@ def linear(
         or _is_proxy(input, weight, bias)
     ):
         return torch.nn.functional.linear(input, weight, bias)
-    if bias is None:
-        # C++ extension expects a bias tensor; pass an empty one if None
-        bias = torch.empty(0, dtype=input.dtype)
-    return _C.npu_linear(input, weight, bias)
+    # C++ extension expects a bias tensor; pass an empty one if None
+    return _C.npu_linear(input, weight, _or_empty(bias, input.dtype))
 
 
 def rmsnorm(
@@ -52,11 +62,13 @@ def layer_norm(
         return torch.nn.functional.layer_norm(
             input, normalized_shape, weight, bias, eps
         )
-    if weight is None:
-        weight = torch.empty(0, dtype=input.dtype)
-    if bias is None:
-        bias = torch.empty(0, dtype=input.dtype)
-    return _C.npu_layer_norm(input, list(normalized_shape), weight, bias, eps)
+    return _C.npu_layer_norm(
+        input,
+        list(normalized_shape),
+        _or_empty(weight, input.dtype),
+        _or_empty(bias, input.dtype),
+        eps,
+    )
 
 
 def scaled_dot_product_attention(
@@ -77,10 +89,8 @@ def scaled_dot_product_attention(
             dropout_p=dropout_p,
             is_causal=is_causal,
         )
-    if attn_mask is None:
-        attn_mask = torch.empty(0, dtype=query.dtype)
     return _C.npu_scaled_dot_product_attention(
-        query, key, value, attn_mask, dropout_p, is_causal, scale
+        query, key, value, _or_empty(attn_mask, query.dtype), dropout_p, is_causal, scale
     )
 
 
@@ -142,14 +152,7 @@ def quantized_linear(
 
         if _C is None or _is_proxy(input, weight, scale, zero_point, bias):
             if is_int4:
-                # Cast weight to int32 to satisfy NPU Floor op element type requirements (no unsigned types)
-                weight_s32 = weight.to(torch.int32)
-                w_odd = torch.floor_divide(weight_s32, 16)
-                w_even = weight_s32 - w_odd * 16
-                w_even_u = w_even.unsqueeze(1)
-                w_odd_u = w_odd.unsqueeze(1)
-                w_unpacked = torch.cat([w_even_u, w_odd_u], dim=1).transpose(1, 2).reshape(weight.shape[0], -1)
-                w_float = w_unpacked.float()
+                w_float = unpack_int4_packed(weight)
             else:
                 w_float = weight.float()
 
@@ -159,21 +162,20 @@ def quantized_linear(
             w_float = w_float.to(input.dtype)
             return torch.nn.functional.linear(input, w_float, bias)
 
-    if zero_point is None:
-        zero_point = torch.empty(0, dtype=input.dtype, device=input.device)
-    if bias is None:
-        bias = torch.empty(0, dtype=input.dtype, device=input.device)
-
-    return _C.npu_quantized_linear(input, weight, scale, zero_point, bias)
+    return _C.npu_quantized_linear(
+        input,
+        weight,
+        scale,
+        _or_empty(zero_point, input.dtype, input.device),
+        _or_empty(bias, input.dtype, input.device),
+    )
 
 
 def rotary_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Hardware accelerated Rotary Position Embedding (RoPE) for LLMs."""
-    if _C is not None and not _is_proxy(x, cos, sin):
-        try:
-            return _C.npu_rotary_embedding(x, cos, sin)
-        except Exception:
-            pass
+    res = _try_npu("npu_rotary_embedding", x, cos, sin)
+    if res is not _MISS:
+        return res
     # PyTorch CPU reference fallback
     d = x.shape[-1]
     x1 = x[..., : d // 2]
@@ -203,13 +205,10 @@ def conv2d(
             groups=groups,
         )
 
-    if bias is None:
-        bias = torch.empty(0, dtype=input.dtype)
-
     return _C.npu_conv2d(
         input,
         weight,
-        bias,
+        _or_empty(bias, input.dtype),
         _to_pair(stride),
         _to_pair(padding),
         _to_pair(dilation),
@@ -245,17 +244,135 @@ def max_pool2d(
     )
 
 
+def conv2d_backward(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    groups: int = 1,
+    needs_input_grad: bool = True,
+    needs_weight_grad: bool = True,
+    needs_bias_grad: bool = True,
+) -> tuple:
+    """Conv2d gradients via Level Zero kernels (transposed conv, im2col+MatMul, ReduceSum)."""
+    res = _try_npu(
+        "npu_conv2d_backward",
+        grad_output,
+        input,
+        weight,
+        _to_pair(stride),
+        _to_pair(padding),
+        _to_pair(dilation),
+        groups,
+        needs_input_grad,
+        needs_weight_grad,
+        needs_bias_grad,
+    )
+    if res is not _MISS:
+        grad_input, grad_weight, grad_bias = res
+        return (
+            grad_input if needs_input_grad else None,
+            grad_weight if needs_weight_grad else None,
+            grad_bias if needs_bias_grad else None,
+        )
+    grad_input = grad_weight = grad_bias = None
+    if needs_input_grad:
+        grad_input = torch.nn.grad.conv2d_input(
+            input.shape, weight, grad_output,
+            stride=stride, padding=padding, dilation=dilation, groups=groups,
+        )
+    if needs_weight_grad:
+        grad_weight = torch.nn.grad.conv2d_weight(
+            input, weight.shape, grad_output,
+            stride=stride, padding=padding, dilation=dilation, groups=groups,
+        )
+    if needs_bias_grad:
+        grad_bias = grad_output.sum(dim=(0, 2, 3))
+    return grad_input, grad_weight, grad_bias
+
+
+def scaled_dot_product_attention_backward(
+    grad_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float = 0.0,
+) -> tuple:
+    """SDPA gradients via the Level Zero recompute-and-chain-rule kernel."""
+    res = _try_npu(
+        "npu_scaled_dot_product_attention_backward",
+        grad_output,
+        query,
+        key,
+        value,
+        _or_empty(attn_mask, query.dtype),
+        dropout_p,
+        is_causal,
+        scale,
+    )
+    if res is not _MISS:
+        return tuple(res)
+    with torch.enable_grad():
+        q = query.detach().requires_grad_(True)
+        k = key.detach().requires_grad_(True)
+        v = value.detach().requires_grad_(True)
+        out_cpu = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+            scale=scale if scale else None,
+        )
+        out_cpu.backward(grad_output)
+        return q.grad, k.grad, v.grad
+
+
 def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     if _C is None or _is_proxy(weight, indices):
         return torch.nn.functional.embedding(indices, weight)
     return _C.npu_embedding(weight, indices)
 
 
+def embedding_backward(
+    grad_output: torch.Tensor,
+    indices: torch.Tensor,
+    num_embeddings: int,
+    padding_idx: int | None = None,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> torch.Tensor:
+    """Scatter gradients into the embedding table on the NPU (one-hot + MatMul kernel)."""
+    if padding_idx is None and not scale_grad_by_freq and not sparse:
+        res = _try_npu("npu_embedding_backward", grad_output, indices, num_embeddings)
+        if res is not _MISS:
+            return res
+    if padding_idx is None:
+        padding_idx = -1
+    return torch.ops.aten.embedding_backward(
+        grad_output, indices, num_embeddings, padding_idx, scale_grad_by_freq, sparse
+    )
+
+
 def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
     if _C is None or _is_proxy(pred, target):
         return torch.nn.functional.mse_loss(pred, target, reduction=reduction)
-    red_map = {"none": 0, "mean": 1, "sum": 2}
-    return _C.npu_mse_loss(pred, target, red_map.get(reduction, 1))
+    return _C.npu_mse_loss(pred, target, _reduction_code(reduction))
+
+
+def mse_loss_backward(
+    grad_output: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Gradient of MSE loss: 2 * (pred - target) [* 1/N for mean] scaled by grad_output."""
+    res = _try_npu("npu_mse_loss_backward", grad_output, pred, target, _reduction_code(reduction))
+    if res is not _MISS:
+        return res
+    scale = 2.0 / pred.numel() if reduction == "mean" else 2.0
+    return grad_output * scale * (pred - target)
 
 
 def cross_entropy_loss(
@@ -263,13 +380,10 @@ def cross_entropy_loss(
     target: torch.Tensor,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    if _C is None or _is_proxy(pred, target):
-        return torch.nn.functional.cross_entropy(pred, target, reduction=reduction)
-    red_map = {"none": 0, "mean": 1, "sum": 2}
-    try:
-        return _C.npu_cross_entropy_loss(pred, target, red_map.get(reduction, 1))
-    except Exception:
-        return torch.nn.functional.cross_entropy(pred, target, reduction=reduction)
+    res = _try_npu("npu_cross_entropy_loss", pred, target, _reduction_code(reduction))
+    if res is not _MISS:
+        return res
+    return torch.nn.functional.cross_entropy(pred, target, reduction=reduction)
 
 
 def cross_entropy_loss_backward(
@@ -278,12 +392,11 @@ def cross_entropy_loss_backward(
     target: torch.Tensor,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    if _C is not None and not _is_proxy(grad_output, pred, target):
-        red_map = {"none": 0, "mean": 1, "sum": 2}
-        try:
-            return _C.npu_cross_entropy_loss_backward(grad_output, pred, target, red_map.get(reduction, 1))
-        except Exception:
-            pass
+    res = _try_npu(
+        "npu_cross_entropy_loss_backward", grad_output, pred, target, _reduction_code(reduction)
+    )
+    if res is not _MISS:
+        return res
     sm = torch.softmax(pred, dim=-1)
     if target.dim() == pred.dim():
         target_prob = target
@@ -302,13 +415,10 @@ def l1_loss(
     reduction: str = "mean",
 ) -> torch.Tensor:
     """Compute L1 loss (Mean Absolute Error) accelerated on Intel NPU."""
-    if _C is None or _is_proxy(pred, target):
-        return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
-    red_map = {"none": 0, "mean": 1, "sum": 2}
-    try:
-        return _C.npu_l1_loss(pred, target, red_map.get(reduction, 1))
-    except Exception:
-        return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
+    res = _try_npu("npu_l1_loss", pred, target, _reduction_code(reduction))
+    if res is not _MISS:
+        return res
+    return torch.nn.functional.l1_loss(pred, target, reduction=reduction)
 
 
 def l1_loss_backward(
@@ -318,12 +428,9 @@ def l1_loss_backward(
     reduction: str = "mean",
 ) -> torch.Tensor:
     """Compute backward gradient for L1 loss."""
-    if _C is not None and not _is_proxy(grad_output, pred, target):
-        red_map = {"none": 0, "mean": 1, "sum": 2}
-        try:
-            return _C.npu_l1_loss_backward(grad_output, pred, target, red_map.get(reduction, 1))
-        except Exception:
-            pass
+    res = _try_npu("npu_l1_loss_backward", grad_output, pred, target, _reduction_code(reduction))
+    if res is not _MISS:
+        return res
     diff = pred - target
     sgn = torch.sign(diff)
     if reduction == "mean":
@@ -367,11 +474,9 @@ def bce_with_logits_loss_backward(
 
 
 def matmul_backward(grad_output: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
-    if _C is not None and not _is_proxy(grad_output, a, b):
-        try:
-            return _C.npu_matmul_backward(grad_output, a, b)
-        except Exception:
-            pass
+    res = _try_npu("npu_matmul_backward", grad_output, a, b)
+    if res is not _MISS:
+        return res
     grad_a = grad_output @ b.transpose(-2, -1)
     grad_b = a.transpose(-2, -1) @ grad_output
     return [grad_a, grad_b]
@@ -385,13 +490,17 @@ def linear_backward(
     needs_weight_grad: bool = True,
     needs_bias_grad: bool = True,
 ) -> list[torch.Tensor]:
-    if _C is not None and not _is_proxy(grad_output, input, weight):
-        try:
-            return _C.npu_linear_backward(
-                grad_output, input, weight, needs_input_grad, needs_weight_grad, needs_bias_grad
-            )
-        except Exception:
-            pass
+    res = _try_npu(
+        "npu_linear_backward",
+        grad_output,
+        input,
+        weight,
+        needs_input_grad,
+        needs_weight_grad,
+        needs_bias_grad,
+    )
+    if res is not _MISS:
+        return res
     grad_input = grad_output @ weight if needs_input_grad else torch.empty(0)
     grad_weight = grad_output.reshape(-1, grad_output.size(-1)).t() @ input.reshape(-1, input.size(-1)) if needs_weight_grad else torch.empty(0)
     grad_bias = grad_output.reshape(-1, grad_output.size(-1)).sum(0) if needs_bias_grad else torch.empty(0)
@@ -399,24 +508,19 @@ def linear_backward(
 
 
 def relu_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
-    if _C is not None and not _is_proxy(grad_output, input):
-        try:
-            return _C.npu_relu_backward(grad_output, input)
-        except Exception:
-            pass
+    res = _try_npu("npu_relu_backward", grad_output, input)
+    if res is not _MISS:
+        return res
     grad = grad_output.clone()
     grad[input <= 0] = 0
     return grad
 
 
 def gelu_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
-    if _C is not None and not _is_proxy(grad_output, input):
-        try:
-            return _C.npu_gelu_backward(grad_output, input)
-        except Exception:
-            pass
+    res = _try_npu("npu_gelu_backward", grad_output, input)
+    if res is not _MISS:
+        return res
     # Exact GELU derivative fallback
-    import math
     c1 = 1.0 / math.sqrt(2.0)
     c2 = 1.0 / math.sqrt(2.0 * math.pi)
     cdf = 0.5 * (1.0 + torch.erf(c1 * input))
@@ -425,23 +529,145 @@ def gelu_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tenso
 
 
 def silu_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
-    if _C is not None and not _is_proxy(grad_output, input):
-        try:
-            return _C.npu_silu_backward(grad_output, input)
-        except Exception:
-            pass
+    res = _try_npu("npu_silu_backward", grad_output, input)
+    if res is not _MISS:
+        return res
     s = torch.sigmoid(input)
     return grad_output * (s * (1.0 + input * (1.0 - s)))
 
 
 def softmax_backward(grad_output: torch.Tensor, output: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    if _C is not None and not _is_proxy(grad_output, output):
-        try:
-            return _C.npu_softmax_backward(grad_output, output, dim)
-        except Exception:
-            pass
+    res = _try_npu("npu_softmax_backward", grad_output, output, dim)
+    if res is not _MISS:
+        return res
     sum_gy = (grad_output * output).sum(dim=dim, keepdim=True)
     return output * (grad_output - sum_gy)
+
+
+def sin_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_sin_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return grad_output * torch.cos(input)
+
+
+def cos_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_cos_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return -grad_output * torch.sin(input)
+
+
+def exp_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_exp_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return grad_output * torch.exp(input)
+
+
+def sqrt_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_sqrt_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return grad_output * 0.5 / torch.sqrt(input)
+
+
+def abs_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_abs_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return grad_output * torch.sign(input)
+
+
+def rsqrt_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    res = _try_npu("npu_rsqrt_backward", grad_output, input)
+    if res is not _MISS:
+        return res
+    return grad_output * -0.5 * torch.pow(input, -1.5)
+
+
+def pow_backward(
+    grad_output: torch.Tensor,
+    a: torch.Tensor,
+    exponent: torch.Tensor,
+    needs_a_grad: bool = True,
+    needs_exponent_grad: bool = False,
+) -> tuple:
+    """Gradient w.r.t. the base on NPU; exponent gradients use the CPU fallback."""
+    if not needs_exponent_grad:
+        res = _try_npu("npu_pow_backward", grad_output, a, exponent)
+        if res is not _MISS:
+            return res, None
+    grad_a = exponent * torch.pow(a, exponent - 1) * grad_output
+    grad_exp = None
+    if needs_exponent_grad:
+        grad_exp = (torch.pow(a, exponent) * torch.log(a) * grad_output).sum_to_size(exponent.shape)
+    return grad_a, grad_exp
+
+
+def clamp_backward(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    min_val: float,
+    max_val: float,
+) -> torch.Tensor:
+    res = _try_npu("npu_clamp_backward", grad_output, input, min_val, max_val)
+    if res is not _MISS:
+        return res
+    mask = (input >= min_val) & (input <= max_val)
+    return grad_output * mask.to(grad_output.dtype)
+
+
+def where_backward(grad_output: torch.Tensor, condition: torch.Tensor) -> tuple:
+    res = _try_npu("npu_where_backward", grad_output, condition)
+    if res is not _MISS:
+        return tuple(res)
+    mask = condition.to(grad_output.dtype)
+    return grad_output * mask, grad_output * (1.0 - mask)
+
+
+def triu_backward(grad_output: torch.Tensor, diagonal: int = 0) -> torch.Tensor:
+    res = _try_npu("npu_triu_backward", grad_output, diagonal)
+    if res is not _MISS:
+        return res
+    return torch.triu(grad_output, diagonal)
+
+
+def max_pool2d_backward(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    kernel_size,
+    stride,
+    padding,
+    dilation=(1, 1),
+    ceil_mode: bool = False,
+) -> torch.Tensor:
+    """Tiled pools run the NPU Gather kernel; anything else uses CPU indices."""
+    kernel = _to_pair(kernel_size)
+    st = _to_pair(stride) if stride is not None else kernel
+    pd = _to_pair(padding)
+    dl = _to_pair(dilation)
+    tiled = (
+        st == kernel
+        and pd == [0, 0]
+        and dl == [1, 1]
+        and not ceil_mode
+        and input.shape[2] % st[0] == 0
+        and input.shape[3] % st[1] == 0
+    )
+    if tiled:
+        res = _try_npu(
+            "npu_max_pool2d_backward", grad_output, input, kernel, st, pd
+        )
+        if res is not _MISS:
+            return res
+    with torch.enable_grad():
+        xc = input.detach().requires_grad_(True)
+        out_c, _ = torch.nn.functional.max_pool2d_with_indices(
+            xc, kernel, st, pd, dl, ceil_mode, True
+        )
+        out_c.backward(grad_output)
+        return xc.grad
 
 
 def rmsnorm_backward(
@@ -450,11 +676,9 @@ def rmsnorm_backward(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> list[torch.Tensor]:
-    if _C is not None and not _is_proxy(grad_output, input, weight):
-        try:
-            return _C.npu_rmsnorm_backward(grad_output, input, weight, eps)
-        except Exception:
-            pass
+    res = _try_npu("npu_rmsnorm_backward", grad_output, input, weight, eps)
+    if res is not _MISS:
+        return res
     go = grad_output.float()
     in_f = input.float()
     w_f = weight.float()
@@ -479,13 +703,11 @@ def adam_step(
     weight_decay: float,
     step: int,
 ) -> list[torch.Tensor]:
-    if _C is not None and not _is_proxy(param, grad, exp_avg, exp_avg_sq):
-        try:
-            return _C.npu_adam_step(
-                param, grad, exp_avg, exp_avg_sq, lr, beta1, beta2, eps, weight_decay, step
-            )
-        except Exception:
-            pass
+    res = _try_npu(
+        "npu_adam_step", param, grad, exp_avg, exp_avg_sq, lr, beta1, beta2, eps, weight_decay, step
+    )
+    if res is not _MISS:
+        return res
     if weight_decay != 0:
         grad = grad + param * weight_decay
     exp_avg = exp_avg * beta1 + grad * (1.0 - beta1)
@@ -508,21 +730,20 @@ def sgd_step(
     nesterov: bool,
     has_momentum_buffer: bool,
 ) -> list[torch.Tensor]:
-    if _C is not None and not _is_proxy(param, grad, momentum_buffer):
-        try:
-            return _C.npu_sgd_step(
-                param,
-                grad,
-                momentum_buffer,
-                lr,
-                momentum,
-                weight_decay,
-                dampening,
-                nesterov,
-                has_momentum_buffer,
-            )
-        except Exception:
-            pass
+    res = _try_npu(
+        "npu_sgd_step",
+        param,
+        grad,
+        momentum_buffer,
+        lr,
+        momentum,
+        weight_decay,
+        dampening,
+        nesterov,
+        has_momentum_buffer,
+    )
+    if res is not _MISS:
+        return res
     effective_grad = grad
     if weight_decay != 0.0:
         effective_grad = grad + param * weight_decay

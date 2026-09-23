@@ -1,6 +1,6 @@
 import time
-import unittest
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -8,7 +8,7 @@ import intel_npu_acceleration as npu
 from intel_npu_acceleration.frontend import NPUCompilationError
 
 
-class TestFXTracing(unittest.TestCase):
+class TestFXTracing:
     def test_fx_tracing_dtypes(self):
         # 1. Test float32 compilation
         class ModelF32(nn.Module):
@@ -21,7 +21,7 @@ class TestFXTracing(unittest.TestCase):
 
         n_f32 = npu.compile(m_f32, (x_f32, y_f32))
         res_n = n_f32(x_f32, y_f32)
-        self.assertTrue(torch.allclose(res_n, x_f32 + y_f32, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(res_n, x_f32 + y_f32, atol=1e-2, rtol=1e-2)
 
         # 2. Test float16 compilation
         class ModelF16(nn.Module):
@@ -34,10 +34,8 @@ class TestFXTracing(unittest.TestCase):
 
         n_f16 = npu.compile(m_f16, (x_f16, y_f16))
         res_n16 = n_f16(x_f16, y_f16)
-        self.assertTrue(
-            torch.allclose(
-                res_n16.float(), (x_f16 + y_f16).float(), atol=1e-2, rtol=1e-2
-            )
+        assert torch.allclose(
+            res_n16.float(), (x_f16 + y_f16).float(), atol=1e-2, rtol=1e-2
         )
 
     def test_fx_tracing_caching(self):
@@ -62,7 +60,7 @@ class TestFXTracing(unittest.TestCase):
             f"\nFX Tracing Caching benchmark - First Compile: {t_first:.4f}s | Second (Cache): {t_second:.4f}s"
         )
         # Python cache lookup is extremely fast (< 1-2 ms), while actual compilation takes 10+ ms.
-        self.assertTrue(t_second < 0.05 or t_second < t_first * 0.1)
+        assert t_second < 0.05 or t_second < t_first * 0.1
 
     def test_fx_tracing_varying_shapes(self):
         class ShapeModel(nn.Module):
@@ -75,13 +73,13 @@ class TestFXTracing(unittest.TestCase):
         x1 = torch.randn(2, 4)
         n1 = npu.compile(m, x1)
         res1 = n1(x1)
-        self.assertEqual(res1.shape, (2, 4))
+        assert res1.shape == (2, 4)
 
         # Compile with shape (4, 4)
         x2 = torch.randn(4, 4)
         n2 = npu.compile(m, x2)
         res2 = n2(x2)
-        self.assertEqual(res2.shape, (2, 8))
+        assert res2.shape == (2, 8)
 
     def test_fx_tracing_zero_dim_inputs(self):
         # Verify tracing with zero-dimensional scalar input tensors
@@ -96,9 +94,9 @@ class TestFXTracing(unittest.TestCase):
         try:
             n_model = npu.compile(m, (x, scalar))
             res = n_model(x, scalar)
-            self.assertTrue(torch.allclose(res, x + 3.0, atol=1e-2, rtol=1e-2))
+            assert torch.allclose(res, x + 3.0, atol=1e-2, rtol=1e-2)
         except Exception as e:
-            self.fail(f"Zero-dimensional scalar input compilation failed: {e}")
+            pytest.fail(f"Zero-dimensional scalar input compilation failed: {e}")
 
     def test_fx_tracing_invalid_ops(self):
         # Tracing an unsupported operator must raise NPUCompilationError
@@ -110,9 +108,5 @@ class TestFXTracing(unittest.TestCase):
         m = InvalidModel()
         x = torch.randn(8)
 
-        with self.assertRaises(NPUCompilationError):
+        with pytest.raises(NPUCompilationError):
             npu.compile(m, x, strict=True)
-
-
-if __name__ == "__main__":
-    unittest.main()

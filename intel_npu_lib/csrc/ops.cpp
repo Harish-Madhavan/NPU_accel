@@ -1,6 +1,8 @@
 #include "include/ops.h"
 
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset1.hpp>
@@ -77,6 +79,17 @@ std::string get_key(const std::string& op_name, const std::vector<torch::Tensor>
     }
     ss << extra_args;
     return ss.str();
+}
+
+// Constant::create cannot deduce braced lists holding int64_t variables
+// (ambiguous overloads), so build the vector explicitly.
+static std::shared_ptr<ov::Node> i64_const(const std::vector<int64_t>& vals) {
+    return ov::opset1::Constant::create(ov::element::i64, ov::Shape{vals.size()}, vals);
+}
+
+static std::shared_ptr<ov::Node> i64_scalar(int64_t v) {
+    return ov::opset1::Constant::create(ov::element::i64, ov::Shape{},
+                                        std::vector<int64_t>{v});
 }
 
 // --- Core Compilation & Execution Logic ---
@@ -793,12 +806,30 @@ torch::Tensor npu_embedding(torch::Tensor weight, torch::Tensor indices) {
 }
 
 torch::Tensor npu_embedding_backward(torch::Tensor grad_output, torch::Tensor indices, int64_t num_embeddings) {
-    // Embedding gradient scatter
-    auto grad_out_flat = grad_output.reshape({-1, grad_output.size(-1)});
-    auto idx_flat = indices.reshape({-1});
-    torch::Tensor grad_weight = torch::zeros({num_embeddings, grad_output.size(-1)}, grad_output.options());
-    grad_weight.index_add_(0, idx_flat, grad_out_flat);
-    return grad_weight;
+    // Embedding gradient as a Level Zero graph: one-hot expand indices, then
+    // grad_weight = one_hot(indices)^T @ grad_output. Additive accumulation
+    // over duplicate indices falls out of the matrix product, matching
+    // aten::embedding_backward (dense, no padding_idx scaling).
+    int64_t E = grad_output.size(-1);
+    int64_t S = indices.numel();
+    auto go_flat = grad_output.reshape({S, E}).contiguous();
+    auto idx_flat = indices.reshape({-1}).contiguous();
+
+    std::string key = get_key("embedding_backward", {go_flat, idx_flat}, std::to_string(num_embeddings));
+    ov::element::Type go_type = torch_dtype_to_ov(go_flat);
+    auto arg_go = std::make_shared<ov::opset1::Parameter>(go_type, get_ov_shape(go_flat));
+    auto arg_idx = std::make_shared<ov::opset1::Parameter>(ov::element::i64, get_ov_shape(idx_flat));
+
+    auto depth = i64_scalar(num_embeddings);
+    auto on = ov::opset1::Constant::create(go_type, ov::Shape{}, {1.0f});
+    auto off = ov::opset1::Constant::create(go_type, ov::Shape{}, {0.0f});
+    auto oh = std::make_shared<ov::opset1::OneHot>(arg_idx, depth, on, off, -1);
+    auto perm = ov::opset1::Constant::create(ov::element::i64, ov::Shape{2}, {1, 0});
+    auto oh_t = std::make_shared<ov::opset1::Transpose>(oh, perm);
+    auto grad_w = std::make_shared<ov::opset1::MatMul>(oh_t, arg_go, false, false);
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad_w}, ov::ParameterVector{arg_go, arg_idx});
+    return execute_op(key, model, {go_flat, idx_flat});
 }
 
 // ---------------------------------------------------------------------------
@@ -963,21 +994,78 @@ torch::Tensor npu_softmax_backward(torch::Tensor grad_output, torch::Tensor outp
     return execute_op(key, model, {grad_output, output});
 }
 
+namespace {
+
+// Shared RMSNorm backward prologue: rms and normalized input as graph nodes.
+struct RmsNormBwdNodes {
+    std::shared_ptr<ov::Node> rms;
+    std::shared_ptr<ov::Node> xn;
+};
+
+RmsNormBwdNodes build_rmsnorm_bwd_core(const ov::Output<ov::Node>& arg_x,
+                                       int64_t rank, float epsilon) {
+    auto sq = std::make_shared<ov::opset1::Multiply>(arg_x, arg_x);
+    auto axes_last = i64_const({rank - 1});
+    auto mean = std::make_shared<ov::opset1::ReduceMean>(sq, axes_last, true);
+    auto eps_c = ov::opset1::Constant::create(mean->get_element_type(), ov::Shape{},
+                                              {epsilon});
+    auto rms = std::make_shared<ov::opset1::Sqrt>(
+        std::make_shared<ov::opset1::Add>(mean, eps_c));
+    auto xn = std::make_shared<ov::opset1::Divide>(arg_x, rms);
+    return {rms, xn};
+}
+
+}  // namespace
+
 std::vector<torch::Tensor> npu_rmsnorm_backward(torch::Tensor grad_output, torch::Tensor input, torch::Tensor weight, float epsilon) {
-    auto go = grad_output.to(torch::kFloat32);
-    auto in_f = input.to(torch::kFloat32);
-    auto w_f = weight.to(torch::kFloat32);
+    // RMSNorm backward as Level Zero graphs (previously torch-CPU composition):
+    //   rms = sqrt(mean(x^2) + eps); xn = x / rms
+    //   grad_w = sum(go * xn) over leading dims
+    //   grad_in = (go * w - xn * mean(go * w * xn)) / rms
+    int64_t rank = input.dim();
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    std::string suffix = std::to_string(epsilon);
 
-    auto rms = torch::sqrt(in_f.pow(2).mean(-1, true) + epsilon);
-    auto xn = in_f / rms;
+    // --- grad_input graph ---
+    torch::Tensor grad_in;
+    {
+        std::string key = get_key("rmsnorm_backward_input", {grad_output, input, weight}, suffix);
+        auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+        auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+        auto arg_w = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
+        auto core = build_rmsnorm_bwd_core(arg_x, rank, epsilon);
+        auto dl_dxn = std::make_shared<ov::opset1::Multiply>(arg_go, arg_w);
+        auto axes_last = i64_const({rank - 1});
+        auto correction = std::make_shared<ov::opset1::ReduceMean>(
+            std::make_shared<ov::opset1::Multiply>(dl_dxn, core.xn), axes_last, true);
+        auto grad = std::make_shared<ov::opset1::Divide>(
+            std::make_shared<ov::opset1::Subtract>(
+                dl_dxn, std::make_shared<ov::opset1::Multiply>(core.xn, correction)),
+            core.rms);
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
+                                                 ov::ParameterVector{arg_go, arg_x, arg_w});
+        grad_in = execute_op(key, model, {grad_output, input, weight});
+    }
 
-    std::vector<int64_t> sum_dims(go.dim() - 1);
-    std::iota(sum_dims.begin(), sum_dims.end(), 0);
-    auto grad_w = (go * xn).sum(sum_dims).to(weight.dtype());
-
-    auto dL_dxn = go * w_f;
-    auto correction = (dL_dxn * xn).mean(-1, true);
-    auto grad_in = ((dL_dxn - xn * correction) / rms).to(grad_output.dtype());
+    // --- grad_weight graph ---
+    torch::Tensor grad_w;
+    {
+        std::string key = get_key("rmsnorm_backward_weight", {grad_output, input, weight}, suffix);
+        auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+        auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+        std::shared_ptr<ov::Node> gw = std::make_shared<ov::opset1::Multiply>(
+            arg_go, build_rmsnorm_bwd_core(arg_x, rank, epsilon).xn);
+        if (rank > 1) {
+            std::vector<int64_t> axes_lead(rank - 1);
+            std::iota(axes_lead.begin(), axes_lead.end(), 0);
+            auto axes = ov::opset1::Constant::create(ov::element::i64,
+                                                     ov::Shape{axes_lead.size()}, axes_lead);
+            gw = std::make_shared<ov::opset1::ReduceSum>(gw, axes, false);
+        }
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{gw},
+                                                 ov::ParameterVector{arg_go, arg_x});
+        grad_w = execute_op(key, model, {grad_output, input});
+    }
 
     return {grad_in, grad_w};
 }
@@ -1152,6 +1240,475 @@ torch::Tensor npu_l1_loss_backward(torch::Tensor grad_output, torch::Tensor pred
     auto grad = std::make_shared<ov::opset1::Multiply>(scaled_sgn, arg_g);
     auto model = std::make_shared<ov::Model>(ov::OutputVector{grad}, ov::ParameterVector{arg_g, arg_p, arg_t});
     return execute_op(key, model, {grad_output, pred, target});
+}
+
+// ---------------------------------------------------------------------------
+// Conv2d Backward (Level Zero graphs)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// grad_bias: ReduceSum over N,H,W.
+torch::Tensor conv2d_bwd_bias(const torch::Tensor& grad_output, const std::string& cfg) {
+    std::string key = get_key("conv2d_backward_bias", {grad_output}, cfg);
+    auto arg_dy =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output), get_ov_shape(grad_output));
+    auto axes = ov::opset1::Constant::create(ov::element::i64, ov::Shape{3}, {0, 2, 3});
+    auto sum = std::make_shared<ov::opset1::ReduceSum>(arg_dy, axes, false);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{sum}, ov::ParameterVector{arg_dy});
+    return execute_op(key, model, {grad_output});
+}
+
+// grad_input for a single group slice via transposed convolution.
+// Filters must arrive in [C_IN, C_OUT, Kh, Kw] order (transposed vs forward).
+torch::Tensor conv2d_bwd_input_single(const torch::Tensor& grad_output, const torch::Tensor& weight_t,
+                                      int64_t H, int64_t W, int64_t sh, int64_t sw, int64_t ph,
+                                      int64_t pw, int64_t dh, int64_t dw, const std::string& key) {
+    auto arg_dy = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output),
+                                                          get_ov_shape(grad_output));
+    auto arg_w = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(weight_t),
+                                                         get_ov_shape(weight_t));
+    int64_t Ho = grad_output.size(2);
+    int64_t Wo = grad_output.size(3);
+    int64_t Kh = weight_t.size(2);
+    int64_t Kw = weight_t.size(3);
+    int64_t oph = H - ((Ho - 1) * sh - 2 * ph + dh * (Kh - 1) + 1);
+    int64_t opw = W - ((Wo - 1) * sw - 2 * pw + dw * (Kw - 1) + 1);
+    auto out_shape = i64_const({H, W});
+    auto node = std::make_shared<ov::opset1::ConvolutionBackpropData>(
+        arg_dy, arg_w, out_shape, ov::Strides{(size_t)sh, (size_t)sw},
+        ov::CoordinateDiff{ph, pw}, ov::CoordinateDiff{ph, pw}, ov::Strides{(size_t)dh, (size_t)dw},
+        ov::op::PadType::EXPLICIT, ov::CoordinateDiff{oph, opw});
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{node}, ov::ParameterVector{arg_dy, arg_w});
+    return execute_op(key, model, {grad_output, weight_t});
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> npu_conv2d_backward(torch::Tensor grad_output, torch::Tensor input,
+                                               torch::Tensor weight, std::vector<int64_t> stride,
+                                               std::vector<int64_t> padding, std::vector<int64_t> dilation,
+                                               int64_t groups, bool needs_input_grad,
+                                               bool needs_weight_grad, bool needs_bias_grad) {
+    std::stringstream ss;
+    ss << "s" << stride[0] << "x" << stride[1] << "_p" << padding[0] << "x" << padding[1]
+       << "_d" << dilation[0] << "x" << dilation[1] << "_g" << groups;
+    std::string cfg = ss.str();
+
+    int64_t N = input.size(0);
+    int64_t Ci = input.size(1);
+    int64_t H = input.size(2);
+    int64_t W = input.size(3);
+    int64_t Co = weight.size(0);
+    int64_t Kh = weight.size(2);
+    int64_t Kw = weight.size(3);
+    int64_t Ho = grad_output.size(2);
+    int64_t Wo = grad_output.size(3);
+    int64_t sh = stride[0], sw = stride[1];
+    int64_t ph = padding[0], pw = padding[1];
+    int64_t dh = dilation[0], dw = dilation[1];
+
+    torch::Tensor grad_input, grad_weight, grad_bias;
+
+    if (needs_bias_grad) {
+        grad_bias = conv2d_bwd_bias(grad_output, cfg);
+    }
+
+    if (needs_input_grad) {
+        if (groups == 1) {
+            // Forward weights arrive as (Co,Ci,Kh,Kw), which already matches the
+            // BackpropData filter order [C_IN(backprop), C_OUT(backprop), ...].
+            std::string key = get_key("conv2d_backward_input", {grad_output, input, weight}, cfg);
+            grad_input = conv2d_bwd_input_single(grad_output, weight, H, W, sh, sw, ph, pw, dh,
+                                                 dw, key);
+        } else {
+            // Grouped: per-group transposed convolution, concatenated on channels.
+            int64_t Cog = Co / groups;
+            int64_t Cig = Ci / groups;
+            auto ov_type = torch_dtype_to_ov(input);
+            ov::OutputVector parts;
+            ov::ParameterVector params;
+            std::vector<torch::Tensor> inputs;
+            // Parameters are shared across group slices; build one graph.
+            auto arg_dy = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+            auto arg_w = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
+            params = {arg_dy, arg_w};
+            inputs = {grad_output, weight};
+            auto one = i64_const({1, 1, 1, 1});
+            for (int64_t g = 0; g < groups; ++g) {
+                auto dy_begin = i64_const({0, g * Cog, 0, 0});
+                auto dy_end = i64_const({N, (g + 1) * Cog, Ho, Wo});
+                auto dy_g = std::make_shared<ov::opset1::StridedSlice>(
+                    arg_dy, dy_begin, dy_end, one, std::vector<int64_t>{}, std::vector<int64_t>{});
+                auto w_begin = i64_const({g * Cog, 0, 0, 0});
+                auto w_end = i64_const({(g + 1) * Cog, Cig, Kh, Kw});
+                auto w_g = std::make_shared<ov::opset1::StridedSlice>(
+                    arg_w, w_begin, w_end, one, std::vector<int64_t>{}, std::vector<int64_t>{});
+                int64_t oph = H - ((Ho - 1) * sh - 2 * ph + dh * (Kh - 1) + 1);
+                int64_t opw = W - ((Wo - 1) * sw - 2 * pw + dw * (Kw - 1) + 1);
+                auto out_shape = i64_const({H, W});
+                parts.push_back(std::make_shared<ov::opset1::ConvolutionBackpropData>(
+                    dy_g, w_g, out_shape, ov::Strides{(size_t)sh, (size_t)sw},
+                    ov::CoordinateDiff{ph, pw}, ov::CoordinateDiff{ph, pw},
+                    ov::Strides{(size_t)dh, (size_t)dw}, ov::op::PadType::EXPLICIT,
+                    ov::CoordinateDiff{oph, opw}));
+            }
+            auto concat = std::make_shared<ov::opset1::Concat>(parts, 1);
+            auto model = std::make_shared<ov::Model>(ov::OutputVector{concat}, params);
+            std::string gkey = get_key("conv2d_backward_input", {grad_output, input, weight}, cfg);
+            grad_input = execute_op(gkey, model, inputs);
+        }
+    }
+
+    if (needs_weight_grad) {
+        // grad_weight via im2col: pad X, gather Kh*Kw patch blocks, P^T @ dY,
+        // reduce over N, reshape to (Co, Ci, Kh, Kw), block-mask for groups.
+        std::string key = get_key("conv2d_backward_weight", {grad_output, input, weight}, cfg);
+        ov::element::Type ov_type = torch_dtype_to_ov(input);
+        auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+        auto arg_dy = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+
+        int64_t Hp = H + 2 * ph;
+        int64_t Wp = W + 2 * pw;
+        auto pb = i64_const({0, 0, ph, pw});
+        auto pe = i64_const({0, 0, ph, pw});
+        auto zero = ov::opset1::Constant::create(ov_type, ov::Shape{}, {0.0f});
+        auto Xp = std::make_shared<ov::opset1::Pad>(arg_x, pb, pe, zero, ov::op::PadMode::CONSTANT);
+        auto flat_shape = i64_const({N, Ci, Hp * Wp});
+        auto Xf = std::make_shared<ov::opset1::Reshape>(Xp, flat_shape, false);
+        auto axis2 = i64_scalar(2);
+
+        ov::OutputVector blocks;
+        for (int64_t kh = 0; kh < Kh; ++kh) {
+            for (int64_t kw = 0; kw < Kw; ++kw) {
+                std::vector<int64_t> idx(Ho * Wo);
+                for (int64_t oh = 0; oh < Ho; ++oh) {
+                    for (int64_t ow = 0; ow < Wo; ++ow) {
+                        idx[oh * Wo + ow] = (oh * sh + kh * dh) * Wp + (ow * sw + kw * dw);
+                    }
+                }
+                auto idx_c = ov::opset1::Constant::create(ov::element::i64,
+                                                          ov::Shape{(size_t)idx.size()}, idx);
+                auto g = std::make_shared<ov::opset1::Gather>(Xf, idx_c, axis2);
+                auto perm = ov::opset1::Constant::create(ov::element::i64, ov::Shape{3}, {0, 2, 1});
+                blocks.push_back(std::make_shared<ov::opset1::Transpose>(g, perm));
+            }
+        }
+        auto P = std::make_shared<ov::opset1::Concat>(blocks, 2);
+        auto Pt = std::make_shared<ov::opset1::Transpose>(P, i64_const({0, 2, 1}));
+        // (N,Co,Ho,Wo) -> (N,Ho,Wo,Co) is a permute, not a reshape.
+        auto dy_perm = std::make_shared<ov::opset1::Transpose>(arg_dy, i64_const({0, 2, 3, 1}));
+        auto Yf = std::make_shared<ov::opset1::Reshape>(dy_perm, i64_const({N, Ho * Wo, Co}), false);
+        auto M = std::make_shared<ov::opset1::MatMul>(Pt, Yf, false, false);
+        auto S = std::make_shared<ov::opset1::ReduceSum>(M, i64_const({0}), false);
+        auto T = std::make_shared<ov::opset1::Transpose>(S, i64_const({1, 0}));
+        // Columns are (kh,kw)-major with Ci innermost: reshape to (Co,Kh,Kw,Ci),
+        // then permute to (Co,Ci,Kh,Kw).
+        auto dW4 = std::make_shared<ov::opset1::Reshape>(
+            T, i64_const({Co, Kh, Kw, Ci}), false);
+        std::shared_ptr<ov::Node> dW = std::make_shared<ov::opset1::Transpose>(
+            dW4, i64_const({0, 3, 1, 2}));
+
+        if (groups > 1) {
+            // Grouped: keep each group's block-diagonal entries by slicing
+            // rows [j*Cog:(j+1)*Cog] and cols [j*Cig:(j+1)*Cig], then stacking
+            // rows -> (Co, Ci/groups, Kh, Kw), matching the forward layout.
+            int64_t Cog = Co / groups;
+            int64_t Cig = Ci / groups;
+            ov::OutputVector gparts;
+            auto gone = i64_const({1, 1, 1, 1});
+            for (int64_t j = 0; j < groups; ++j) {
+                auto gb = i64_const({j * Cog, j * Cig, 0, 0});
+                auto ge = i64_const({(j + 1) * Cog, (j + 1) * Cig, Kh, Kw});
+                gparts.push_back(std::make_shared<ov::opset1::StridedSlice>(
+                    dW, gb, ge, gone, std::vector<int64_t>{}, std::vector<int64_t>{}));
+            }
+            dW = std::make_shared<ov::opset1::Concat>(gparts, 0);
+        }
+
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{dW},
+                                                 ov::ParameterVector{arg_x, arg_dy});
+        grad_weight = execute_op(key, model, {input, grad_output});
+    }
+
+    return {grad_input, grad_weight, grad_bias};
+}
+
+// ---------------------------------------------------------------------------
+// Scaled Dot-Product Attention Backward (Level Zero composite)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Transpose the last two dimensions via the NPU transpose kernel.
+torch::Tensor transpose_last2(const torch::Tensor& t) {
+    int64_t rank = t.dim();
+    std::vector<int64_t> perm(rank);
+    for (int64_t i = 0; i < rank; ++i) perm[i] = i;
+    if (rank >= 2) std::swap(perm[rank - 1], perm[rank - 2]);
+    return npu_transpose(t, perm);
+}
+
+// Elementwise multiply by a host scalar through the NPU multiply kernel
+// (OpenVINO broadcasting handles the 0-dim operand).
+torch::Tensor mul_scalar(const torch::Tensor& t, double value) {
+    auto scalar = torch::full({}, value, t.options());
+    return npu_mul(t, scalar);
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> npu_scaled_dot_product_attention_backward(torch::Tensor grad_output,
+                                                                      torch::Tensor query, torch::Tensor key,
+                                                                      torch::Tensor value, torch::Tensor attn_mask,
+                                                                      double dropout_p, bool is_causal, double scale) {
+    (void)dropout_p;  // Forward applies no dropout, so there is nothing to differentiate through.
+    int64_t Sq = query.size(-2);
+    int64_t Sk = key.size(-2);
+    int64_t E = query.size(-1);
+    double eff_scale = scale > 0.0 ? scale : 1.0 / std::sqrt(static_cast<double>(E));
+
+    // Recompute attention probabilities exactly as forward:
+    // S = Q @ K^T * scale (+ mask) (+ causal mask); P = softmax(S).
+    auto s = npu_matmul(query, transpose_last2(key));
+    s = mul_scalar(s, eff_scale);
+    if (attn_mask.defined() && attn_mask.numel() > 0) {
+        s = npu_add(s, attn_mask);
+    }
+    if (is_causal) {
+        // Additive lower-triangular mask: key j visible when j <= i + (Sk - Sq).
+        auto rows = torch::arange(Sq, torch::TensorOptions().dtype(torch::kLong)).unsqueeze(1);
+        auto cols = torch::arange(Sk, torch::TensorOptions().dtype(torch::kLong)).unsqueeze(0);
+        auto allowed = cols <= (rows + (Sk - Sq));
+        auto zero = torch::tensor(0.0, query.options());
+        auto neg_inf = torch::tensor(-std::numeric_limits<float>::infinity(), query.options());
+        s = npu_add(s, torch::where(allowed, zero, neg_inf));
+    }
+    auto p = npu_softmax(s, -1);
+
+    // Softmax-Jacobian chain rule with Level Zero MatMul/elementwise kernels:
+    // dV = P^T @ dO; dP = dO @ V^T; dS = P * (dP - sum(dP * P)); dQ = dS @ K; dK = dS^T @ Q.
+    // NOTE: S carries the attention scale (S = Q@K^T * scale), so dQ/dK must be
+    // scaled once more by eff_scale (dV/dP/dS need no extra factor).
+    auto dv = npu_matmul(transpose_last2(p), grad_output);
+    auto dp = npu_matmul(grad_output, transpose_last2(value));
+    auto dp_p = npu_mul(dp, p);
+    auto sum = mul_scalar(npu_mean(dp_p, {dp_p.dim() - 1}, true), static_cast<double>(Sk));
+    auto ds = npu_mul(p, npu_sub(dp, sum));
+    auto dq = mul_scalar(npu_matmul(ds, key), eff_scale);
+    auto dk = mul_scalar(npu_matmul(transpose_last2(ds), query), eff_scale);
+    return {dq, dk, dv};
+}
+
+// ---------------------------------------------------------------------------
+// Elementwise transcendentals, clamping, selection & triangular ops
+// ---------------------------------------------------------------------------
+
+torch::Tensor npu_sin(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Sin>("sin", a);
+}
+
+torch::Tensor npu_cos(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Cos>("cos", a);
+}
+
+torch::Tensor npu_exp(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Exp>("exp", a);
+}
+
+torch::Tensor npu_sqrt(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Sqrt>("sqrt", a);
+}
+
+torch::Tensor npu_abs(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Abs>("abs", a);
+}
+
+torch::Tensor npu_sign(torch::Tensor a) {
+    return execute_unary_op_helper<ov::opset1::Sign>("sign", a);
+}
+
+torch::Tensor npu_rsqrt(torch::Tensor a) {
+    // No dedicated Rsqrt op: x^(-0.5) via Power with a constant exponent.
+    std::string key = get_key("rsqrt", {a});
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
+    auto exp = ov::opset1::Constant::create(torch_dtype_to_ov(a), ov::Shape{}, {-0.5f});
+    auto op = std::make_shared<ov::opset1::Power>(arg_a, exp);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a});
+    return execute_op(key, model, {a});
+}
+
+torch::Tensor npu_pow(torch::Tensor a, torch::Tensor exponent) {
+    return execute_binary_op_helper<ov::opset1::Power>("pow", a, exponent);
+}
+
+torch::Tensor npu_clamp(torch::Tensor a, double min_val, double max_val) {
+    std::string key =
+        get_key("clamp", {a}, std::to_string(min_val) + "_" + std::to_string(max_val));
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
+    auto op = std::make_shared<ov::opset1::Clamp>(arg_a, min_val, max_val);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op}, ov::ParameterVector{arg_a});
+    return execute_op(key, model, {a});
+}
+
+torch::Tensor npu_where(torch::Tensor condition, torch::Tensor a, torch::Tensor b) {
+    std::string key = get_key("where", {a, b});
+    auto arg_c =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(condition), get_ov_shape(condition));
+    auto arg_a = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(a), get_ov_shape(a));
+    auto arg_b = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(b), get_ov_shape(b));
+    auto op = std::make_shared<ov::opset1::Select>(arg_c, arg_a, arg_b);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{op},
+                                             ov::ParameterVector{arg_c, arg_a, arg_b});
+    return execute_op(key, model, {condition, a, b});
+}
+
+torch::Tensor npu_triu(torch::Tensor a, int64_t diagonal) {
+    // Triangular mask is shape-static CPU metadata; the multiply runs on NPU.
+    auto mask = torch::triu(torch::ones(a.sizes(), a.options()), diagonal);
+    return npu_mul(a, mask);
+}
+
+// ---------------------------------------------------------------------------
+// Elementwise backward kernels (Level Zero graphs / NPU compositions)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Elementwise multiply by a host scalar through the NPU multiply kernel.
+torch::Tensor mul_scalar_local(const torch::Tensor& t, double value) {
+    auto scalar = torch::full({}, value, t.options());
+    return npu_mul(t, scalar);
+}
+
+}  // namespace
+
+torch::Tensor npu_sin_backward(torch::Tensor grad_output, torch::Tensor input) {
+    return npu_mul(grad_output, npu_cos(input));
+}
+
+torch::Tensor npu_cos_backward(torch::Tensor grad_output, torch::Tensor input) {
+    return npu_mul(grad_output, npu_neg(npu_sin(input)));
+}
+
+torch::Tensor npu_exp_backward(torch::Tensor grad_output, torch::Tensor input) {
+    return npu_mul(grad_output, npu_exp(input));
+}
+
+torch::Tensor npu_sqrt_backward(torch::Tensor grad_output, torch::Tensor input) {
+    // d/dx sqrt(x) = 0.5 / sqrt(x)
+    return mul_scalar_local(npu_mul(grad_output, npu_rsqrt(input)), 0.5);
+}
+
+torch::Tensor npu_abs_backward(torch::Tensor grad_output, torch::Tensor input) {
+    return npu_mul(grad_output, npu_sign(input));
+}
+
+torch::Tensor npu_rsqrt_backward(torch::Tensor grad_output, torch::Tensor input) {
+    // d/dx x^(-0.5) = -0.5 * x^(-1.5)
+    auto exp = torch::full({}, -1.5, input.options());
+    return mul_scalar_local(npu_mul(grad_output, npu_pow(input, exp)), -0.5);
+}
+
+torch::Tensor npu_pow_backward(torch::Tensor grad_output, torch::Tensor a, torch::Tensor exponent) {
+    // grad_a = go * b * a^(b-1). Exponent gradients route to the CPU fallback.
+    auto one = torch::ones({}, a.options());
+    auto dec = npu_sub(exponent, one);
+    return npu_mul(grad_output, npu_mul(exponent, npu_pow(a, dec)));
+}
+
+torch::Tensor npu_clamp_backward(torch::Tensor grad_output, torch::Tensor input, double min_val,
+                                 double max_val) {
+    std::string key = get_key("clamp_backward", {grad_output, input},
+                              std::to_string(min_val) + "_" + std::to_string(max_val));
+    auto arg_g =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output), get_ov_shape(grad_output));
+    auto arg_x =
+        std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
+    auto elem_type = arg_x->get_element_type();
+    auto lo = ov::opset1::Constant::create(elem_type, ov::Shape{}, {(float)min_val});
+    auto hi = ov::opset1::Constant::create(elem_type, ov::Shape{}, {(float)max_val});
+    auto ge = std::make_shared<ov::opset1::GreaterEqual>(arg_x, lo);
+    auto le = std::make_shared<ov::opset1::LessEqual>(arg_x, hi);
+    auto both = std::make_shared<ov::opset1::LogicalAnd>(ge, le);
+    auto mask = std::make_shared<ov::opset1::Convert>(both, elem_type);
+    auto grad = std::make_shared<ov::opset1::Multiply>(arg_g, mask);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
+                                             ov::ParameterVector{arg_g, arg_x});
+    return execute_op(key, model, {grad_output, input});
+}
+
+std::vector<torch::Tensor> npu_where_backward(torch::Tensor grad_output, torch::Tensor condition) {
+    // grad_a = go * mask; grad_b = go * (1 - mask). Two graphs, one helper.
+    std::string key = get_key("where_backward", {grad_output, condition});
+    auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output),
+                                                         get_ov_shape(grad_output));
+    auto arg_c = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(condition),
+                                                         get_ov_shape(condition));
+    auto elem_type = arg_g->get_element_type();
+    auto mask = std::make_shared<ov::opset1::Convert>(arg_c, elem_type);
+    auto one = ov::opset1::Constant::create(elem_type, ov::Shape{}, {1.0f});
+    torch::Tensor grad_a, grad_b;
+    {
+        auto grad = std::make_shared<ov::opset1::Multiply>(arg_g, mask);
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
+                                                 ov::ParameterVector{arg_g, arg_c});
+        grad_a = execute_op(key + "_a", model, {grad_output, condition});
+    }
+    {
+        auto grad = std::make_shared<ov::opset1::Multiply>(
+            arg_g, std::make_shared<ov::opset1::Subtract>(one, mask));
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
+                                                 ov::ParameterVector{arg_g, arg_c});
+        grad_b = execute_op(key + "_b", model, {grad_output, condition});
+    }
+    return {grad_a, grad_b};
+}
+
+torch::Tensor npu_triu_backward(torch::Tensor grad_output, int64_t diagonal) {
+    // Gradient flows only through the kept triangle: triu is its own mask.
+    return npu_triu(grad_output, diagonal);
+}
+
+torch::Tensor npu_max_pool2d_backward(torch::Tensor grad_output, torch::Tensor input,
+                                      std::vector<int64_t> kernel_size, std::vector<int64_t> stride,
+                                      std::vector<int64_t> padding) {
+    // Tiled pools only (stride == kernel, no padding): gradient routes through
+    // the argmax mask, recomputed as Equal(input, upsample(MaxPool(input)))
+    // with numpy-broadcast nearest upsampling. Overlapping/padded/dilated
+    // pools need scatter-add; those route to the CPU fallback in Python.
+    // NOTE on ties: inputs exactly equal to the window maximum each receive
+    // the full gradient (torch routes to the first max only). Exact ties are
+    // measure-zero in real activations; random-data parity tests cover this.
+    TORCH_CHECK(stride == kernel_size, "npu_max_pool2d_backward supports tiled pools only");
+    TORCH_CHECK(padding == std::vector<int64_t>({0, 0}),
+                "npu_max_pool2d_backward supports unpadded pools only");
+    int64_t N = input.size(0), C = input.size(1), H = input.size(2), W = input.size(3);
+    int64_t Ho = grad_output.size(2), Wo = grad_output.size(3);
+    int64_t sh = stride[0], sw = stride[1];
+    int64_t kh = kernel_size[0], kw = kernel_size[1];
+    TORCH_CHECK(H == Ho * sh && W == Wo * sw, "npu_max_pool2d_backward requires exact tiling");
+    std::string key = get_key("max_pool2d_backward", {grad_output, input});
+    ov::element::Type ov_type = torch_dtype_to_ov(input);
+    auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+    auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+    auto pool = std::make_shared<ov::opset1::MaxPool>(
+        arg_x, ov::Strides{(size_t)sh, (size_t)sw}, ov::Shape{0, 0}, ov::Shape{0, 0},
+        ov::Shape{(size_t)kh, (size_t)kw}, ov::op::RoundingType::FLOOR, ov::op::PadType::EXPLICIT);
+    // Nearest upsample (Ho,Wo)->(H,W): reshape, numpy-broadcast the unit dims, reshape.
+    auto axes_full = i64_const({0, 1, 2, 3, 4, 5});
+    auto upsample = [&](const ov::Output<ov::Node>& t) {
+        auto r1 = std::make_shared<ov::opset1::Reshape>(t, i64_const({N, C, Ho, 1, Wo, 1}), false);
+        auto b = std::make_shared<ov::opset1::Broadcast>(r1, i64_const({N, C, Ho, sh, Wo, sw}),
+                                                         axes_full);
+        return std::make_shared<ov::opset1::Reshape>(b, i64_const({N, C, H, W}), false);
+    };
+    auto mask = std::make_shared<ov::opset1::Equal>(arg_x, upsample(pool));
+    auto grad = std::make_shared<ov::opset1::Multiply>(
+        upsample(arg_go), std::make_shared<ov::opset1::Convert>(mask, ov_type));
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
+                                             ov::ParameterVector{arg_go, arg_x});
+    return execute_op(key, model, {grad_output, input});
 }
 
 // ---------------------------------------------------------------------------

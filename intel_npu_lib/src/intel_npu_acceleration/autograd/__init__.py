@@ -4,13 +4,17 @@ import torch.fx
 from intel_npu_acceleration import _functional as F_npu
 
 from .functions import (
+    NPUAbs,
     NPUAdd,
     NPUBCEWithLogitsLoss,
     NPUCat,
+    NPUClamp,
     NPUConv2d,
+    NPUCos,
     NPUCrossEntropyLoss,
     NPUDiv,
     NPUEmbedding,
+    NPUExp,
     NPUGeLU,
     NPUHardSigmoid,
     NPUHardSwish,
@@ -18,20 +22,69 @@ from .functions import (
     NPULayerNorm,
     NPULinear,
     NPUMatMul,
+    NPUMaxPool2d,
     NPUMean,
     NPUMSELoss,
     NPUMul,
     NPUNeg,
+    NPUPow,
     NPUReLU,
     NPUReshape,
     NPURMSNorm,
+    NPURsqrt,
     NPUScaledDotProductAttention,
     NPUSiLU,
+    NPUSin,
     NPUSoftmax,
+    NPUSqrt,
     NPUStack,
     NPUSub,
     NPUTranspose,
+    NPUTriu,
+    NPUWhere,
 )
+
+__all__ = [
+    "matmul",
+    "add",
+    "sub",
+    "mul",
+    "relu",
+    "gelu",
+    "silu",
+    "sin",
+    "cos",
+    "exp",
+    "sqrt",
+    "abs",
+    "rsqrt",
+    "pow",
+    "clamp",
+    "where",
+    "triu",
+    "flatten",
+    "rmsnorm",
+    "softmax",
+    "max_pool2d",
+    "linear",
+    "conv2d",
+    "layer_norm",
+    "hardsigmoid",
+    "hardswish",
+    "neg",
+    "div",
+    "transpose",
+    "reshape",
+    "cat",
+    "stack",
+    "mean",
+    "embedding",
+    "mse_loss",
+    "cross_entropy_loss",
+    "l1_loss",
+    "bce_with_logits_loss",
+    "scaled_dot_product_attention",
+]
 
 
 def _should_use_autograd(*args) -> bool:
@@ -77,6 +130,72 @@ def gelu(a):
 
 def silu(a):
     return NPUSiLU.apply(a) if _should_use_autograd(a) else F_npu.silu(a)
+
+
+def sin(a):
+    return NPUSin.apply(a) if _should_use_autograd(a) else F_npu.sin(a)
+
+
+def cos(a):
+    return NPUCos.apply(a) if _should_use_autograd(a) else F_npu.cos(a)
+
+
+def exp(a):
+    return NPUExp.apply(a) if _should_use_autograd(a) else F_npu.exp(a)
+
+
+def sqrt(a):
+    return NPUSqrt.apply(a) if _should_use_autograd(a) else F_npu.sqrt(a)
+
+
+def abs(a):
+    return NPUAbs.apply(a) if _should_use_autograd(a) else F_npu.abs(a)
+
+
+def rsqrt(a):
+    return NPURsqrt.apply(a) if _should_use_autograd(a) else F_npu.rsqrt(a)
+
+
+def pow(a, exponent):
+    return NPUPow.apply(a, exponent) if _should_use_autograd(a, exponent) else F_npu.pow(a, exponent)
+
+
+def clamp(a, min=None, max=None):
+    if min is None and max is None:
+        raise ValueError("clamp: at least one of 'min' or 'max' must not be None")
+    return NPUClamp.apply(a, min, max) if _should_use_autograd(a) else F_npu.clamp(a, min, max)
+
+
+def where(condition, a, b):
+    return (
+        NPUWhere.apply(condition, a, b)
+        if _should_use_autograd(condition, a, b)
+        else F_npu.where(condition, a, b)
+    )
+
+
+def triu(input, diagonal=0):
+    return NPUTriu.apply(input, diagonal) if _should_use_autograd(input) else F_npu.triu(input, diagonal)
+
+
+def flatten(input, start_dim=0, end_dim=-1):
+    shape = list(input.shape)
+    rank = len(shape)
+    s = start_dim + rank if start_dim < 0 else start_dim
+    e = end_dim + rank if end_dim < 0 else end_dim
+    flat = 1
+    for d in shape[s : e + 1]:
+        flat *= d
+    new_shape = shape[:s] + [flat] + shape[e + 1 :]
+    if _should_use_autograd(input):
+        return NPUReshape.apply(input, new_shape)
+    return F_npu.reshape(input, new_shape)
+
+
+def max_pool2d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+    if _should_use_autograd(input):
+        return NPUMaxPool2d.apply(input, kernel_size, stride, padding, dilation, ceil_mode)
+    return F_npu.max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -174,31 +293,47 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
 
 
 # Wrap public functions to prevent FX tracing into requires_grad checks
-torch.fx.wrap(matmul)
-torch.fx.wrap(add)
-torch.fx.wrap(sub)
-torch.fx.wrap(mul)
-torch.fx.wrap(relu)
-torch.fx.wrap(gelu)
-torch.fx.wrap(silu)
-torch.fx.wrap(rmsnorm)
-torch.fx.wrap(softmax)
-torch.fx.wrap(linear)
-torch.fx.wrap(conv2d)
-torch.fx.wrap(layer_norm)
-torch.fx.wrap(hardsigmoid)
-torch.fx.wrap(hardswish)
-torch.fx.wrap(neg)
-torch.fx.wrap(div)
-torch.fx.wrap(transpose)
-torch.fx.wrap(reshape)
-torch.fx.wrap(cat)
-torch.fx.wrap(stack)
-torch.fx.wrap(mean)
-torch.fx.wrap(embedding)
-torch.fx.wrap(mse_loss)
-torch.fx.wrap(cross_entropy_loss)
-torch.fx.wrap(l1_loss)
-torch.fx.wrap(bce_with_logits_loss)
-torch.fx.wrap(scaled_dot_product_attention)
+for _fn in (
+    matmul,
+    add,
+    sub,
+    mul,
+    relu,
+    gelu,
+    silu,
+    sin,
+    cos,
+    exp,
+    sqrt,
+    abs,
+    rsqrt,
+    pow,
+    clamp,
+    where,
+    triu,
+    flatten,
+    rmsnorm,
+    softmax,
+    max_pool2d,
+    linear,
+    conv2d,
+    layer_norm,
+    hardsigmoid,
+    hardswish,
+    neg,
+    div,
+    transpose,
+    reshape,
+    cat,
+    stack,
+    mean,
+    embedding,
+    mse_loss,
+    cross_entropy_loss,
+    l1_loss,
+    bce_with_logits_loss,
+    scaled_dot_product_attention,
+):
+    torch.fx.wrap(_fn)
+del _fn
 

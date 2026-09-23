@@ -25,6 +25,7 @@ import torch
 import torch.fx
 
 import intel_npu_acceleration as npu_lib
+from intel_npu_acceleration._functional.utils import unpack_int4_packed
 from intel_npu_acceleration.config import config as npu_config
 from intel_npu_acceleration.exceptions import NPUCompilationError
 
@@ -173,11 +174,7 @@ def _dequantized_linears(traced: torch.fx.GraphModule) -> Iterator[dict]:
                     quantized_weights[submod] = weight.data
                     scale = getattr(submod, "weight_scale", 1.0)
                     zp = getattr(submod, "weight_zero_point", 0.0)
-                    w_u8 = weight.data
-                    c_out = w_u8.shape[0]
-                    w_odd = torch.floor_divide(w_u8, 16)
-                    w_even = w_u8 - w_odd * 16
-                    w_unpacked = torch.stack([w_even, w_odd], dim=-1).view(c_out, -1).float()
+                    w_unpacked = unpack_int4_packed(weight.data)
                     zp_val = zp.float() if isinstance(zp, torch.Tensor) else float(zp)
                     submod.weight.data = (w_unpacked - zp_val) * scale
         yield quantized_weights
@@ -202,6 +199,61 @@ def _collect_stateful_modules(model: torch.nn.Module, traced: torch.fx.GraphModu
             if isinstance(submod, NPUStatefulKVCache):
                 stateful_modules.append(submod)
     return stateful_modules
+
+
+def _detect_precision(model: torch.nn.Module, example_input: Any) -> str:
+    """Return "fp16" if model parameters or example inputs use half precision, else "auto"."""
+    candidates: list[Any] = (
+        list(example_input) if isinstance(example_input, (tuple, list)) else [example_input]
+    )
+    if any(
+        isinstance(x, torch.Tensor) and x.dtype in (torch.float16, torch.bfloat16)
+        for x in candidates
+    ):
+        return "fp16"
+    if hasattr(model, "parameters"):
+        try:
+            for p in model.parameters():
+                if p.dtype in (torch.float16, torch.bfloat16):
+                    return "fp16"
+        except Exception:
+            pass
+    return "auto"
+
+
+def _trace_and_convert_to_ov(
+    model: torch.nn.Module,
+    example_input: Any,
+    stateful: bool = False,
+    precision: str = "auto",
+    traced: torch.fx.GraphModule | None = None,
+    example_input_tuple: tuple | None = None,
+) -> tuple[Any, torch.fx.GraphModule, tuple, list]:
+    """Shared trace → OpenVINO IR pipeline for compile and IR export.
+
+    Traces the model (unless ``traced`` is given), converts via the OpenVINO
+    frontend, folds scalar inputs, freezes static shapes, binds stateful
+    KV-cache nodes, and runs graph optimizations. Returns ``(ov_model,
+    traced, input_tuple, placeholder_names)``.
+    """
+    if example_input_tuple is None:
+        example_input_tuple = _to_example_tuple(example_input)
+    if traced is None:
+        traced = _trace_model(model)
+    converted_inputs = _to_converted_inputs(example_input_tuple)
+    all_placeholder_names = [n.name for n in traced.graph.nodes if n.op == "placeholder"]
+    with _dequantized_linears(traced):
+        ov_model = _convert_to_ov_model(model, converted_inputs)
+        ov_model = fold_scalar_parameter_inputs(
+            ov_model, example_input_tuple, all_placeholder_names
+        )
+        reshape_model_inputs_to_static(
+            ov_model, example_input_tuple, all_placeholder_names
+        )
+    stateful_modules = _collect_stateful_modules(model, traced)
+    ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
+    ov_model = optimize_ov_model(ov_model, precision=precision)
+    return ov_model, traced, example_input_tuple, all_placeholder_names
 
 
 def _convert_to_ov_model(model: torch.nn.Module, converted_inputs: tuple) -> Any:
@@ -485,22 +537,7 @@ def compile_to_npu(
 
     # Automatic dtype inspection from standard PyTorch model and tensors
     if precision == "auto":
-        is_fp16 = False
-        if isinstance(example_input, torch.Tensor) and example_input.dtype in [torch.float16, torch.bfloat16]:
-            is_fp16 = True
-        elif isinstance(example_input, (tuple, list)):
-            if any(isinstance(x, torch.Tensor) and x.dtype in [torch.float16, torch.bfloat16] for x in example_input):
-                is_fp16 = True
-        if not is_fp16 and hasattr(model, "parameters"):
-            try:
-                for p in model.parameters():
-                    if p.dtype in [torch.float16, torch.bfloat16]:
-                        is_fp16 = True
-                        break
-            except Exception:
-                pass
-        if is_fp16:
-            precision = "fp16"
+        precision = _detect_precision(model, example_input)
 
     # Compiler Performance Intelligence Logging
     if performance_hint == "LATENCY" and num_streams == 1:
@@ -561,9 +598,6 @@ def compile_to_npu(
                 preprocess_config=preprocess_config,
             )
 
-        # Convert non-Tensor scalars to Tensors so that torch.jit.trace works natively
-        example_input_tuple_converted = _to_converted_inputs(example_input_tuple)
-
         # 1. Generate Cache Key (include perf and precision to avoid false hits)
         graph_str = str(traced.graph)
         input_meta = []
@@ -596,26 +630,18 @@ def compile_to_npu(
                     all_placeholder_names=all_placeholder_names,
                 )
 
-        # 2. Capture Values & Natively Convert Model using OpenVINO PyTorch Frontend
-        with _dequantized_linears(traced):
-            ov_model = _convert_to_ov_model(model, example_input_tuple_converted)
-            ov_model = fold_scalar_parameter_inputs(
-                ov_model, example_input_tuple, all_placeholder_names
-            )
-            reshape_model_inputs_to_static(
-                ov_model, example_input_tuple, all_placeholder_names
-            )
+        # 2. Trace, convert, and optimize via the shared pipeline
+        # (trace inputs are reused: no retracing, Dynamo sanitization preserved)
+        ov_model, _, _, _ = _trace_and_convert_to_ov(
+            model,
+            example_input_tuple,
+            stateful=stateful,
+            precision=precision,
+            traced=traced,
+            example_input_tuple=example_input_tuple,
+        )
 
-        # Find all NPUStatefulKVCache submodules in chronological/topological order
-        stateful_modules = _collect_stateful_modules(model, traced)
-
-        # 3. Post-process Stateful KV Cache nodes if requested
-        ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
-
-        # 4. OpenVINO Built-in Model Graph Optimizations (Constant Folding + Validation + Precision Conversion)
-        ov_model = optimize_ov_model(ov_model, precision=precision)
-
-        # 5. Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
+        # 3. Apply PrePostProcessor (PPP) to offload layout/type transpositions and normalizations to NPU
         if preprocess_config:
             try:
                 ov_model = apply_pre_post_processing(ov_model, preprocess_config)
@@ -641,7 +667,7 @@ def compile_to_npu(
             core, ov_model, target_device, performance_hint, num_streams, precision, config
         )
 
-        # 5. Cache Management (thread-safe)
+        # 4. Cache Management (thread-safe)
         input_names = [p.any_name for p in ov_model.inputs]
         with _GRAPH_CACHE_LOCK:
             if len(_GRAPH_CACHE) >= _MAX_GRAPH_CACHE_SIZE:
@@ -710,29 +736,9 @@ def export_openvino_ir(
         >>> model = torch.nn.Linear(10, 2)
         >>> xml_path = npu.export_openvino_ir(model, torch.randn(1, 10), "model.xml")
     """
-    example_input_tuple = _to_example_tuple(example_input)
-    converted_inputs = _to_converted_inputs(example_input_tuple)
-
-    traced = _trace_model(model)
-
-    all_placeholder_names = [
-        node.name for node in traced.graph.nodes if node.op == "placeholder"
-    ]
-
-    # Temporarily dequantize int8/uint8 Linear weights for correct IR export
-    with _dequantized_linears(traced):
-        ov_model = _convert_to_ov_model(model, tuple(converted_inputs))
-        ov_model = fold_scalar_parameter_inputs(
-            ov_model, example_input_tuple, all_placeholder_names
-        )
-        reshape_model_inputs_to_static(
-            ov_model, example_input_tuple, all_placeholder_names
-        )
-
-    stateful_modules = _collect_stateful_modules(model, traced)
-
-    ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
-    ov_model = optimize_ov_model(ov_model)
+    ov_model, _, example_input_tuple, _ = _trace_and_convert_to_ov(
+        model, example_input, stateful=stateful, precision="auto"
+    )
 
     if preprocess_config:
         ov_model = apply_pre_post_processing(ov_model, preprocess_config)

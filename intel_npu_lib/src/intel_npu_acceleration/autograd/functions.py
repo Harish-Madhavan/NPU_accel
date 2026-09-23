@@ -36,6 +36,58 @@ class NPUMatMul(torch.autograd.Function):
         return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
 
 
+def _make_unary_function(name: str, forward_fn, backward_fn) -> type:
+    """Build a single-input/single-output autograd Function class.
+
+    NPUReLU / NPUGeLU / NPUSiLU share identical forward/backward structure
+    and differ only in the dispatched ``F_npu`` kernels; generating them
+    keeps the three definitions from drifting apart.
+    """
+
+    class NPUUnary(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, a):
+            ctx.save_for_backward(a)
+            return forward_fn(a)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (a,) = ctx.saved_tensors
+            return backward_fn(grad_output, a)
+
+    NPUUnary.__name__ = name
+    NPUUnary.__qualname__ = name
+    return NPUUnary
+
+
+NPUReLU = _make_unary_function("NPUReLU", F_npu.relu, F_npu.relu_backward)
+"""NPU-accelerated ReLU with Autograd support."""
+
+NPUGeLU = _make_unary_function("NPUGeLU", F_npu.gelu, F_npu.gelu_backward)
+"""NPU-accelerated GeLU with Autograd support."""
+
+NPUSiLU = _make_unary_function("NPUSiLU", F_npu.silu, F_npu.silu_backward)
+"""NPU-accelerated SiLU (Swish) with Autograd support."""
+
+NPUSin = _make_unary_function("NPUSin", F_npu.sin, F_npu.sin_backward)
+"""NPU-accelerated Sine with Autograd support."""
+
+NPUCos = _make_unary_function("NPUCos", F_npu.cos, F_npu.cos_backward)
+"""NPU-accelerated Cosine with Autograd support."""
+
+NPUExp = _make_unary_function("NPUExp", F_npu.exp, F_npu.exp_backward)
+"""NPU-accelerated Exponential with Autograd support."""
+
+NPUSqrt = _make_unary_function("NPUSqrt", F_npu.sqrt, F_npu.sqrt_backward)
+"""NPU-accelerated Square Root with Autograd support."""
+
+NPUAbs = _make_unary_function("NPUAbs", F_npu.abs, F_npu.abs_backward)
+"""NPU-accelerated Absolute Value with Autograd support."""
+
+NPURsqrt = _make_unary_function("NPURsqrt", F_npu.rsqrt, F_npu.rsqrt_backward)
+"""NPU-accelerated Reciprocal Square Root with Autograd support."""
+
+
 class NPUAdd(torch.autograd.Function):
     """NPU-accelerated Addition with Autograd support."""
 
@@ -78,20 +130,6 @@ class NPUMul(torch.autograd.Function):
         grad_a = grad_output * b
         grad_b = grad_output * a
         return _unbroadcast(grad_a, a.shape), _unbroadcast(grad_b, b.shape)
-
-
-class NPUReLU(torch.autograd.Function):
-    """NPU-accelerated ReLU with Autograd support."""
-
-    @staticmethod
-    def forward(ctx, a):
-        ctx.save_for_backward(a)
-        return F_npu.relu(a)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (a,) = ctx.saved_tensors
-        return F_npu.relu_backward(grad_output, a)
 
 
 class NPUSoftmax(torch.autograd.Function):
@@ -137,34 +175,6 @@ class NPULinear(torch.autograd.Function):
         )
 
 
-class NPUGeLU(torch.autograd.Function):
-    """NPU-accelerated GeLU with Autograd support."""
-
-    @staticmethod
-    def forward(ctx, a):
-        ctx.save_for_backward(a)
-        return F_npu.gelu(a)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (a,) = ctx.saved_tensors
-        return F_npu.gelu_backward(grad_output, a)
-
-
-class NPUSiLU(torch.autograd.Function):
-    """NPU-accelerated SiLU (Swish) with Autograd support."""
-
-    @staticmethod
-    def forward(ctx, a):
-        ctx.save_for_backward(a)
-        return F_npu.silu(a)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (a,) = ctx.saved_tensors
-        return F_npu.silu_backward(grad_output, a)
-
-
 class NPURMSNorm(torch.autograd.Function):
     """NPU-accelerated RMSNorm with Autograd support."""
 
@@ -197,36 +207,18 @@ class NPUConv2d(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         input, weight, bias = ctx.saved_tensors
-        stride = ctx.stride
-        padding = ctx.padding
-        dilation = ctx.dilation
-        groups = ctx.groups
-
-        grad_input = grad_weight = grad_bias = None
-
-        if ctx.needs_input_grad[0]:
-            grad_input = torch.nn.grad.conv2d_input(
-                input.shape,
-                weight,
-                grad_output,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-            )
-        if ctx.needs_input_grad[1]:
-            grad_weight = torch.nn.grad.conv2d_weight(
-                input,
-                weight.shape,
-                grad_output,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-            )
-        if bias is not None and ctx.needs_input_grad[2]:
-            grad_bias = grad_output.sum(dim=(0, 2, 3))
-
+        grad_input, grad_weight, grad_bias = F_npu.conv2d_backward(
+            grad_output,
+            input,
+            weight,
+            stride=ctx.stride,
+            padding=ctx.padding,
+            dilation=ctx.dilation,
+            groups=ctx.groups,
+            needs_input_grad=ctx.needs_input_grad[0],
+            needs_weight_grad=ctx.needs_input_grad[1],
+            needs_bias_grad=bias is not None and ctx.needs_input_grad[2],
+        )
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
@@ -328,6 +320,108 @@ class NPUNeg(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return -grad_output
+
+
+class NPUClamp(torch.autograd.Function):
+    """NPU-accelerated Clamp with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a, min_val, max_val):
+        ctx.save_for_backward(a)
+        ctx.min_val = min_val
+        ctx.max_val = max_val
+        return F_npu.clamp(a, min_val, max_val)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (a,) = ctx.saved_tensors
+        lo = float("-inf") if ctx.min_val is None else float(ctx.min_val)
+        hi = float("inf") if ctx.max_val is None else float(ctx.max_val)
+        return F_npu.clamp_backward(grad_output, a, lo, hi), None, None
+
+
+class NPUPow(torch.autograd.Function):
+    """NPU-accelerated Power with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a, exponent):
+        ctx.exponent_is_tensor = isinstance(exponent, torch.Tensor)
+        if ctx.exponent_is_tensor:
+            ctx.save_for_backward(a, exponent)
+        else:
+            ctx.save_for_backward(a)
+            ctx.exponent = exponent
+        return F_npu.pow(a, exponent)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        saved = ctx.saved_tensors
+        a = saved[0]
+        if ctx.exponent_is_tensor:
+            exponent = saved[1]
+            needs_b = ctx.needs_input_grad[1]
+        else:
+            exponent = torch.full((), ctx.exponent, dtype=a.dtype, device=a.device)
+            needs_b = False
+        grad_a, grad_b = F_npu.pow_backward(
+            grad_output,
+            a,
+            exponent,
+            needs_a_grad=ctx.needs_input_grad[0],
+            needs_exponent_grad=needs_b,
+        )
+        return grad_a, grad_b
+
+
+class NPUWhere(torch.autograd.Function):
+    """NPU-accelerated Where/Select with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, condition, a, b):
+        ctx.save_for_backward(condition)
+        return F_npu.where(condition, a, b)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (condition,) = ctx.saved_tensors
+        grad_a, grad_b = F_npu.where_backward(grad_output, condition)
+        return None, grad_a, grad_b
+
+
+class NPUTriu(torch.autograd.Function):
+    """NPU-accelerated Upper-Triangular with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, a, diagonal=0):
+        ctx.diagonal = diagonal
+        return F_npu.triu(a, diagonal)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return F_npu.triu_backward(grad_output, ctx.diagonal), None
+
+
+class NPUMaxPool2d(torch.autograd.Function):
+    """NPU-accelerated MaxPool2d with Autograd support."""
+
+    @staticmethod
+    def forward(ctx, input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+        ctx.save_for_backward(input)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.ceil_mode = ceil_mode
+        return F_npu.max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (input,) = ctx.saved_tensors
+        grad_input = F_npu.max_pool2d_backward(
+            grad_output, input, ctx.kernel_size, ctx.stride, ctx.padding,
+            ctx.dilation, ctx.ceil_mode,
+        )
+        return grad_input, None, None, None, None, None
 
 
 class NPUDiv(torch.autograd.Function):
@@ -479,14 +573,13 @@ class NPUEmbedding(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
         num_embeddings = weight.shape[0]
-        padding_idx = ctx.padding_idx if ctx.padding_idx is not None else -1
-        grad_weight = torch.ops.aten.embedding_backward(
+        grad_weight = F_npu.embedding_backward(
             grad_output,
             input,
             num_embeddings,
-            padding_idx,
-            ctx.scale_grad_by_freq,
-            ctx.sparse,
+            padding_idx=ctx.padding_idx,
+            scale_grad_by_freq=ctx.scale_grad_by_freq,
+            sparse=ctx.sparse,
         )
         return None, grad_weight, None, None, None, None, None
 
@@ -525,28 +618,16 @@ class NPUScaledDotProductAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         query, key, value, attn_mask, out = ctx.saved_tensors
-
-        with torch.enable_grad():
-            q = query.detach().requires_grad_(True)
-            k = key.detach().requires_grad_(True)
-            v = value.detach().requires_grad_(True)
-
-            out_cpu = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=ctx.dropout_p,
-                is_causal=ctx.is_causal,
-                scale=ctx.scale,
-            )
-
-            out_cpu.backward(grad_output)
-
-            grad_query = q.grad
-            grad_key = k.grad
-            grad_value = v.grad
-
+        grad_query, grad_key, grad_value = F_npu.scaled_dot_product_attention_backward(
+            grad_output,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=ctx.dropout_p,
+            is_causal=ctx.is_causal,
+            scale=ctx.scale if ctx.scale is not None else 0.0,
+        )
         return grad_query, grad_key, grad_value, None, None, None, None
 
 
@@ -562,9 +643,7 @@ class NPUMSELoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         pred, target = ctx.saved_tensors
-        red = ctx.reduction
-        scale = 2.0 / pred.numel() if red == "mean" else (2.0 if red == "sum" else 2.0)
-        grad_pred = grad_output * scale * (pred - target)
+        grad_pred = F_npu.mse_loss_backward(grad_output, pred, target, reduction=ctx.reduction)
         grad_target = -grad_pred
         return grad_pred, grad_target, None
 

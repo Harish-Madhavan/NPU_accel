@@ -1,7 +1,7 @@
 import math
-import unittest
 from dataclasses import dataclass
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -183,7 +183,7 @@ class Llama(nn.Module):
         return output, new_kv_cache
 
 
-class TestLlamaModel(unittest.TestCase):
+class TestLlamaModel:
     def test_llama_caching(self):
         conf = LlamaConfig()
         model = Llama(conf)
@@ -208,14 +208,10 @@ class TestLlamaModel(unittest.TestCase):
             try:
                 npu_model = compile_to_npu(model, (x, start_pos, kv_cache))
             except Exception as e:
-                self.fail(f"Compilation failed: {e}")
+                pytest.fail(f"Compilation failed: {e}")
 
         out_npu, cache_npu = npu_model(x, start_pos, kv_cache)
         out_cpu, cache_cpu = model(x, start_pos, kv_cache)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-        self.assertTrue(torch.allclose(cache_npu, cache_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(cache_npu, cache_cpu, atol=1e-2, rtol=1e-2)

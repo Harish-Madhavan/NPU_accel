@@ -1,16 +1,9 @@
-import unittest
-
 import torch
 
 import intel_npu_acceleration as npu
 
 
-class TestAutogradSLM(unittest.TestCase):
-    def setUp(self):
-        # Clean the compiler graph cache before each test
-        import intel_npu_acceleration.frontend as frontend
-        frontend._GRAPH_CACHE.clear()
-
+class TestAutogradSLM:
     def test_embedding_autograd(self):
         # Setup inputs
         vocab_size = 20
@@ -30,14 +23,14 @@ class TestAutogradSLM(unittest.TestCase):
         # NPU Autograd
         out_npu = npu.embedding(indices, w2)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
 
         # Backward
         grad_out = torch.randn_like(out_cpu)
         out_cpu.backward(grad_out)
         out_npu.backward(grad_out)
 
-        self.assertTrue(torch.allclose(w2.grad, w1.grad, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(w2.grad, w1.grad, atol=1e-2, rtol=1e-2)
 
     def test_sdpa_autograd_causal(self):
         # Setup SDPA inputs
@@ -63,17 +56,13 @@ class TestAutogradSLM(unittest.TestCase):
             q2, k2, v2, is_causal=True
         )
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
 
         # Backward
         grad_out = torch.randn_like(out_cpu)
         out_cpu.backward(grad_out)
         out_npu.backward(grad_out)
 
-        self.assertTrue(torch.allclose(q2.grad, q1.grad, atol=1e-2, rtol=1e-2))
-        self.assertTrue(torch.allclose(k2.grad, k1.grad, atol=1e-2, rtol=1e-2))
-        self.assertTrue(torch.allclose(v2.grad, v1.grad, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.allclose(q2.grad, q1.grad, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(k2.grad, k1.grad, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(v2.grad, v1.grad, atol=1e-2, rtol=1e-2)

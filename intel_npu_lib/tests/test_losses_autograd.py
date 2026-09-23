@@ -1,15 +1,10 @@
-import unittest
-
 import torch
 from torch.testing import assert_close
 
 import intel_npu_acceleration as npu
 
 
-class TestLossesAutograd(unittest.TestCase):
-    def setUp(self):
-        torch.manual_seed(42)
-
+class TestLossesAutograd:
     def test_l1_loss_forward_backward_mean(self):
         pred_cpu = torch.randn(4, 8, requires_grad=True)
         target = torch.randn(4, 8)
@@ -111,7 +106,3 @@ class TestLossesAutograd(unittest.TestCase):
         out_cpu.backward()
         out_npu.backward()
         assert_close(x_npu.grad, x_cpu.grad, atol=1e-4, rtol=1e-4)
-
-
-if __name__ == "__main__":
-    unittest.main()

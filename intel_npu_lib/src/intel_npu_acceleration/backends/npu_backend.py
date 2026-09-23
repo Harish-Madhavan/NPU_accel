@@ -48,7 +48,8 @@ Implements:
 - torch.npu.* (is_available, device_count, get_device_name, get_device_properties, empty_cache,
                synchronize, set_device, memory_allocated, manual_seed, Stream/Event, device/stream
                context managers, amp, capability)
-- torch.backends.npu.* (is_available, version, matmul flags, allow_tf32, sdp flags)
+- torch.npu.amp.* (autocast, GradScaler, custom_fwd, custom_bwd)
+- torch.backends.npu.* (is_available, is_built, version, matmul flags, allow_tf32, sdp flags)
 - torch.accelerator bridge (synchronize, empty_cache, streams, device indices, memory queries)
 - torch.Tensor.to("npu") & torch.Tensor.npu() & torch.Tensor.is_npu
 - nn.Module.to("npu") & nn.Module.npu() → torch.compile(backend="npu")
@@ -59,6 +60,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 import types
 from typing import Any
 
@@ -95,6 +97,66 @@ def _has_explicit_device(args: tuple, kwargs: dict) -> tuple[bool, Any]:
     if "device" in kwargs and kwargs["device"] is not None:
         return True, kwargs["device"]
     return False, None
+
+
+def _safe_device(spec: Any, fallback: str = "cpu") -> torch.device:
+    """Build ``torch.device(spec)``, falling back when the spec is unparseable."""
+    try:
+        return torch.device(spec)
+    except Exception:
+        return torch.device(fallback)
+
+
+def _package_version() -> str:
+    """Return the installed distribution version (never hardcode it)."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("intel_npu_acceleration")
+    except Exception:
+        return "0.2.0"
+
+
+def _fallback_to_zero_on_npu_error(orig_fn):
+    """Wrap a zero-arg accelerator query: NPU-related RuntimeErrors become 0."""
+
+    def _patched():
+        try:
+            return orig_fn()
+        except RuntimeError as e:
+            if "npu" in str(e).lower():
+                return 0
+            raise
+
+    return _patched
+
+
+def _make_acc_forwarder(npu_attr: str, default: Any):
+    """Forward a ``torch.accelerator`` query to ``torch.npu`` with a default.
+
+    ``default`` may be a value or a zero-arg factory (e.g. ``dict``) so each
+    call gets a fresh mutable object.
+    """
+
+    def _forward(device=None):
+        if hasattr(torch, "npu"):
+            return getattr(torch.npu, npu_attr)(device)
+        return default() if callable(default) else default
+
+    return _forward
+
+
+# torch.accelerator memory/capability queries mirrored from torch.npu,
+# with the CPU-fallback default used when torch.npu is absent.
+_ACC_FORWARDED_ATTRS: dict[str, Any] = {
+    "memory_allocated": 0,
+    "max_memory_allocated": 0,
+    "memory_reserved": 0,
+    "max_memory_reserved": 0,
+    "memory_stats": dict,
+    "reset_peak_memory_stats": None,
+    "get_device_capability": (1, 0),
+}
 
 # ---------------------------------------------------------------------------
 # Device Properties & Contexts
@@ -169,25 +231,11 @@ def _register_privateuse1_backend() -> bool:
 
                 _orig_cdi = getattr(_acc, "current_device_index", None)
                 if _orig_cdi:
-                    def _patched_cdi():
-                        try:
-                            return _orig_cdi()
-                        except RuntimeError as e:
-                            if "npu" in str(e).lower():
-                                return 0
-                            raise
-                    _acc.current_device_index = _patched_cdi  # type: ignore[attr-defined]
+                    _acc.current_device_index = _fallback_to_zero_on_npu_error(_orig_cdi)  # type: ignore[attr-defined]
 
                 _orig_cd_idx = getattr(_acc, "current_device_idx", None)
                 if _orig_cd_idx:
-                    def _patched_cd_idx():
-                        try:
-                            return _orig_cd_idx()
-                        except RuntimeError as e:
-                            if "npu" in str(e).lower():
-                                return 0
-                            raise
-                    _acc.current_device_idx = _patched_cd_idx  # type: ignore[attr-defined]
+                    _acc.current_device_idx = _fallback_to_zero_on_npu_error(_orig_cd_idx)  # type: ignore[attr-defined]
 
                 _orig_sdi = getattr(_acc, "set_device_index", None)
                 if _orig_sdi:
@@ -254,22 +302,11 @@ def _register_privateuse1_backend() -> bool:
                         return True
                     _acc.is_available = _patched_ia  # type: ignore[attr-defined]
 
-                if hasattr(_acc, "memory_allocated"):
-                    _acc.memory_allocated = lambda device=None: torch.npu.memory_allocated(device) if hasattr(torch, "npu") else 0
-                if hasattr(_acc, "max_memory_allocated"):
-                    _acc.max_memory_allocated = lambda device=None: torch.npu.max_memory_allocated(device) if hasattr(torch, "npu") else 0
-                if hasattr(_acc, "memory_reserved"):
-                    _acc.memory_reserved = lambda device=None: torch.npu.memory_reserved(device) if hasattr(torch, "npu") else 0
-                if hasattr(_acc, "max_memory_reserved"):
-                    _acc.max_memory_reserved = lambda device=None: torch.npu.max_memory_reserved(device) if hasattr(torch, "npu") else 0
-                if hasattr(_acc, "memory_stats"):
-                    _acc.memory_stats = lambda device=None: torch.npu.memory_stats(device) if hasattr(torch, "npu") else {}
-                if hasattr(_acc, "reset_peak_memory_stats"):
-                    _acc.reset_peak_memory_stats = lambda device=None: torch.npu.reset_peak_memory_stats(device) if hasattr(torch, "npu") else None
+                for _attr, _default in _ACC_FORWARDED_ATTRS.items():
+                    if hasattr(_acc, _attr):
+                        setattr(_acc, _attr, _make_acc_forwarder(_attr, _default))
                 if hasattr(_acc, "reset_accumulated_memory_stats"):
                     _acc.reset_accumulated_memory_stats = lambda device=None: None
-                if hasattr(_acc, "get_device_capability"):
-                    _acc.get_device_capability = lambda device=None: torch.npu.get_device_capability(device) if hasattr(torch, "npu") else (1, 0)
                 if hasattr(_acc, "set_stream"):
                     _acc.set_stream = lambda stream: torch.npu.set_stream(stream) if hasattr(torch, "npu") else None
 
@@ -379,16 +416,7 @@ def _setup_torch_npu_module() -> None:
         # Stream / Event — API parity, Level Zero command queue
         class Stream:
             def __init__(self, device=None, priority=0):
-                if device is not None:
-                    try:
-                        self.device = torch.device(device)
-                    except Exception:
-                        self.device = torch.device("cpu")
-                else:
-                    try:
-                        self.device = torch.device("npu:0")
-                    except Exception:
-                        self.device = torch.device("cpu")
+                self.device = _safe_device(device if device is not None else "npu:0")
                 self.priority = priority
 
             def __enter__(self):
@@ -423,11 +451,9 @@ def _setup_torch_npu_module() -> None:
         class Event:
             def __init__(self, enable_timing=False, blocking=False, interprocess=False):
                 self.enable_timing = enable_timing
-                import time
                 self._time = time.perf_counter()
 
             def record(self, stream=None):
-                import time
                 self._time = time.perf_counter()
 
             def wait(self, stream=None):
@@ -478,10 +504,23 @@ def _setup_torch_npu_module() -> None:
 
         # AMP support — reuse host amp, NPU supports fp16/bf16
         try:
-            npu_module.amp = types.SimpleNamespace(
-                autocast=lambda *a, **kw: torch.autocast(*a, device_type="npu", **kw),
-                GradScaler=torch.amp.GradScaler if hasattr(torch, "amp") else torch.cuda.amp.GradScaler,  # type: ignore[attr-defined]
-            )
+            import functools
+
+            amp_kwargs: dict[str, Any] = {
+                "autocast": lambda *a, **kw: torch.autocast(*a, device_type="npu", **kw),
+                "GradScaler": torch.amp.GradScaler if hasattr(torch, "amp") else torch.cuda.amp.GradScaler,  # type: ignore[attr-defined]
+            }
+            # torch.amp.custom_fwd/custom_bwd exist on torch>=2.4; binding
+            # device_type up front mirrors torch.cuda.amp.custom_fwd/bwd.
+            if hasattr(torch.amp, "custom_fwd"):
+                amp_kwargs["custom_fwd"] = functools.partial(  # type: ignore[attr-defined]
+                    torch.amp.custom_fwd, device_type="npu"
+                )
+            if hasattr(torch.amp, "custom_bwd"):
+                amp_kwargs["custom_bwd"] = functools.partial(  # type: ignore[attr-defined]
+                    torch.amp.custom_bwd, device_type="npu"
+                )
+            npu_module.amp = types.SimpleNamespace(**amp_kwargs)
         except Exception:
             pass
 
@@ -491,7 +530,8 @@ def _setup_torch_npu_module() -> None:
     if not hasattr(torch.backends, "npu"):
         backends_npu = types.ModuleType("torch.backends.npu")
         backends_npu.is_available = device_mod.is_available  # type: ignore[attr-defined]
-        backends_npu.version = lambda: "0.2.0"  # type: ignore[attr-defined]
+        backends_npu.is_built = lambda: True  # type: ignore[attr-defined]
+        backends_npu.version = _package_version  # type: ignore[attr-defined]
         backends_npu.matmul = types.SimpleNamespace(
             allow_tf32=False,
             allow_fp16_reduced_precision_reduction=True,
@@ -514,7 +554,7 @@ def _patch_tensor_factories() -> None:
     factories = [
         "empty", "zeros", "ones", "randn", "rand", "randint",
         "arange", "eye", "full", "empty_like", "zeros_like",
-        "ones_like", "randn_like", "as_tensor"
+        "ones_like", "randn_like", "as_tensor", "tensor",
     ]
     for name in factories:
         if hasattr(torch, name) and not hasattr(getattr(torch, name), "_npu_patched"):
@@ -538,26 +578,6 @@ def _patch_tensor_factories() -> None:
                 return wrapper
 
             setattr(torch, name, _make_wrapper(orig_fn))
-
-    if hasattr(torch, "tensor") and not hasattr(torch.tensor, "_npu_patched"):
-        orig_tensor = torch.tensor
-
-        def _tensor_wrapper(*args, **kwargs):
-            dev = kwargs.get("device", None)
-            is_npu = False
-            if dev is not None and _is_npu_device(dev):
-                is_npu = True
-                kwargs["device"] = torch.device("cpu")
-            res = orig_tensor(*args, **kwargs)
-            if is_npu and isinstance(res, torch.Tensor):
-                try:
-                    res._is_npu = True
-                except Exception:
-                    pass
-            return res
-
-        _tensor_wrapper._npu_patched = True  # type: ignore[attr-defined]
-        torch.tensor = _tensor_wrapper  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # torch.Tensor patches: .to("npu"), .npu(), .is_npu

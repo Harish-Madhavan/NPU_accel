@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 
@@ -25,12 +24,7 @@ class HybridUnsupportedMLP(nn.Module):
         return torch.erf(torch.relu(self.fc(x)))
 
 
-class TestDynamicBucketing(unittest.TestCase):
-    def setUp(self):
-        # Clear the compiler graph cache to prevent random weight collisions between tests
-        import intel_npu_acceleration.frontend as frontend
-        frontend._GRAPH_CACHE.clear()
-
+class TestDynamicBucketing:
     def test_sync_bucketing(self):
         model = SimpleMLP()
         model.eval()
@@ -52,8 +46,8 @@ class TestDynamicBucketing(unittest.TestCase):
             out_cpu = model(x)
             out_npu = npu_model(x)
 
-            self.assertEqual(out_npu.shape, out_cpu.shape)
-            self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
+            assert out_npu.shape == out_cpu.shape
+            assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
 
     def test_async_bucketing(self):
         model = SimpleMLP()
@@ -82,13 +76,13 @@ class TestDynamicBucketing(unittest.TestCase):
         # Wait and verify
         out_npu1 = npu_model.wait_async(h1)
         out_cpu1 = model(x1)
-        self.assertEqual(out_npu1.shape, out_cpu1.shape)
-        self.assertTrue(torch.allclose(out_npu1, out_cpu1, atol=1e-2, rtol=1e-2))
+        assert out_npu1.shape == out_cpu1.shape
+        assert torch.allclose(out_npu1, out_cpu1, atol=1e-2, rtol=1e-2)
 
         out_npu2 = npu_model.wait_async(h2)
         out_cpu2 = model(x2)
-        self.assertEqual(out_npu2.shape, out_cpu2.shape)
-        self.assertTrue(torch.allclose(out_npu2, out_cpu2, atol=1e-2, rtol=1e-2))
+        assert out_npu2.shape == out_cpu2.shape
+        assert torch.allclose(out_npu2, out_cpu2, atol=1e-2, rtol=1e-2)
 
     def test_zero_copy_option(self):
         model = SimpleMLP()
@@ -107,9 +101,10 @@ class TestDynamicBucketing(unittest.TestCase):
         out_cpu = model(x)
         out_npu = npu_model(x)
 
-        self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)
 
-    def test_hybrid_fallback_with_bucketing(self):
+    @pytest.mark.parametrize("seq_len", [7, 15])
+    def test_hybrid_fallback_with_bucketing(self, seq_len):
         model = HybridUnsupportedMLP()
         model.eval()
 
@@ -126,14 +121,9 @@ class TestDynamicBucketing(unittest.TestCase):
             dynamic_dim=1,
         )
 
-        for seq_len in [7, 15]:
-            x = torch.randn(1, seq_len, 32)
-            out_cpu = model(x)
-            out_npu = npu_model(x)
+        x = torch.randn(1, seq_len, 32)
+        out_cpu = model(x)
+        out_npu = npu_model(x)
 
-            self.assertEqual(out_npu.shape, out_cpu.shape)
-            self.assertTrue(torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert out_npu.shape == out_cpu.shape
+        assert torch.allclose(out_npu, out_cpu, atol=1e-2, rtol=1e-2)

@@ -1,5 +1,4 @@
-import unittest
-
+import pytest
 import torch
 import torch.nn as nn
 from torch.testing import assert_close
@@ -9,15 +8,11 @@ import intel_npu_acceleration.functional as F_npu
 from intel_npu_acceleration.optim import NPUSGD, NPUAdam
 
 
-class TestTrainingAndOptimizers(unittest.TestCase):
+class TestTrainingAndOptimizers:
     """
     Test suite for Level Zero accelerated training, backward autograd passes,
     loss functions, and hardware optimizers (NPUAdam, NPUSGD).
     """
-
-    def setUp(self):
-        npu.clear_graph_cache()
-        torch.manual_seed(42)
 
     def test_linear_autograd_backward_level_zero(self):
         """Verify NPULinear forward and backward against PyTorch native linear."""
@@ -60,25 +55,27 @@ class TestTrainingAndOptimizers(unittest.TestCase):
         assert_close(a_npu.grad, a_cpu.grad, atol=1e-2, rtol=1e-2)
         assert_close(b_npu.grad, b_cpu.grad, atol=1e-2, rtol=1e-2)
 
-    def test_activations_backward_level_zero(self):
-        """Verify backward pass for ReLU, GELU, and SiLU."""
-        acts = [
+    @pytest.mark.parametrize(
+        ("npu_fn", "torch_fn"),
+        [
             (npu.relu, torch.nn.functional.relu),
             (npu.gelu, torch.nn.functional.gelu),
             (npu.silu, torch.nn.functional.silu),
-        ]
-        for npu_fn, torch_fn in acts:
-            x_cpu = torch.randn(4, 16, requires_grad=True)
-            x_npu = x_cpu.detach().clone().requires_grad_(True)
+        ],
+    )
+    def test_activations_backward_level_zero(self, npu_fn, torch_fn):
+        """Verify backward pass for ReLU, GELU, and SiLU."""
+        x_cpu = torch.randn(4, 16, requires_grad=True)
+        x_npu = x_cpu.detach().clone().requires_grad_(True)
 
-            out_c = torch_fn(x_cpu)
-            out_n = npu_fn(x_npu)
-            assert_close(out_n, out_c, atol=1e-2, rtol=1e-2)
+        out_c = torch_fn(x_cpu)
+        out_n = npu_fn(x_npu)
+        assert_close(out_n, out_c, atol=1e-2, rtol=1e-2)
 
-            grad_out = torch.randn_like(out_c)
-            out_c.backward(grad_out)
-            out_n.backward(grad_out)
-            assert_close(x_npu.grad, x_cpu.grad, atol=1e-2, rtol=1e-2)
+        grad_out = torch.randn_like(out_c)
+        out_c.backward(grad_out)
+        out_n.backward(grad_out)
+        assert_close(x_npu.grad, x_cpu.grad, atol=1e-2, rtol=1e-2)
 
     def test_npu_adam_optimizer_step(self):
         """Verify NPUAdam optimization step convergence against torch.optim.Adam."""
@@ -147,7 +144,7 @@ class TestTrainingAndOptimizers(unittest.TestCase):
             final_loss = loss.item()
 
         # Verify loss strictly decreases during training
-        self.assertLess(final_loss, initial_loss * 0.5)
+        assert final_loss < initial_loss * 0.5
 
     def test_softmax_autograd_backward_level_zero(self):
         """Verify softmax backward pass executes with high precision."""
@@ -207,9 +204,4 @@ class TestTrainingAndOptimizers(unittest.TestCase):
             loss.backward()
             optimizer.step()
 
-        self.assertIsNotNone(loss.item())
-
-
-if __name__ == "__main__":
-    unittest.main()
-
+        assert loss.item() is not None
