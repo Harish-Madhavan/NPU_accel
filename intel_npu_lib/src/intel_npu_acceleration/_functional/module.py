@@ -719,6 +719,36 @@ def adam_step(
     return [param, exp_avg, exp_avg_sq]
 
 
+def adamw_step(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+) -> list[torch.Tensor]:
+    res = _try_npu(
+        "npu_adamw_step", param, grad, exp_avg, exp_avg_sq, lr, beta1, beta2, eps, weight_decay, step
+    )
+    if res is not _MISS:
+        return res
+    # AdamW: decoupled weight decay applied directly to weights
+    if weight_decay != 0.0:
+        param = param * (1.0 - lr * weight_decay)
+    exp_avg = exp_avg * beta1 + grad * (1.0 - beta1)
+    exp_avg_sq = exp_avg_sq * beta2 + (grad * grad) * (1.0 - beta2)
+    bc1 = 1.0 - (beta1 ** step)
+    bc2 = 1.0 - (beta2 ** step)
+    step_val = (exp_avg / bc1) / (torch.sqrt(exp_avg_sq / bc2) + eps)
+    param = param - step_val * lr
+    return [param, exp_avg, exp_avg_sq]
+
+
+
 def sgd_step(
     param: torch.Tensor,
     grad: torch.Tensor,

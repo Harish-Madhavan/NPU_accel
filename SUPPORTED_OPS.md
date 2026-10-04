@@ -90,6 +90,7 @@ The library operates on three unified levels:
 | Tool / Optimizer | Module | Description |
 | :--- | :--- | :--- |
 | `NPUAdam` | `intel_npu_acceleration.optim.NPUAdam` | Fused first moment, second moment, bias correction, and weight update kernel on NPU |
+| `NPUAdamW` | `intel_npu_acceleration.optim.NPUAdamW` | Fused AdamW with decoupled weight decay parameter updates directly on NPU |
 | `NPUSGD` | `intel_npu_acceleration.optim.NPUSGD` | Momentum-buffered SGD update kernel on NPU |
 | `clip_grad_norm_` | `intel_npu_acceleration.optim.clip_grad_norm_` | Gradient clipping matching PyTorch standard `clip_grad_norm_` |
 
@@ -119,6 +120,23 @@ The library operates on three unified levels:
 | `quantized_linear` | ✅ | Hardware-accelerated linear kernel supporting FP32, FP16, INT8, and packed INT4 |
 | Compiler Auto-Dequantization | ✅ | Native OpenVINO compiler automatic unpack for INT8 and packed INT4 during `compile_to_npu` |
 
+### 8. Small Language Models (SLM) & Pipeline APIs
+| API Surface | Module | Description |
+| :--- | :--- | :--- |
+| `NPUCausalLM.from_pretrained` | `intel_npu_acceleration.llm` | End-to-end Hugging Face weight loading, tokenizer integration, and NPU Level Zero compilation |
+| `NPUCausalLM.generate` | `intel_npu_acceleration.llm` | Hardware-register stateful autoregressive generation loop (57+ tok/s on SmolLM2-135M) |
+| `NPUCausalLM.stream_generate` | `intel_npu_acceleration.llm` | Low-latency token-by-token streaming generator yielding tokens in real time |
+| `FusedStatefulAttention` | `intel_npu_acceleration.llm` | Fused QKV projection, rotary positional embeddings (RoPE), stateful KV-cache, and SDPA |
+| `export_compiled_model` | `intel_npu_acceleration.frontend.serialization` | Serializes compiled Level Zero hardware binary (`.blob`) to disk for instant zero-overhead restarts |
+| `import_compiled_model` | `intel_npu_acceleration.frontend.serialization` | Directly reloads pre-compiled hardware executables without PyTorch FX tracing overhead |
+| `export_openvino_ir` | `intel_npu_acceleration.frontend.serialization` | Exports `.xml` / `.bin` IR topology for Netron inspection and standalone OpenVINO deployment |
+
+### 9. TorchDynamo Canonical Op Normalization
+The backend features canonical name resolution and decompositions for PyTorch 2.x `torch.compile`:
+- **Tensor manipulation**: `aten._to_copy`, `aten.clone.default`, `aten.detach.default`, `aten.transpose.int`, `aten.t.default`
+- **Reductions & Shapes**: `aten.sym_size.default`, `aten.mean.dim`, `aten.sum.dim_IntList`
+- **Activations & Math**: `aten.gelu.default`, `aten.silu.default`, `aten._softmax.default`, `aten.native_layer_norm.default`
+- **Attention & Embedding**: `aten.scaled_dot_product_attention.default`, `aten.embedding.default`
 
 ---
 
@@ -129,7 +147,7 @@ The library operates on three unified levels:
 cd intel_npu_lib
 python setup.py build_ext --inplace
 
-# Run Full Test Suite (148 tests, 0 warnings)
+# Run Full Test Suite (339 tests, 0 warnings, 0 errors)
 pytest
 ```
 

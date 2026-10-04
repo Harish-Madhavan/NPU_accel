@@ -4,7 +4,7 @@ from .utils import _C, _is_proxy
 
 
 def _unary_op(a: torch.Tensor, torch_fn, npu_fn) -> torch.Tensor:
-    if _C is None or _is_proxy(a):
+    if _C is None or npu_fn is None or _is_proxy(a):
         return torch_fn(a)
     return npu_fn(a)
 
@@ -21,15 +21,11 @@ def silu(a: torch.Tensor) -> torch.Tensor:
 
 
 def hardsigmoid(a: torch.Tensor) -> torch.Tensor:
-    if _C is not None and hasattr(_C, "npu_hardsigmoid") and not _is_proxy(a):
-        return _C.npu_hardsigmoid(a)
-    return torch.nn.functional.hardsigmoid(a)
+    return _unary_op(a, torch.nn.functional.hardsigmoid, getattr(_C, "npu_hardsigmoid", None) if _C else None)
 
 
 def hardswish(a: torch.Tensor) -> torch.Tensor:
-    if _C is not None and hasattr(_C, "npu_hardswish") and not _is_proxy(a):
-        return _C.npu_hardswish(a)
-    return torch.nn.functional.hardswish(a)
+    return _unary_op(a, torch.nn.functional.hardswish, getattr(_C, "npu_hardswish", None) if _C else None)
 
 
 def softmax(a: torch.Tensor, dim: int = -1) -> torch.Tensor:

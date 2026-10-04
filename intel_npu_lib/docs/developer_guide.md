@@ -74,7 +74,7 @@ We utilize `pytest` to run our test suite. All tests are located in `intel_npu_l
 ```bash
 cd intel_npu_lib
 
-# Run all 38 tests
+# Run all 339 tests (0 errors, 0 warnings)
 python -m pytest
 
 # Run a specific test with log printing
@@ -85,7 +85,7 @@ python -m pytest tests/test_basic.py -v -s
 
 ## 🌐 Production CI/CD Pipeline
 
-Our GitHub Actions workflow [.github/workflows/ci.yml](file:///E:/Git%20Repo/NPU_accel/.github/workflows/ci.yml) manages code quality, linting, building, and test coverages:
+Our GitHub Actions workflow [ci.yml](../../.github/workflows/ci.yml) manages code quality, linting, building, and test coverages:
 
 ### 1. CI Build Matrix
 *   **Operating Systems**: Windows (`windows-latest`) and Linux (`ubuntu-latest`).

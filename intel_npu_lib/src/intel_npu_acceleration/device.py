@@ -10,8 +10,12 @@ __all__ = [
     "is_available",
     "device_count",
     "current_device",
+    "set_device",
+    "device",
     "get_device_name",
     "get_device_properties",
+    "mem_get_info",
+    "get_memory_info",
     "empty_cache",
     "synchronize",
     "set_property",
@@ -54,8 +58,17 @@ def _get_ov_core() -> Any | None:
             return _OV_CORE
         try:
             import openvino as ov
+            import openvino.properties as ov_props
 
             _OV_CORE = ov.Core()
+            from .cache import get_cache_dir
+
+            cache_dir = get_cache_dir()
+            if cache_dir:
+                try:
+                    _OV_CORE.set_property({ov_props.cache_dir(): cache_dir})
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"OpenVINO Core init failed: {e}")
             _OV_CORE = None
@@ -77,17 +90,11 @@ _EAGER_DEVICE: str = "NPU"
 
 
 def _apply_to_ov_core(properties: dict[str, str]) -> None:
-    """Mirror driver properties to the Python OpenVINO Core singleton.
-
-    Graph-mode compiles use the Python ``ov.Core`` (not the C++ backend's
-    Core), so global settings must reach both. Best-effort: the NPU plugin
-    accepts unknown keys silently and per-compile configs override globals.
-    """
+    """Mirror driver properties to the Python OpenVINO Core singleton."""
     try:
-        from .frontend.compiler import _get_core
-
-        core = _get_core()
-        core.set_property("NPU", properties)
+        core = _get_ov_core()
+        if core is not None and any("NPU" in d for d in core.available_devices):
+            core.set_property("NPU", properties)
     except Exception as e:
         logger.debug(f"OV Core property mirror skipped: {e}")
 
@@ -252,13 +259,94 @@ def device_count() -> int:
     return 1 if is_available() else 0
 
 
+_CURRENT_DEVICE: int = 0
+_DEVICE_LOCK = threading.Lock()
+
+
 def current_device() -> int:
     """Return the index of the currently selected NPU device.
 
     Returns:
-        int: Device index (always 0 for primary NPU accelerator).
+        int: Device index (e.g. 0).
     """
-    return 0
+    return _CURRENT_DEVICE
+
+
+def set_device(device: Any) -> None:
+    """Set the currently active NPU device index.
+
+    Validates that the specified device index is within valid bounds.
+
+    Args:
+        device (int | str | torch.device): Device index or device identifier.
+
+    Raises:
+        RuntimeError: If device index is out of bounds (< 0 or >= device_count()).
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> npu.set_device(0)
+    """
+    global _CURRENT_DEVICE
+    if device is None:
+        return
+    import torch
+
+    if isinstance(device, str):
+        device = torch.device(device)
+    idx = device.index if isinstance(device, torch.device) else int(device)
+    if idx is None:
+        idx = 0
+    count = device_count()
+    if idx < 0 or (count > 0 and idx >= count):
+        raise RuntimeError(f"Invalid device index {idx}, only {count} NPU device(s) available.")
+    with _DEVICE_LOCK:
+        _CURRENT_DEVICE = idx
+
+
+class device:  # noqa: N801
+    """Context manager and device selector that changes the selected NPU device.
+
+    Args:
+        device (torch.device | int | str): Device index or device identifier to select.
+
+    Examples:
+        >>> import intel_npu_acceleration as npu
+        >>> with npu.device(0):
+        ...     # operations run on NPU 0
+        ...     pass
+    """
+
+    def __init__(self, device: Any) -> None:
+        import torch
+
+        if device is None:
+            self.idx = 0
+        elif isinstance(device, str):
+            d = torch.device(device)
+            self.idx = d.index if d.index is not None else 0
+        elif isinstance(device, torch.device):
+            self.idx = device.index if device.index is not None else 0
+        else:
+            self.idx = int(device)
+        count = device_count()
+        if self.idx < 0 or (count > 0 and self.idx >= count):
+            raise RuntimeError(f"Invalid device index {self.idx}, only {count} NPU device(s) available.")
+        self.device = torch.device(f"npu:{self.idx}")
+        self.prev: int | None = None
+
+    def __enter__(self) -> Any:
+        self.prev = current_device()
+        set_device(self.idx)
+        return self.device
+
+    def __exit__(self, *args: Any) -> None:
+        if self.prev is not None:
+            set_device(self.prev)
+
+    def __repr__(self) -> str:
+        return f"<intel_npu_acceleration.device {self.device}>"
+
 
 
 def get_device_name(device: int = 0) -> str:
@@ -302,11 +390,50 @@ def get_device_properties(device: int = 0) -> dict[str, Any]:
     }
     if available:
         core = _get_ov_core()
-        try:
-            props["optimal_infer_requests"] = core.get_property("NPU", "OPTIMAL_NUMBER_OF_INFER_REQUESTS")
-        except Exception:
-            props["optimal_infer_requests"] = 1
+        if core is not None:
+            try:
+                props["optimal_infer_requests"] = core.get_property("NPU", "OPTIMAL_NUMBER_OF_INFER_REQUESTS")
+            except Exception:
+                props["optimal_infer_requests"] = 1
+            try:
+                props["total_memory"] = int(core.get_property("NPU", "NPU_DEVICE_TOTAL_MEM_SIZE"))
+            except Exception:
+                props["total_memory"] = 16 * 1024 * 1024 * 1024
+            try:
+                props["allocated_memory"] = int(core.get_property("NPU", "NPU_DEVICE_ALLOC_MEM_SIZE"))
+            except Exception:
+                props["allocated_memory"] = 0
     return props
+
+
+def mem_get_info(device: Any = None) -> tuple[int, int]:
+    """Return (free_memory, total_memory) in bytes for the specified NPU device.
+
+    Parity implementation for torch.cuda.mem_get_info and torch.accelerator.get_memory_info.
+    """
+    dev_idx = 0
+    if device is not None:
+        if hasattr(device, "index") and device.index is not None:
+            dev_idx = device.index
+        elif isinstance(device, int):
+            dev_idx = device
+        elif isinstance(device, str):
+            try:
+                import torch
+
+                dev_idx = torch.device(device).index or 0
+            except Exception:
+                dev_idx = 0
+    props = get_device_properties(dev_idx)
+    total = int(props.get("total_memory", 16 * 1024 * 1024 * 1024))
+    alloc = int(props.get("allocated_memory", 0))
+    free = max(0, total - alloc)
+    return (free, total)
+
+
+def get_memory_info(device: Any = None) -> tuple[int, int]:
+    """Return (free_memory, total_memory) in bytes for the specified NPU device."""
+    return mem_get_info(device)
 
 
 def empty_cache() -> None:
@@ -323,6 +450,11 @@ def empty_cache() -> None:
 
     clear_graph_cache()
     clear_cache()
+    if _C is not None and hasattr(_C, "clear_cpp_model_cache"):
+        try:
+            _C.clear_cpp_model_cache()
+        except Exception as e:
+            logger.debug(f"Failed to clear C++ model cache: {e}")
     logger.info("NPU memory and model caches purged successfully.")
 
 

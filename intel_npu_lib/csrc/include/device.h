@@ -4,14 +4,13 @@
 #include <atomic>
 #include <iostream>
 #include <list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <openvino/openvino.hpp>
 #include <openvino/runtime/intel_npu/level_zero/level_zero.hpp>
-#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 /**
  * @file device.h
@@ -161,7 +160,7 @@ private:
     std::unique_ptr<ov::Core> m_core;
     ov::RemoteContext m_context;
     std::unique_ptr<ov::intel_npu::level_zero::ZeroContext> m_zero_context;
-    std::map<std::string, CacheEntry> m_model_cache;
+    std::unordered_map<std::string, CacheEntry> m_model_cache;
     std::list<std::string> m_access_order;
     const size_t m_max_cache_size = 200;
 
@@ -170,11 +169,13 @@ private:
     bool m_has_context = false;               ///< True when RemoteContext init succeeded
     bool m_has_zero_context = false;          ///< True when ZeroContext init succeeded
     std::string m_eager_device = "CPU";       ///< Target device for eager ops (CPU fallback for tiny ops)
-    std::set<std::string> m_supported_props;  ///< Populated by probeProperties()
+    std::string m_compile_config_key = "LATENCY_CPU"; ///< Cached hint + eager device suffix
+    std::unordered_set<std::string> m_supported_props;  ///< Populated by probeProperties()
     ov::hint::PerformanceMode m_performance_hint = ov::hint::PerformanceMode::LATENCY;
     std::atomic<uint64_t> m_cache_version{0};
 
-    void probeProperties();  ///< Queries ov::supported_properties at initialization
+    void probeProperties();          ///< Queries ov::supported_properties at initialization
+    void updateCompileConfigKey();   ///< Updates m_compile_config_key under lock
 };
 
 // --- C-API Wrappers for PyBind11 Python Bindings ---

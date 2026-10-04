@@ -105,7 +105,7 @@ if errorlevel 1 (
 echo [SUCCESS] C++ extension built inplace.
 
 if "%NO_INSTALL%"=="1" (
-  echo Skipping pip install (--no-install).
+  echo Skipping pip install ^(--no-install^).
   exit /b 0
 )
 
@@ -118,3 +118,4 @@ if errorlevel 1 (
 
 echo [SUCCESS] intel_npu_acceleration installed. Verify with:
 echo   python -m intel_npu_acceleration --info
+echo   python -m intel_npu_acceleration --self-test

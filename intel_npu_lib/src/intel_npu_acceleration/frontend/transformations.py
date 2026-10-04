@@ -19,6 +19,59 @@ def _build_placeholder_maps(
     return exact, cleaned
 
 
+def freeze_inferred_reshape_dims(ov_model: ov.Model) -> int:
+    """Replace `-1` dims in Reshape shape constants with concrete sizes.
+
+    The NPU compiler requires static output bounds, but OpenVINO leaves `-1`
+    (infer-dim) outputs dynamic — and that dynamism taints every downstream
+    shape, failing compilation with "cannot compute output bounds". All
+    shapes are static at this point in our pipeline (dynamic buckets re-trace
+    per bucket), so every single `-1` is computable from its data input.
+
+    Nodes are skipped (left dynamic) when the shape is not a Constant, the
+    data shape is not static, there are multiple `-1`s, a `0` is present, or
+    sizes are inconsistent. Iterates to let upstream freezes cascade.
+    Returns the number of reshapes frozen.
+    """
+    frozen = 0
+    for _ in range(3):
+        changed = False
+        for node in ov_model.get_ops():
+            if node.get_type_name() != "Reshape":
+                continue
+            try:
+                shape_src = node.input(1).get_source_output().get_node()
+                if shape_src.get_type_name() != "Constant":
+                    continue
+                dims = [int(v) for v in np.asarray(shape_src.get_data()).reshape(-1)]
+                if dims.count(-1) != 1 or any(d == 0 for d in dims):
+                    continue
+                data_shape = node.input(0).get_partial_shape()
+                if not data_shape.is_static:
+                    continue
+                concrete = list(data_shape.get_shape())
+                total = int(np.prod(concrete, dtype=np.int64))
+                known = 1
+                for d in dims:
+                    if d != -1:
+                        known *= d
+                if known <= 0 or total % known != 0:
+                    continue
+                resolved = [total // known if d == -1 else d for d in dims]
+                node.input(1).replace_source_output(
+                    ops.constant(np.array(resolved, dtype=np.int64)).output(0)
+                )
+                frozen += 1
+                changed = True
+            except Exception as e:
+                logger.debug(f"Reshape freeze skipped for {node.get_friendly_name()}: {e}")
+        if not changed:
+            break
+    if frozen:
+        logger.debug(f"Froze inferred dims in {frozen} Reshape nodes for NPU static bounds.")
+    return frozen
+
+
 def fold_scalar_parameter_inputs(
     ov_model: ov.Model,
     example_input_tuple: tuple,
@@ -254,6 +307,97 @@ def transform_stateful_kv_cache(
         variables,
         "Stateful_NPU_Model",
     )
+
+
+def transform_quantized_weights(
+    ov_model: ov.Model,
+    model: Any,
+) -> ov.Model:
+    """Transform dequantized Linear weights into native OpenVINO INT8/INT4 QDQ nodes.
+
+    Scans torch.nn.Linear modules in `model` that have quantization metadata
+    (mode='int8' with weight_scale, or mode='int4' with weight_scale and weight_zero_point),
+    locates their corresponding Constant nodes in `ov_model`, and substitutes them with
+    hardware QDQ subgraphs:
+      - INT8: Constant(int8) -> Convert(f32) -> Multiply(scale_f32)
+      - INT4: Constant(uint4) -> Convert(f32) -> Subtract(zp_f32) -> Multiply(scale_f32)
+
+    Enables Level Zero NPU QDQ hardware acceleration, reducing memory traffic and blob size.
+    """
+    import torch
+    import torch.nn as nn
+
+    from intel_npu_acceleration._functional.utils import unpack_int4_packed
+
+    if not isinstance(model, nn.Module):
+        return ov_model
+
+    quantized_linears: dict[str, nn.Linear] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            qm = getattr(module, "quantization_mode", None)
+            if qm in ("int8", "int4") and hasattr(module, "weight_scale"):
+                quantized_linears[f"{name}.weight"] = module
+
+    if not quantized_linears:
+        return ov_model
+
+    replaced_count = 0
+    for op in list(ov_model.get_ops()):
+        if op.get_type_name() != "Constant":
+            continue
+
+        fname = op.get_friendly_name()
+        # Normalize friendly name prefixes produced by TorchDynamo / OpenVINO
+        pname = fname
+        for prefix in ("self.", "__module."):
+            if pname.startswith(prefix):
+                pname = pname[len(prefix) :]
+
+        if pname not in quantized_linears:
+            matches = [k for k in quantized_linears if fname.endswith(k)]
+            if len(matches) == 1:
+                pname = matches[0]
+            else:
+                continue
+
+        lmod = quantized_linears[pname]
+        scale = lmod.weight_scale.detach().cpu().numpy().astype(np.float32)
+
+        if lmod.quantization_mode == "int8":
+            w_i8 = lmod.weight.data.detach().cpu().numpy()
+            c_i8 = ops.constant(w_i8, dtype=ov.Type.i8, name=fname + "/int8")
+            c_f32 = ops.convert(c_i8, destination_type=ov.Type.f32)
+            s_const = ops.constant(scale, dtype=ov.Type.f32, name=fname + "/scale")
+            qdq = ops.multiply(c_f32, s_const, name=fname + "/dequant")
+            op.output(0).replace(qdq.output(0))
+            replaced_count += 1
+        elif lmod.quantization_mode == "int4":
+            w_u8 = lmod.weight.data.detach().cpu()
+            w_unp = unpack_int4_packed(w_u8).numpy().astype(np.uint8)
+            zp = getattr(lmod, "weight_zero_point", None)
+            c_u4 = ops.constant(w_unp, dtype=ov.Type.u4, name=fname + "/int4")
+            c_f32 = ops.convert(c_u4, destination_type=ov.Type.f32)
+            s_const = ops.constant(scale, dtype=ov.Type.f32, name=fname + "/scale")
+            if zp is not None:
+                zp_np = (
+                    zp.detach().cpu().numpy().astype(np.float32)
+                    if isinstance(zp, torch.Tensor)
+                    else np.float32(zp)
+                )
+                zp_const = ops.constant(zp_np, dtype=ov.Type.f32, name=fname + "/zp")
+                sub_zp = ops.subtract(c_f32, zp_const, name=fname + "/sub_zp")
+                qdq = ops.multiply(sub_zp, s_const, name=fname + "/dequant")
+            else:
+                qdq = ops.multiply(c_f32, s_const, name=fname + "/dequant")
+            op.output(0).replace(qdq.output(0))
+            replaced_count += 1
+
+    if replaced_count > 0:
+        logger.info(
+            f"Successfully converted {replaced_count} quantized weights into native OpenVINO QDQ hardware nodes."
+        )
+    return ov_model
 
 
 def configure_input_ppp(inp_info: Any, cfg: dict[str, Any]) -> None:

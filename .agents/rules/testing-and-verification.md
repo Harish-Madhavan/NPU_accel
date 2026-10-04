@@ -1,7 +1,7 @@
 # Testing & Verification Guidelines
 
 ## Intent
-Ensure zero regression across the 120+ test suites in `intel_npu_lib/tests/`.
+Ensure zero regression across the 339 tests in 120+ test suites in `intel_npu_lib/tests/`.
 
 ## Rules
 1. **Always Run Pytest**:

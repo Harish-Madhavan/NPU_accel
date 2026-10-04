@@ -116,3 +116,15 @@ import intel_npu_acceleration as npu
 # Force strict NPU execution — raises NPUCompilationError if any CPU fallback is needed
 compiled_model = npu.compile(model, x_example, strict=True)
 ```
+
+---
+
+## 🎛️ Partitioned Graph Module Interface Parity
+
+When a model is partitioned into NPU and CPU segments, the resulting module preserves 100% PyTorch `torch.fx.GraphModule` identity while providing full execution interface parity with monolithic `NPUGraphModule` instances:
+
+* **`.submit(*args)`**: Submits inference and returns an `NPUAsyncFuture` with `.result()` and `.done()` methods.
+* **`.batch_infer(inputs_list)`**: Dispatches multiple input items sequentially or across parallel streams.
+* **`.reset_states()`**: Recursively cascades state resets across all internal stateful NPU submodules.
+* **`.npu_submodules` / `.cpu_submodules`**: Lists names of submodules assigned to the NPU and CPU respectively for transparent hardware inspection.
+* **`isinstance(compiled, torch.fx.GraphModule)`**: Fully satisfies PyTorch FX typing invariants for downstream optimization passes.

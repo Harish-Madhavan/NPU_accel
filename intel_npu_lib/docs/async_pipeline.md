@@ -43,6 +43,13 @@ Blocks the active thread **only until the specific async task finishes**, and re
 *   **Parameters**: `handle` (The request index returned by `infer_async`).
 *   **Returns**: The output PyTorch tensor or a tuple of tensors.
 
+### 3. `submit(*args) -> NPUAsyncFuture`
+Future-based asynchronous execution matching Python standard concurrent futures patterns.
+*   **Returns**: `NPUAsyncFuture` with `.result()` and `.done()` methods.
+
+### 4. `batch_infer(inputs_list: Sequence[Any]) -> List[Any]`
+Efficiently batches multi-item inferences across round-robin hardware execution streams.
+
 ### 📝 Example Usage: Autoregressive Overlapping
 ```python
 import torch

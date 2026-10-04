@@ -124,3 +124,20 @@ class TestOpenVINOFeatures:
         assert optimized is not None
         assert len(optimized.get_parameters()) == 1
         assert len(optimized.get_results()) == 1
+
+    def test_export_and_import_compiled_model(self):
+        model = make_simple_mlp(16, 32, 8).eval()
+        x = torch.randn(2, 16)
+        compiled_model = npu.compile(model, x)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            blob_path = os.path.join(tmp_dir, "test_model.blob")
+            exported_path = npu.export_compiled_model(compiled_model, blob_path)
+            assert os.path.exists(exported_path)
+            assert os.path.getsize(exported_path) > 0
+
+            # Import pre-compiled binary blob
+            imported_model = npu.import_compiled_model(exported_path)
+            out_orig = compiled_model(x)
+            out_imported = imported_model(x)
+            assert torch.allclose(out_orig, out_imported, atol=1e-3)

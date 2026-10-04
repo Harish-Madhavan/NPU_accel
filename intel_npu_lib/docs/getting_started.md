@@ -11,37 +11,50 @@ Because the library builds a native C++ extension (`_C.pyd` on Windows / `_C.so`
 *   **Windows 11**: Install [Visual Studio 2022 Community](https://visualstudio.microsoft.com/vs/community/) and select **"Desktop development with C++"** in the installer.
 *   **Linux (Ubuntu 22.04+)**: Run `sudo apt update && sudo apt install build-essential python3-dev ninja-build` to configure GCC and Ninja.
 
-### 2. Install Package in Development Mode
-Editable installation is recommended for developers so that changes in Python source files are reflected instantly:
-```bash
-# Clone and navigate
-git clone https://github.com/Harish-Madhavan/NPU_accel.git
-cd NPU_accel/intel_npu_lib
+### 2. Install Package
 
-# Install Python packages and inplace C++ library
-# (CPU torch keeps the download small; install it first)
+#### Option A: Automated One-Command Installer (Recommended)
+```bash
+git clone https://github.com/Harish-Madhavan/NPU_accel.git
+cd NPU_accel
+python install.py
+```
+> Automatically verifies Python (3.10+), installs PyTorch and OpenVINO, detects MSVC/GCC compiler, builds the native C++ Level Zero extension in-place, and runs an end-to-end hardware verification self-test.
+
+#### Option B: Manual In-Place Installation
+```bash
+git clone https://github.com/Harish-Madhavan/NPU_accel.git
+cd NPU_accel
+
+# Pre-install CPU PyTorch and OpenVINO
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install openvino "numpy>=1.24"
 
-# Windows: configures MSVC automatically (supports --clean / --no-install)
-#   ..\build_npu.bat
-# Any OS:
-python setup.py build_ext --inplace
+# Install package directly from repository root
 pip install --no-build-isolation --no-deps -e .
 ```
+
+* **Windows**: You can also run `.\build_npu.bat`
+* **Linux**: You can run `./build_npu.sh`
 
 Build knobs: `NPU_NO_BUILD_EXT=1` skips the native extension (pure-Python
 fallback), `NPU_VERBOSE_BUILD=1` prints OpenVINO discovery details, and
 `OPENVINO_DIR`/`INTEL_OPENVINO_DIR` point at a non-PyPI toolkit install.
-Single source of truth: package metadata lives in `pyproject.toml`;
-`setup.py` only defines how to build the `_C` extension.
 
-### 3. Verification
-Verify that the package can bind to the C++ Level Zero driver and load successfully:
+### 3. Verification & Self-Test
+Verify that the package binds to the Level Zero driver and passes hardware verification:
+```bash
+# Print diagnostic summary
+python -m intel_npu_acceleration --info
+
+# Run end-to-end hardware acceleration verification self-test
+python -m intel_npu_acceleration --self-test
+```
 ```python
 import intel_npu_acceleration as npu
 
 print(f"Is NPU backend available: {npu.is_available()}")
+npu.self_test()  # Runs automated hardware numerics verification
 ```
 ```bash
 # Equivalent terminal diagnostics (also installed as `intel-npu-info`):
@@ -129,3 +142,28 @@ export INTEL_NPU_CACHE_DIR="/home/user/my_ai_models/npu_cache"
 ```
 (`NPU_CACHE_DIR` is accepted as an alias. Explicit env vars take precedence
 over the default `./npu_cache` and are created on demand at import.)
+
+### 3. Dedicated Pre-compiled Binary Blob Persistence
+You can manually export and import pre-compiled Level Zero binary blobs (.blob) directly:
+```python
+# Export pre-compiled Level Zero executable
+npu.export_compiled_model(npu_model, "npu_cache/my_model.blob")
+
+# Sub-second cold reload (skips FX tracing & OpenVINO IR conversion)
+npu_model = npu.import_compiled_model("npu_cache/my_model.blob")
+```
+
+---
+
+## 🦙 Small Language Models (SLMs) on Intel NPU
+
+Run autoregressive language models (such as `SmolLM2-135M`) with hardware state registers:
+```python
+from intel_npu_acceleration.llm import NPUCausalLM
+
+# Load and compile for Intel NPU
+model = NPUCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M", max_seq_len=256)
+
+# Generate tokens
+print(model.generate("The capital of France is", max_new_tokens=30))
+```

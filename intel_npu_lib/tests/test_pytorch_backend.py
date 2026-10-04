@@ -49,6 +49,33 @@ class TestPyTorchBackendConformance:
 
         # set_device
         torch.npu.set_device(0)
+        torch.npu.set_device("npu:0")
+        torch.npu.set_device(torch.device("npu:0"))
+        assert torch.npu.current_device() == 0
+
+        # Top-level npu.set_device / npu.current_device
+        npu.set_device(0)
+        assert npu.current_device() == 0
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            npu.set_device(999)
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            npu.set_device(-1)
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            torch.npu.set_device(999)
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            torch.npu.set_device(-1)
+
+        # Context manager device switching and validation
+        with torch.npu.device(0):
+            assert torch.npu.current_device() == 0
+        with torch.npu.device("npu:0"):
+            assert torch.npu.current_device() == 0
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            with torch.npu.device(999):
+                pass
+        with pytest.raises(RuntimeError, match="Invalid device index"):
+            with torch.npu.device(-1):
+                pass
 
         # Device name and properties
         name = torch.npu.get_device_name(0)
@@ -70,15 +97,28 @@ class TestPyTorchBackendConformance:
 
         # Synchronize & Cache
         torch.npu.synchronize()
-        torch.npu.empty_cache()
+        if npu._C is not None and hasattr(npu._C, "get_cache_version"):
+            v1 = npu._C.get_cache_version()
+            torch.npu.empty_cache()
+            v2 = npu._C.get_cache_version()
+            assert v2 > v1
+        else:
+            torch.npu.empty_cache()
 
-        # Memory stats
+        # Memory stats & queries
         assert torch.npu.memory_allocated() == 0
         assert torch.npu.max_memory_allocated() == 0
         assert torch.npu.memory_reserved() == 0
         assert torch.npu.max_memory_reserved() == 0
         assert isinstance(torch.npu.memory_stats(), dict)
         torch.npu.reset_peak_memory_stats()
+
+        free_mem, total_mem = torch.npu.mem_get_info()
+        assert free_mem > 0
+        assert total_mem > 0
+        assert free_mem <= total_mem
+        free_mem2, total_mem2 = torch.npu.get_memory_info()
+        assert (free_mem2, total_mem2) == (free_mem, total_mem)
 
         # RNG
         torch.npu.manual_seed(42)
@@ -213,6 +253,32 @@ class TestPyTorchBackendConformance:
         assert acc.max_memory_reserved() == 0
         assert isinstance(acc.memory_stats(), dict)
         acc.reset_peak_memory_stats()
+        acc.reset_accumulated_memory_stats()
+
+        # Universal accelerator memory info
+        free_acc, total_acc = acc.get_memory_info()
+        assert free_acc > 0
+        assert total_acc > 0
+        assert free_acc <= total_acc
+
+        # Deprecation-safe index aliases
+        assert acc.current_device_idx() == 0
+        acc.set_device_idx(0)
+        acc.empty_host_cache()
+
+        # Device index context manager
+        with acc.device_index(0):
+            assert acc.current_device_index() == 0
+        with acc.device_index(None):
+            assert acc.current_device_index() == 0
+
+        # Submodule parity
+        if hasattr(acc, "memory"):
+            assert acc.memory.get_memory_info() == (free_acc, total_acc)
+        if hasattr(acc, "random"):
+            rng = acc.random.get_rng_state()
+            assert isinstance(rng, torch.Tensor)
+            assert isinstance(acc.random.initial_seed(), int)
 
     # -----------------------------------------------------------------------
     # 5. Tensor Movement, Tagging & Factories

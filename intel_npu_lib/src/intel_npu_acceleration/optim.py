@@ -11,7 +11,7 @@ import torch
 
 from . import _functional as F_npu
 
-__all__ = ["NPUAdam", "NPUSGD", "clip_grad_norm_"]
+__all__ = ["NPUAdam", "NPUAdamW", "NPUSGD", "clip_grad_norm_"]
 
 
 def _run_closure(closure: Callable[[], float] | None) -> float | None:
@@ -113,6 +113,94 @@ class NPUAdam(torch.optim.Optimizer):
                 exp_avg_sq.copy_(new_exp_avg_sq)
 
         return loss
+
+
+class NPUAdamW(torch.optim.Optimizer):
+    """AdamW optimizer with fused Level Zero NPU kernel step execution.
+
+    Implements the AdamW algorithm (Loshchilov & Hutter, 2019) with decoupled
+    weight decay accelerated directly on the Intel NPU.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        lr (float, optional): Learning rate. Defaults to 1e-3.
+        betas (Tuple[float, float], optional): Coefficients for computing running averages
+            of gradient and its square. Defaults to (0.9, 0.999).
+        eps (float, optional): Term added to denominator for numerical stability. Defaults to 1e-8.
+        weight_decay (float, optional): Decoupled weight decay coefficient. Defaults to 1e-2.
+
+    Examples:
+        >>> import torch
+        >>> from intel_npu_acceleration.optim import NPUAdamW
+        >>> model = torch.nn.Linear(10, 2)
+        >>> optimizer = NPUAdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        """Perform a single optimization step on the NPU hardware with decoupled decay.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model and returns the loss.
+
+        Returns:
+            Optional[float]: The loss value returned by the closure, if provided.
+        """
+        loss = _run_closure(closure)
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                state["step"] += 1
+                step = state["step"]
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+
+                new_p, new_exp_avg, new_exp_avg_sq = F_npu.adamw_step(
+                    p.data, grad, exp_avg, exp_avg_sq, lr, beta1, beta2, eps, weight_decay, step
+                )
+                p.data.copy_(new_p)
+                exp_avg.copy_(new_exp_avg)
+                exp_avg_sq.copy_(new_exp_avg_sq)
+
+        return loss
+
 
 
 class NPUSGD(torch.optim.Optimizer):

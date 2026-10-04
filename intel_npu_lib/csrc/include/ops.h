@@ -274,8 +274,15 @@ std::vector<torch::Tensor> npu_adam_step(torch::Tensor param, torch::Tensor grad
                                          double lr, double beta1, double beta2, double eps,
                                          double weight_decay, int64_t step);
 
+/** @brief Fused AdamW optimizer step with decoupled weight decay on NPU. */
+std::vector<torch::Tensor> npu_adamw_step(torch::Tensor param, torch::Tensor grad,
+                                          torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+                                          double lr, double beta1, double beta2, double eps,
+                                          double weight_decay, int64_t step);
+
 /** @brief Fused SGD optimizer step with momentum buffers on NPU. */
 std::vector<torch::Tensor> npu_sgd_step(torch::Tensor param, torch::Tensor grad,
                                         torch::Tensor momentum_buffer, double lr,
                                         double momentum, double weight_decay,
                                         double dampening, bool nesterov, bool has_momentum_buffer);
+

@@ -17,7 +17,25 @@ import torch.fx
 logger = logging.getLogger("intel_npu_acceleration.frontend.dynamo")
 
 try:
-    from torch._dynamo import register_backend
+    from torch._dynamo import list_backends, register_backend
+
+    def _ensure_registered() -> None:
+        # Entry points (installed distributions) and explicit registration
+        # are mutually exclusive: torch's lookup_backend() registers the
+        # entry-point target itself after loading, so an explicit call here
+        # would collide with it ("duplicate name: npu"). Register explicitly
+        # only when no entry point is visible (bare src-tree usage).
+        try:
+            if "npu" in list_backends():
+                return
+        except Exception:
+            pass
+        try:
+            register_backend(name="npu", compiler_fn=_compile_backend)
+            register_backend(name="intel_npu", compiler_fn=_compile_backend)
+        except AssertionError:
+            pass
+        logger.debug("Registered 'npu' and 'intel_npu' TorchDynamo backends (explicit).")
 
     def _compile_backend(
         gm: torch.fx.GraphModule,
@@ -63,10 +81,22 @@ try:
             kwargs.setdefault("dynamic_buckets", True)
 
         # Automatic PyTorch Autocast detection
-        if torch.is_autocast_enabled() or (
-            hasattr(torch, "is_autocast_cpu_enabled") and torch.is_autocast_cpu_enabled()
+        if (
+            torch.is_autocast_enabled()
+            or (hasattr(torch, "is_autocast_enabled") and torch.is_autocast_enabled("npu"))
+            or (hasattr(torch, "is_autocast_cpu_enabled") and torch.is_autocast_cpu_enabled())
         ):
-            kwargs.setdefault("precision", "fp16")
+            autocast_dtype = None
+            if hasattr(torch, "get_autocast_dtype"):
+                try:
+                    autocast_dtype = torch.get_autocast_dtype("npu")
+                except Exception:
+                    pass
+            if autocast_dtype == torch.bfloat16:
+                kwargs.setdefault("precision", "bf16")
+            else:
+                kwargs.setdefault("precision", "fp16")
+
 
         # Prune unused placeholders (e.g. Dynamo SymInt symbols with 0 users in dynamic shapes)
         placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
@@ -123,9 +153,7 @@ try:
 
         return compiled
 
-    register_backend(name="npu", compiler_fn=_compile_backend)
-    register_backend(name="intel_npu", compiler_fn=_compile_backend)
-    logger.debug("Successfully registered 'npu' and 'intel_npu' TorchDynamo backends.")
+    _ensure_registered()
 
 except Exception as e:
     logger.debug(f"TorchDynamo NPU backend registration skipped: {e}")

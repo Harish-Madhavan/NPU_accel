@@ -5,12 +5,16 @@ __all__ = [
     "compile",
     "compile_to_npu",
     "export_openvino_ir",
+    "export_compiled_model",
+    "import_compiled_model",
     "clear_graph_cache",
 ]
 
 import contextlib
 import hashlib
+import io
 import logging
+import os
 import re
 import threading
 import warnings
@@ -30,12 +34,19 @@ from intel_npu_acceleration.config import config as npu_config
 from intel_npu_acceleration.exceptions import NPUCompilationError
 
 from .graph_module import NPUDynamicGraphModule, NPUGraphModule
+from .serialization import (
+    export_compiled_model,
+    export_openvino_ir,
+    import_compiled_model,
+)
 from .transformations import (
     apply_pre_post_processing,
     fold_scalar_parameter_inputs,
+    freeze_inferred_reshape_dims,
     optimize_ov_model,
     reshape_model_inputs_to_static,
     serialize_openvino_model,
+    transform_quantized_weights,
     transform_stateful_kv_cache,
 )
 
@@ -84,19 +95,13 @@ def clear_graph_cache():
 
 
 def _get_core():
-    global _OV_CORE
-    if _OV_CORE is None:
-        _OV_CORE = ov.Core()
+    from ..device import _get_ov_core
 
-        # Disk model cache
-        cache_dir = npu_lib.get_cache_dir()
-        if cache_dir:
-            logger.debug(f"Configuring Graph-mode cache dir: {cache_dir}")
-            try:
-                _OV_CORE.set_property({ov_props.cache_dir(): cache_dir})
-            except Exception:
-                pass
-    return _OV_CORE
+    core = _get_ov_core()
+    if core is None:
+        raise RuntimeError("OpenVINO Core could not be initialized")
+    return core
+
 
 
 def _to_example_tuple(example_input: Any) -> tuple:
@@ -250,8 +255,10 @@ def _trace_and_convert_to_ov(
         reshape_model_inputs_to_static(
             ov_model, example_input_tuple, all_placeholder_names
         )
+        freeze_inferred_reshape_dims(ov_model)
     stateful_modules = _collect_stateful_modules(model, traced)
     ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
+    ov_model = transform_quantized_weights(ov_model, model)
     ov_model = optimize_ov_model(ov_model, precision=precision)
     return ov_model, traced, example_input_tuple, all_placeholder_names
 
@@ -277,7 +284,16 @@ def _convert_to_ov_model(model: torch.nn.Module, converted_inputs: tuple) -> Any
                     message="`torch.jit.trace_method` is deprecated.*",
                     category=FutureWarning,
                 )
-                return ov.convert_model(model, example_input=converted_inputs)
+                try:
+                    return ov.convert_model(model, example_input=converted_inputs)
+                except Exception as direct_err:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            traced_jit = torch.jit.trace(model, converted_inputs, check_trace=False)
+                            return ov.convert_model(traced_jit)
+                    except Exception:
+                        raise direct_err
         except Exception as e:
             raise NPUCompilationError(f"Failed to natively convert PyTorch model: {e}") from e
 
@@ -288,14 +304,13 @@ def _convert_to_ov_model(model: torch.nn.Module, converted_inputs: tuple) -> Any
 # _compile_with_ladder) and remembered for the rest of the session.
 _NPU_L0_PROPS: dict[str, str] = {
     "NPU_TURBO": "YES",
+    "NPU_TILES": "2",
     "NPU_DISABLE_IDLE_MEMORY_PRUNING": "YES",
     "NPU_RUN_INFERENCES_SEQUENTIALLY": "NO",
     "NPU_DEFER_WEIGHTS_LOAD": "YES",
     "NPU_QDQ_OPTIMIZATION": "YES",
     "NPU_QDQ_OPTIMIZATION_AGGRESSIVE": "YES",
     "NPU_COMPILATION_MODE_PARAMS": "optimization-level=2",
-    "NPU_USE_SDA": "YES",
-    "NPU_BACKEND_TYPE": "LEVEL_ZERO",
 }
 
 # Options the driver refused in this session ("Option 'X' is not supported").
@@ -703,49 +718,6 @@ def compile_to_npu(
     except Exception as e:
         logger.error(f"Compilation Failed: {e}")
         raise
-
-
-def export_openvino_ir(
-    model: torch.nn.Module,
-    example_input: Any,
-    output_xml_path: str,
-    output_bin_path: str | None = None,
-    preprocess_config: dict | None = None,
-    stateful: bool = False,
-) -> str:
-    """Export a PyTorch model directly to OpenVINO Intermediate Representation (IR) format (.xml / .bin).
-
-    Generates serialized OpenVINO IR files that can be visualized in Netron or deployed
-    directly using the OpenVINO C++ or Python runtime engines without PyTorch dependencies.
-
-    Args:
-        model (torch.nn.Module): PyTorch module to export.
-        example_input (Any): Concrete sample inputs for graph tracing.
-        output_xml_path (str): Destination filesystem path for the `.xml` model topology file.
-        output_bin_path (Optional[str], optional): Destination path for the `.bin` weight file.
-            If omitted, defaults to the same filename with a `.bin` extension. Defaults to None.
-        preprocess_config (Optional[dict], optional): Hardware Pre-Post Processing dictionary to bake into IR. Defaults to None.
-        stateful (bool, optional): If True, serializes KV-cache registers as OpenVINO ReadValue/Assign nodes. Defaults to False.
-
-    Returns:
-        str: The path to the generated `.xml` topology file.
-
-    Examples:
-        >>> import torch
-        >>> import intel_npu_acceleration as npu
-        >>> model = torch.nn.Linear(10, 2)
-        >>> xml_path = npu.export_openvino_ir(model, torch.randn(1, 10), "model.xml")
-    """
-    ov_model, _, example_input_tuple, _ = _trace_and_convert_to_ov(
-        model, example_input, stateful=stateful, precision="auto"
-    )
-
-    if preprocess_config:
-        ov_model = apply_pre_post_processing(ov_model, preprocess_config)
-
-    serialize_openvino_model(ov_model, output_xml_path, output_bin_path)
-    logger.info(f"Successfully exported OpenVINO IR model to '{output_xml_path}'")
-    return output_xml_path
 
 
 # --- Import TorchDynamo Backend Submodule ---

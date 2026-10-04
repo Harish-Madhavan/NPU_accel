@@ -22,7 +22,7 @@ python setup.py build_ext --inplace
 ```powershell
 pytest
 ```
-- Verify 120+ test suites pass with 0 errors and 0 warnings.
+- Verify all 339 tests across 120+ test suites pass with 0 errors and 0 warnings.
 
 ### 3. Run Specific Test Suite (for targeted debugging)
 ```powershell

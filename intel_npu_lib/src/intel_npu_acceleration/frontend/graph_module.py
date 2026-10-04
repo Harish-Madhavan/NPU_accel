@@ -93,13 +93,14 @@ class NPUAsyncFuture:
 class LeasedBufferPool:
     """Pool of pre-allocated tensors with weakref-based auto-return."""
 
-    __slots__ = ("shape", "dtype", "idle_buffers", "_active", "_lock")
+    __slots__ = ("shape", "dtype", "idle_buffers", "_active", "_lock", "_cached_ov_tensors")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
         self.shape = shape
         self.dtype = dtype
         self.idle_buffers: list[torch.Tensor] = []
         self._active: set[int] = set()
+        self._cached_ov_tensors: dict[int, ov.Tensor] = {}
         self._lock = threading.Lock()
 
     @property
@@ -115,6 +116,14 @@ class LeasedBufferPool:
             buf = self.idle_buffers.pop() if self.idle_buffers else torch.empty(self.shape, dtype=self.dtype)
             self._active.add(id(buf))
             return buf
+
+    def get_ov_tensor(self, buf: torch.Tensor) -> ov.Tensor:
+        buf_id = id(buf)
+        ov_t = self._cached_ov_tensors.get(buf_id)
+        if ov_t is None:
+            ov_t = ov.Tensor(buf.numpy(), shared_memory=True)
+            self._cached_ov_tensors[buf_id] = ov_t
+        return ov_t
 
     def release(self, buf_id: int, buf: torch.Tensor) -> None:
         with self._lock:
@@ -206,9 +215,25 @@ class NPUGraphModule(torch.nn.Module):
             [req.get_input_tensor(i) for i in range(len(self.compiled_model.inputs))]
             for req in self.infer_requests
         ]
+        self.input_torch_views: list[list[torch.Tensor | None]] = []
+        for req_idx in range(self.num_streams):
+            in_views: list[torch.Tensor | None] = []
+            for i in range(len(self.compiled_model.inputs)):
+                if self.input_static[i]:
+                    try:
+                        in_views.append(torch.from_numpy(self.input_tensors[req_idx][i].data))
+                    except Exception:
+                        in_views.append(None)
+                else:
+                    in_views.append(None)
+            self.input_torch_views.append(in_views)
 
         self.output_info: list[tuple[bool, tuple[int, ...] | None, torch.dtype | None]] = []
         self.output_pools: list[LeasedBufferPool | None] = []
+        # The NPU plugin materializes boolean outputs as u8 bytes at runtime
+        # even when the model declares boolean: flag those outputs so the
+        # collector restores torch.bool (0/1 values are preserved).
+        self.output_is_bool: list[bool] = []
         for j in range(len(self.compiled_model.outputs)):
             ov_out = self.compiled_model.outputs[j]
             p_shape = ov_out.get_partial_shape()
@@ -218,6 +243,7 @@ class NPUGraphModule(torch.nn.Module):
                 target_dtype = _OV_TO_NP.get(ov_type, np.float32)
                 torch_dtype = _OV_TO_TORCH.get(ov_type, torch.float32)
                 self.output_info.append((True, shape, torch_dtype))
+                self.output_is_bool.append(ov_type == ov.Type.boolean)
                 num_elements = int(np.prod(shape))
                 if num_elements > npu_config.leased_buffer_threshold_elements or not self.clone_outputs:
                     self.output_pools.append(LeasedBufferPool(shape, torch_dtype))
@@ -236,6 +262,19 @@ class NPUGraphModule(torch.nn.Module):
             [req.get_output_tensor(j) for j in range(len(self.compiled_model.outputs))]
             for req in self.infer_requests
         ]
+        self.output_torch_views: list[list[torch.Tensor | None]] = []
+        for req_idx in range(self.num_streams):
+            out_views: list[torch.Tensor | None] = []
+            for j in range(len(self.compiled_model.outputs)):
+                if self.output_info[j][0]:
+                    try:
+                        out_views.append(torch.from_numpy(self.output_tensors[req_idx][j].data))
+                    except Exception:
+                        out_views.append(None)
+                else:
+                    out_views.append(None)
+            self.output_torch_views.append(out_views)
+
         self.input_meta = list(
             zip(
                 self.arg_indices,
@@ -245,6 +284,29 @@ class NPUGraphModule(torch.nn.Module):
                 self.input_sizes, strict=False,
             )
         )
+        self._last_output_buf_ids = [[-1] * len(self.compiled_model.outputs) for _ in range(self.num_streams)]
+        self._fast_inputs: list[list[tuple[int, torch.Tensor, torch.dtype, tuple[int, ...]]] | None] = []
+        copy_threshold = npu_config.copy_threshold_elements
+        for req_idx in range(self.num_streams):
+            can_fast = (
+                all(self.input_static)
+                and all(s < copy_threshold for s in self.input_sizes)
+                and all(v is not None for v in self.input_torch_views[req_idx])
+            )
+            if can_fast:
+                pairs = []
+                for i in range(len(self.compiled_model.inputs)):
+                    view = self.input_torch_views[req_idx][i]
+                    assert view is not None
+                    pairs.append((
+                        self.arg_indices[i],
+                        view,
+                        self.target_torch_dtypes[i],
+                        tuple(view.shape),
+                    ))
+                self._fast_inputs.append(pairs)
+            else:
+                self._fast_inputs.append(None)
 
     # ------------------------------------------------------------------
     # Hot-path helpers — deduplicated between sync and async
@@ -273,11 +335,12 @@ class NPUGraphModule(torch.nn.Module):
         return np_view, np_view
 
     def _next_request(self) -> tuple[int, Any]:
+        if self.num_streams == 1:
+            return 0, self.infer_requests[0]
         with self._lock:
             idx = self.request_idx
             req = self.infer_requests[idx]
-            if self.num_streams > 1:
-                self.request_idx = (self.request_idx + 1) % self.num_streams
+            self.request_idx = (self.request_idx + 1) % self.num_streams
             return idx, req
 
     def _bind_inputs(
@@ -287,16 +350,49 @@ class NPUGraphModule(torch.nn.Module):
         args: tuple[Any, ...],
         keep_alive_out: list[Any] | None = None,
     ) -> None:
+        fast_inputs = self._fast_inputs[idx]
+        if fast_inputs is not None and keep_alive_out is None:
+            try:
+                for arg_idx, target_view, target_dtype, target_shape in fast_inputs:
+                    val = args[arg_idx]
+                    if (
+                        val.dtype == target_dtype
+                        and val.shape == target_shape
+                        and val.device == self.cpu_device
+                        and val.is_contiguous()
+                    ):
+                        target_view.copy_(val)
+                    else:
+                        raise ValueError("Fallback to general binding")
+                return
+            except Exception:
+                pass
+
         input_meta = self.input_meta
         input_tensors = self.input_tensors[idx]
+        input_torch_views = self.input_torch_views[idx]
         copy_threshold = npu_config.copy_threshold_elements
         get_view = self._get_numpy_view
         for i, (arg_idx, target_dtype, target_tdtype, is_static, target_size) in enumerate(input_meta):
             val = args[arg_idx]
-            np_view, keep_obj = get_view(val, target_dtype, target_tdtype)
-            if keep_alive_out is not None:
-                keep_alive_out.append(keep_obj)
             if is_static and target_size < copy_threshold:
+                target_view = input_torch_views[i]
+                if (
+                    target_view is not None
+                    and isinstance(val, torch.Tensor)
+                    and val.device == self.cpu_device
+                    and val.dtype == target_tdtype
+                    and val.shape == target_view.shape
+                    and val.is_contiguous()
+                ):
+                    target_view.copy_(val)
+                    if keep_alive_out is not None:
+                        keep_alive_out.append(val)
+                    continue
+
+                np_view, keep_obj = get_view(val, target_dtype, target_tdtype)
+                if keep_alive_out is not None:
+                    keep_alive_out.append(keep_obj)
                 ov_tensor = input_tensors[i]
                 if np_view.shape != ov_tensor.shape:
                     if np_view.ndim == 0 and len(ov_tensor.shape) == 1:
@@ -305,6 +401,9 @@ class NPUGraphModule(torch.nn.Module):
                         np_view = np_view.reshape(())
                 np.copyto(ov_tensor.data, np_view)
             else:
+                np_view, keep_obj = get_view(val, target_dtype, target_tdtype)
+                if keep_alive_out is not None:
+                    keep_alive_out.append(keep_obj)
                 try:
                     infer_request.set_input_tensor(i, ov.Tensor(np_view, shared_memory=True))
                 except RuntimeError:
@@ -315,15 +414,19 @@ class NPUGraphModule(torch.nn.Module):
                         np_view = np_view.reshape(())
                     infer_request.set_input_tensor(i, ov.Tensor(np_view, shared_memory=True))
 
-    def _lease_outputs(self, infer_request: Any) -> list[torch.Tensor | None] | None:
+    def _lease_outputs(self, infer_request: Any, idx: int = 0) -> list[torch.Tensor | None] | None:
         if not self.has_output_pools:
             return None
         leased: list[torch.Tensor | None] = []
+        last_ids = self._last_output_buf_ids[idx]
         for j, pool in enumerate(self.output_pools):
             if pool is not None:
                 buf = pool.lease()
                 leased.append(buf)
-                infer_request.set_output_tensor(j, ov.Tensor(buf.numpy(), shared_memory=True))
+                buf_id = id(buf)
+                if last_ids[j] != buf_id:
+                    infer_request.set_output_tensor(j, pool.get_ov_tensor(buf))
+                    last_ids[j] = buf_id
             else:
                 leased.append(None)
         return leased
@@ -335,10 +438,26 @@ class NPUGraphModule(torch.nn.Module):
         clone_outputs = self.clone_outputs
         output_pools = self.output_pools
         output_info = self.output_info
+        output_torch_views = self.output_torch_views[request_idx] if request_idx < len(self.output_torch_views) else None
         output_tensors = self.output_tensors[request_idx] if request_idx < len(self.output_tensors) else []
         from_numpy = torch.from_numpy
-        outputs: list[torch.Tensor] = []
+
         if leased_bufs is not None:
+            if self.num_outputs == 1 and not self.output_is_bool[0]:
+                buf = leased_bufs[0]
+                if buf is not None:
+                    pool = output_pools[0]
+                    assert pool is not None
+                    if clone_outputs:
+                        out = buf.clone()
+                        pool.release(id(buf), buf)
+                        return [out]
+                    else:
+                        view = buf.detach()
+                        weakref.finalize(view, pool.release, id(buf), buf)
+                        return [view]
+
+            outputs: list[torch.Tensor] = []
             for j, buf in enumerate(leased_bufs):
                 if buf is not None:
                     pool = output_pools[j]
@@ -350,23 +469,47 @@ class NPUGraphModule(torch.nn.Module):
                         view = buf.detach()
                         weakref.finalize(view, pool.release, id(buf), buf)
                         outputs.append(view)
+                elif output_info[j][0] and output_torch_views is not None and j < len(output_torch_views) and output_torch_views[j] is not None:
+                    t = output_torch_views[j]
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
+                    outputs.append(t.clone() if clone_outputs else t)
                 elif output_info[j][0] and j < len(output_tensors):
                     t = from_numpy(output_tensors[j].data)
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
                     outputs.append(t.clone() if clone_outputs else t)
                 else:
                     out = infer_request.get_output_tensor(j)
                     t = from_numpy(out.data)
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
                     outputs.append(t.clone() if clone_outputs else t)
+            return outputs
         else:
+            if self.num_outputs == 1 and not self.output_is_bool[0]:
+                if output_info[0][0] and output_torch_views is not None and output_torch_views[0] is not None:
+                    t = output_torch_views[0]
+                    return [t.clone() if clone_outputs else t]
+            outputs = []
             for j in range(self.num_outputs):
-                if output_info[j][0] and j < len(output_tensors):
+                if output_info[j][0] and output_torch_views is not None and j < len(output_torch_views) and output_torch_views[j] is not None:
+                    t = output_torch_views[j]
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
+                    outputs.append(t.clone() if clone_outputs else t)
+                elif output_info[j][0] and j < len(output_tensors):
                     t = from_numpy(output_tensors[j].data)
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
                     outputs.append(t.clone() if clone_outputs else t)
                 else:
                     out = infer_request.get_output_tensor(j)
                     t = from_numpy(out.data)
+                    if j < len(self.output_is_bool) and self.output_is_bool[j]:
+                        t = t.to(torch.bool)
                     outputs.append(t.clone() if clone_outputs else t)
-        return outputs
+            return outputs
 
     # ------------------------------------------------------------------
     # Public API
@@ -376,10 +519,40 @@ class NPUGraphModule(torch.nn.Module):
         idx, req = self._next_request()
         with self._request_locks[idx]:
             self._bind_inputs(req, idx, args)
-            leased = self._lease_outputs(req)
+            leased = self._lease_outputs(req, idx)
             req.infer()
             outputs = self._collect_outputs(req, leased, idx)
             return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    def infer_direct(self, *args: Any) -> Any:
+        """Fast-path direct execution for high-frequency loops (e.g. SLM decoding).
+
+        Bypasses output leasing pool management, weakref finalizers, and thread locks.
+        Directly writes inputs into hardware input views, calls `infer()`, and returns
+        the pre-bound underlying output tensor view.
+        """
+        req = self.infer_requests[0]
+        self._bind_inputs(req, 0, args)
+        req.infer()
+        if self.output_torch_views and self.output_torch_views[0] and self.output_torch_views[0][0] is not None:
+            out_views = self.output_torch_views[0]
+            return out_views[0] if self.num_outputs == 1 else out_views
+        return self.forward(*args)
+
+    def infer_direct_async(self, *args: Any) -> None:
+        """Asynchronously dispatch execution on stream 0 directly without lock contention."""
+        req = self.infer_requests[0]
+        self._bind_inputs(req, 0, args)
+        req.start_async()
+
+    def wait_direct(self) -> Any:
+        """Wait for stream 0 direct execution and return pre-bound output view."""
+        req = self.infer_requests[0]
+        req.wait()
+        if self.output_torch_views and self.output_torch_views[0] and self.output_torch_views[0][0] is not None:
+            out_views = self.output_torch_views[0]
+            return out_views[0] if self.num_outputs == 1 else out_views
+        return self._collect_outputs(req, None, 0)
 
     def infer_async(self, *args: Any) -> int:
         """Start an asynchronous inference request. Returns request index handle."""
@@ -387,7 +560,7 @@ class NPUGraphModule(torch.nn.Module):
         with self._request_locks[idx]:
             keep_alive: list[Any] = []
             self._bind_inputs(req, idx, args, keep_alive_out=keep_alive)
-            leased = self._lease_outputs(req)
+            leased = self._lease_outputs(req, idx)
             self._active_inputs[idx] = (keep_alive, leased)
             req.start_async()
             return idx

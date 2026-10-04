@@ -6,14 +6,20 @@ from .compiler import (
     clear_graph_cache,
     compile,
     compile_to_npu,
-    export_openvino_ir,
 )
 from .graph_module import NPUDynamicGraphModule, NPUGraphModule
+from .serialization import (
+    export_compiled_model,
+    export_openvino_ir,
+    import_compiled_model,
+)
 
 __all__ = [
     "compile",
     "compile_to_npu",
     "export_openvino_ir",
+    "export_compiled_model",
+    "import_compiled_model",
     "NPUCompilationError",
     "_GRAPH_CACHE",
     "clear_graph_cache",

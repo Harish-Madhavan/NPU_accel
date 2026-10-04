@@ -41,8 +41,95 @@ _SUPPORTED_FUNCTIONS = {
 _SUPPORTED_METHODS = {
     "add", "sub", "mul", "matmul", "div", "neg", "transpose", "reshape", "squeeze", "unsqueeze", "view", "to",
     "sigmoid", "tanh", "clamp", "relu", "sin", "cos", "rsqrt", "pow", "flatten", "permute", "chunk", "split",
-    "contiguous", "clone", "softmax", "mean", "sum", "abs", "exp", "sqrt", "type_as", "float", "half", "int", "long"
+    "split_with_sizes", "contiguous", "clone", "copy", "softmax", "mean", "sum", "abs", "exp", "sqrt", "type_as",
+    "float", "half", "double", "bfloat16", "int", "long", "bool", "byte", "char", "short",
+    "size", "dim", "numel", "expand", "select", "narrow", "unbind", "detach", "t",
+    "triu", "tril", "dropout", "masked_fill", "movedim", "moveaxis", "swapaxes", "swapdims",
+    "new_ones", "new_zeros", "new_empty", "new_full", "repeat", "tile",
 }
+
+# Aliases mapping alternate spellings to their canonical op name.
+_ATEN_OP_ALIASES = {
+    "_softmax": "softmax",
+    "native_layer_norm": "layer_norm",
+    "_to_copy": "to",
+    "_unsafe_view": "view",
+    "t": "transpose",
+    "mm": "matmul",
+    "bmm": "matmul",
+    "addmm": "matmul",
+    "addbmm": "matmul",
+    "baddbmm": "matmul",
+    "convolution": "conv2d",
+    "split_with_sizes": "split",
+    "sym_size": "size",
+    "sym_numel": "numel",
+    "sym_stride": "stride",
+    "lift_fresh_copy": "clone",
+    "true_divide": "div",
+    "rsub": "sub",
+    "clamp_min": "clamp",
+    "clamp_max": "clamp",
+    "float_power": "pow",
+    "reciprocal": "div",
+}
+
+# Extra canonical names with no torch.* counterpart in the sets above
+# (mostly deterministic creation / structural ops dynamo emits).
+_EXTRA_CANONICAL_FUNCTIONS = frozenset({
+    "expand", "full", "zeros", "ones", "empty", "eye", "scalar_tensor",
+    "full_like", "zeros_like", "ones_like", "empty_like",
+    "new_ones", "new_zeros", "new_empty", "new_full",
+    "unbind", "split", "chunk", "select", "slice", "narrow",
+    "movedim", "moveaxis", "swapaxes", "swapdims",
+    "detach", "copy", "masked_fill", "tril",
+    "floor", "ceil", "round", "sign", "minimum", "maximum",
+    "size", "dim", "numel", "stride",
+})
+
+
+def _canonical_op_name(target: Any) -> str | None:
+    """Normalize an op target to a canonical name across tracer spellings.
+
+    Handles ``torch.ops.aten.*`` overloads (``.name()`` like ``"aten::add"``),
+    plain ``torch.*`` / ``torch._C._nn.*`` callables (``__name__``), and raw
+    strings. Returns None when no name can be determined.
+
+    Deliberately NOT normalized (stay on CPU): in-place variants (trailing
+    underscore never matches), RNG, scatter/gather/index_put, sorting and
+    top-k/argmax (dynamic indices), comparisons and logical ops (boolean
+    outputs corrupt at the NPU boundary), erf, nonzero/item/tolist
+    (data-dependent), interpolate (NPU-rejected, probed).
+    """
+    if isinstance(target, str):
+        base = target
+    else:
+        base = None
+        name_fn = getattr(target, "name", None)
+        if callable(name_fn):
+            try:
+                base = name_fn().split("::")[-1]
+            except Exception:
+                base = None
+        if not base:
+            base = getattr(target, "__name__", None)
+        if not base:
+            return None
+    # Strip overload suffixes ("add.Tensor" -> "add").
+    base = base.split(".")[0]
+    return _ATEN_OP_ALIASES.get(base, base)
+
+
+def _build_canonical_set() -> frozenset:
+    names: set[str] = set(_EXTRA_CANONICAL_FUNCTIONS)
+    for entry in list(_SUPPORTED_FUNCTIONS) + list(_SUPPORTED_METHODS):
+        name = _canonical_op_name(entry)
+        if name:
+            names.add(name)
+    return frozenset(names)
+
+
+_CANONICAL_FUNCTIONS = _build_canonical_set()
 
 _SUPPORTED_MODULES = {
     torch.nn.Linear, torch.nn.ReLU, torch.nn.GELU, torch.nn.SiLU, torch.nn.LayerNorm, torch.nn.Conv2d, torch.nn.MaxPool2d,
@@ -63,8 +150,19 @@ class OpRegistry:
 
     @classmethod
     def is_function_supported(cls, target: Any) -> bool:
-        """Return True if the function target can be offloaded to NPU."""
-        return target in cls._functions
+        """Return True if the function target can be offloaded to NPU.
+
+        Matches exact registered callables first, then falls back to
+        canonical op names so dynamo-emitted ``torch.ops.aten.*`` spellings
+        get the same coverage as plain ``torch.*`` graphs.
+        """
+        try:
+            if target in cls._functions:
+                return True
+        except TypeError:
+            return False
+        name = _canonical_op_name(target)
+        return name is not None and name in _CANONICAL_FUNCTIONS
 
     @classmethod
     def is_method_supported(cls, name: str) -> bool:

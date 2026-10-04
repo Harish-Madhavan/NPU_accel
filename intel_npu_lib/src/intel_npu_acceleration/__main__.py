@@ -26,6 +26,13 @@ def main():
         help="Clear compiled NPU models from the disk cache directory.",
     )
     parser.add_argument(
+        "--self-test",
+        "--test",
+        dest="self_test",
+        action="store_true",
+        help="Execute an automated end-to-end hardware acceleration verification self-test.",
+    )
+    parser.add_argument(
         "--version",
         action="store_true",
         help="Show package and OpenVINO runtime version info.",
@@ -45,6 +52,10 @@ def main():
         npu.clear_graph_cache()
         print(f"[Intel NPU] Cleared cache directory '{cache_dir}': removed {count} files ({size_mb} MB).")
         sys.exit(0)
+
+    if args.self_test:
+        success = npu.self_test(verbose=True)
+        sys.exit(0 if success else 1)
 
     # Default action: print diagnostic info
     print_info()

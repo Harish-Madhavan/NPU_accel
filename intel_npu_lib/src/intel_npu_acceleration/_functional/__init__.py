@@ -18,6 +18,7 @@ from .binary import add, div, mul, pow, sub, where
 from .module import (
     abs_backward,
     adam_step,
+    adamw_step,
     bce_with_logits_loss,
     bce_with_logits_loss_backward,
     clamp_backward,

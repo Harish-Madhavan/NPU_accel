@@ -219,13 +219,68 @@ class NPUBuildExtension:
 
 import shutil  # noqa: E402
 
+
+def _find_and_activate_msvc() -> bool:
+    """If on Windows and cl.exe is not on PATH, attempt to locate MSVC via vswhere
+    and load its environment variables (INCLUDE, LIB, PATH) into os.environ.
+    """
+    if os.name != "nt" or shutil.which("cl") is not None:
+        return True
+
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    if not os.path.isfile(vswhere):
+        return False
+
+    try:
+        import subprocess
+
+        cmd = [
+            vswhere,
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ]
+        vs_path = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        if not vs_path:
+            return False
+
+        vcvars = os.path.join(vs_path, "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if not os.path.isfile(vcvars):
+            return False
+
+        out = subprocess.check_output(
+            f'cmd.exe /s /c "call "{vcvars}" >nul && set"',
+            shell=True,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            k, sep, v = line.partition("=")
+            if sep and k.upper() in {"PATH", "INCLUDE", "LIB", "LIBPATH"}:
+                os.environ[k] = v
+        return shutil.which("cl") is not None
+    except Exception as e:
+        if _verbose():
+            print(f"Auto-detection of MSVC failed: {e}")
+        return False
+
+
 ext_modules = []
 cmdclass = {}
 skip_reason = None
 
 if os.environ.get("NPU_NO_BUILD_EXT", "0") == "1":
     skip_reason = "NPU_NO_BUILD_EXT=1 is set"
-elif os.name == "nt" and shutil.which("cl") is None:
+elif os.name == "nt" and shutil.which("cl") is None and not _find_and_activate_msvc():
     skip_reason = (
         "MSVC cl.exe not on PATH — install 'Desktop development with C++' "
         "or run from a VS Developer Prompt / build_npu.bat"

@@ -58,6 +58,7 @@ Implements:
 
 from __future__ import annotations
 
+import functools
 import logging
 import sys
 import time
@@ -74,6 +75,9 @@ logger = logging.getLogger("intel_npu_acceleration.backends.npu")
 # ---------------------------------------------------------------------------
 
 def _get_device_module():
+    import sys
+    if "intel_npu_acceleration.device" in sys.modules:
+        return sys.modules["intel_npu_acceleration.device"]
     from intel_npu_acceleration import device as _device
     return _device
 
@@ -117,13 +121,36 @@ def _package_version() -> str:
         return "0.2.0"
 
 
+def _tracing() -> bool:
+    """True while TorchDynamo/FX is capturing a graph.
+
+    Our ``torch.accelerator`` patches exist to fix *runtime* dispatch. During
+    tracing they must behave exactly like stock torch: patched wrappers that
+    return live objects (e.g. Stream handles) cannot be reconstructed by
+    Dynamo and break compilation of any traced code that touches them.
+    """
+    try:
+        compiler = getattr(torch, "compiler", None)
+        is_compiling = getattr(compiler, "is_compiling", None)
+        if is_compiling is not None and is_compiling():
+            return True
+    except Exception:
+        pass
+    try:
+        if torch.jit.is_tracing():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _fallback_to_zero_on_npu_error(orig_fn):
     """Wrap a zero-arg accelerator query: NPU-related RuntimeErrors become 0."""
 
     def _patched():
         try:
             return orig_fn()
-        except RuntimeError as e:
+        except (RuntimeError, ModuleNotFoundError) as e:
             if "npu" in str(e).lower():
                 return 0
             raise
@@ -149,6 +176,7 @@ def _make_acc_forwarder(npu_attr: str, default: Any):
 # torch.accelerator memory/capability queries mirrored from torch.npu,
 # with the CPU-fallback default used when torch.npu is absent.
 _ACC_FORWARDED_ATTRS: dict[str, Any] = {
+    "get_memory_info": lambda dev=None: (16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024),
     "memory_allocated": 0,
     "max_memory_allocated": 0,
     "memory_reserved": 0,
@@ -216,6 +244,10 @@ def _register_privateuse1_backend() -> bool:
                 _orig_cs = getattr(_acc, "current_stream", None)
                 if _orig_cs:
                     def _patched_cs(device=None):
+                        # During graph capture, return stock behavior: live
+                        # Stream objects cannot be reconstructed by Dynamo.
+                        if _tracing():
+                            return _orig_cs(device)
                         try:
                             if device is not None and _is_npu_device(device):
                                 return torch.npu.current_stream(device)  # type: ignore[attr-defined]
@@ -235,7 +267,7 @@ def _register_privateuse1_backend() -> bool:
 
                 _orig_cd_idx = getattr(_acc, "current_device_idx", None)
                 if _orig_cd_idx:
-                    _acc.current_device_idx = _fallback_to_zero_on_npu_error(_orig_cd_idx)  # type: ignore[attr-defined]
+                    _acc.current_device_idx = lambda: _acc.current_device_index()  # type: ignore[attr-defined]
 
                 _orig_sdi = getattr(_acc, "set_device_index", None)
                 if _orig_sdi:
@@ -250,6 +282,22 @@ def _register_privateuse1_backend() -> bool:
                 _orig_sd_idx = getattr(_acc, "set_device_idx", None)
                 if _orig_sd_idx:
                     _acc.set_device_idx = _patched_sdi  # type: ignore[attr-defined]
+
+                class _PatchedDeviceIndex:
+                    def __init__(self, device: int | None = None, /) -> None:
+                        self.idx = device
+                        self.prev_idx = -1
+
+                    def __enter__(self) -> None:
+                        if self.idx is not None and hasattr(torch, "npu"):
+                            self.prev_idx = torch.npu.current_device()
+                            torch.npu.set_device(self.idx)
+
+                    def __exit__(self, *exc_info: object) -> None:
+                        if self.idx is not None and self.prev_idx != -1 and hasattr(torch, "npu"):
+                            torch.npu.set_device(self.prev_idx)
+
+                _acc.device_index = _PatchedDeviceIndex  # type: ignore[attr-defined]
 
                 _orig_sync = getattr(_acc, "synchronize", None)
                 if _orig_sync:
@@ -294,6 +342,14 @@ def _register_privateuse1_backend() -> bool:
                 _orig_ia = getattr(_acc, "is_available", None)
                 if _orig_ia:
                     def _patched_ia():
+                        # During graph capture, report unavailable: Dynamo
+                        # cannot represent NPU stream state (torch has no C++
+                        # device integration for npu), so proceeding as if an
+                        # accelerator exists crashes SymbolicStreamState for
+                        # EVERY torch.compile on the machine. CPU-only torch
+                        # behaves identically. Runtime answers are unchanged.
+                        if _tracing():
+                            return False
                         try:
                             if hasattr(torch, "npu"):
                                 return torch.npu.is_available()
@@ -309,6 +365,38 @@ def _register_privateuse1_backend() -> bool:
                     _acc.reset_accumulated_memory_stats = lambda device=None: None
                 if hasattr(_acc, "set_stream"):
                     _acc.set_stream = lambda stream: torch.npu.set_stream(stream) if hasattr(torch, "npu") else None
+
+                def _patched_gmi(device_index=None):
+                    try:
+                        if hasattr(torch, "npu") and hasattr(torch.npu, "get_memory_info"):
+                            return torch.npu.get_memory_info(device_index)
+                    except Exception:
+                        pass
+                    return (16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024)
+
+                _acc.get_memory_info = _patched_gmi  # type: ignore[attr-defined]
+                _acc.empty_host_cache = lambda: None  # type: ignore[attr-defined]
+                try:
+                    import torch.accelerator.memory as _acc_mem
+
+                    _acc_mem.get_memory_info = _patched_gmi  # type: ignore[attr-defined]
+                    _acc_mem.empty_host_cache = lambda: None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                try:
+                    import torch.accelerator.random as _acc_rand
+
+                    _acc_rand.get_rng_state = lambda device=None: (
+                        torch.npu.get_rng_state(device) if hasattr(torch, "npu") else torch.get_rng_state()
+                    )
+                    _acc_rand.get_rng_state_all = lambda: [
+                        (torch.npu.get_rng_state(d) if hasattr(torch, "npu") else torch.get_rng_state())
+                        for d in range(torch.npu.device_count() if hasattr(torch, "npu") else 1)
+                    ]
+                    _acc_rand.initial_seed = lambda device=None: torch.initial_seed()
+                except Exception:
+                    pass
 
                 # Also patch _get_device_index
                 try:
@@ -353,7 +441,8 @@ def _setup_torch_npu_module() -> None:
         npu_module.is_available = device_mod.is_available  # type: ignore[attr-defined]
         npu_module.device_count = device_mod.device_count  # type: ignore[attr-defined]
         npu_module.current_device = device_mod.current_device  # type: ignore[attr-defined]
-        npu_module.set_device = lambda device: None  # type: ignore[attr-defined]
+
+        npu_module.set_device = device_mod.set_device  # type: ignore[attr-defined]
         npu_module.get_device_name = device_mod.get_device_name  # type: ignore[attr-defined]
 
         def _get_props(device=None):
@@ -363,23 +452,38 @@ def _setup_torch_npu_module() -> None:
         npu_module.get_device_properties = _get_props  # type: ignore[attr-defined]
         npu_module.get_device_capability = lambda device=None: (1, 0)  # type: ignore[attr-defined]
         npu_module.empty_cache = device_mod.empty_cache  # type: ignore[attr-defined]
+        npu_module.empty_host_cache = lambda: None  # type: ignore[attr-defined]
         npu_module.synchronize = device_mod.synchronize  # type: ignore[attr-defined]
+
+        def _get_mem_info(device=None):
+            if hasattr(device_mod, "mem_get_info"):
+                return device_mod.mem_get_info(device)
+            raw = device_mod.get_device_properties()
+            total = int(raw.get("total_memory", 16 * 1024 * 1024 * 1024))
+            alloc = int(raw.get("allocated_memory", 0))
+            return (max(0, total - alloc), total)
+
+        npu_module.mem_get_info = _get_mem_info  # type: ignore[attr-defined]
+        npu_module.get_memory_info = _get_mem_info  # type: ignore[attr-defined]
         npu_module.memory_allocated = lambda device=None: 0  # type: ignore[attr-defined]
         npu_module.max_memory_allocated = lambda device=None: 0  # type: ignore[attr-defined]
         npu_module.memory_reserved = lambda device=None: 0  # type: ignore[attr-defined]
         npu_module.memory_cached = lambda device=None: 0  # type: ignore[attr-defined]
+        npu_module.max_memory_cached = lambda device=None: 0  # type: ignore[attr-defined]
         npu_module.max_memory_reserved = lambda device=None: 0  # type: ignore[attr-defined]
         npu_module.memory_stats = lambda device=None: {}  # type: ignore[attr-defined]
         npu_module.reset_peak_memory_stats = lambda device=None: None  # type: ignore[attr-defined]
+        npu_module.reset_accumulated_memory_stats = lambda device=None: None  # type: ignore[attr-defined]
+        npu_module.can_device_access_peer = lambda dev, peer_dev: False  # type: ignore[attr-defined]
 
         # RNG — NPU shares host RNG (no separate state)
         npu_module.manual_seed = lambda seed: None  # type: ignore[attr-defined]
         npu_module.manual_seed_all = lambda seed: None  # type: ignore[attr-defined]
         npu_module.seed = lambda: 0  # type: ignore[attr-defined]
-        npu_module.initial_seed = lambda: 0  # type: ignore[attr-defined]
+        npu_module.initial_seed = lambda: torch.initial_seed()  # type: ignore[attr-defined]
         npu_module._is_in_bad_fork = lambda: False  # type: ignore[attr-defined]
-        npu_module.get_rng_state = lambda device=None: torch.empty(0, dtype=torch.uint8)  # type: ignore[attr-defined]
-        npu_module.set_rng_state = lambda state, device=None: None  # type: ignore[attr-defined]
+        npu_module.get_rng_state = lambda device=None: torch.get_rng_state()  # type: ignore[attr-defined]
+        npu_module.set_rng_state = lambda state, device=None: torch.set_rng_state(state) if len(state) > 0 else None  # type: ignore[attr-defined]
 
         # AMP — NPU supports fp16/bf16 (mirrors cuda/xpu)
         npu_module.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16]  # type: ignore[attr-defined]
@@ -402,14 +506,29 @@ def _setup_torch_npu_module() -> None:
         # Device context: torch.npu.device(0) / with torch.npu.device(0):
         class _NPUDeviceContext:
             def __init__(self, device):
-                self.device = torch.device(device) if device is not None else torch.device("npu:0")
+                if device is None:
+                    self.idx = 0
+                elif isinstance(device, str):
+                    d = torch.device(device)
+                    self.idx = d.index if d.index is not None else 0
+                elif isinstance(device, torch.device):
+                    self.idx = device.index if device.index is not None else 0
+                else:
+                    self.idx = int(device)
+                count = device_mod.device_count()
+                if self.idx < 0 or (count > 0 and self.idx >= count):
+                    raise RuntimeError(f"Invalid device index {self.idx}, only {count} NPU device(s) available.")
+                self.device = torch.device(f"npu:{self.idx}")
                 self.prev = None
 
             def __enter__(self):
+                self.prev = device_mod.current_device()
+                device_mod.set_device(self.idx)
                 return self.device
 
             def __exit__(self, *args):
-                pass
+                if self.prev is not None:
+                    device_mod.set_device(self.prev)
 
         npu_module.device = _NPUDeviceContext  # type: ignore[attr-defined]
 
@@ -526,6 +645,16 @@ def _setup_torch_npu_module() -> None:
 
         torch.npu = npu_module  # type: ignore[attr-defined]
         sys.modules["torch.npu"] = npu_module
+    else:
+        _existing_npu = torch.npu
+        if not hasattr(_existing_npu, "get_memory_info"):
+            _existing_npu.get_memory_info = (
+                lambda device=None: device_mod.mem_get_info(device)
+                if hasattr(device_mod, "mem_get_info")
+                else (16 * 1024 * 1024 * 1024, 16 * 1024 * 1024 * 1024)
+            )
+        if not hasattr(_existing_npu, "mem_get_info"):
+            _existing_npu.mem_get_info = _existing_npu.get_memory_info
 
     if not hasattr(torch.backends, "npu"):
         backends_npu = types.ModuleType("torch.backends.npu")
@@ -561,6 +690,10 @@ def _patch_tensor_factories() -> None:
             orig_fn = getattr(torch, name)
 
             def _make_wrapper(fn):
+                # Preserve the original __name__/__qualname__ so introspection,
+                # dynamo graph names, and the OpRegistry canonical matching all
+                # see e.g. "arange" instead of "wrapper".
+                @functools.wraps(fn)
                 def wrapper(*args, **kwargs):
                     dev = kwargs.get("device", None)
                     is_npu = False

@@ -13,6 +13,7 @@ from intel_npu_acceleration.frontend.transformations import (
     fold_scalar_parameter_inputs,
     optimize_ov_model,
     reshape_model_inputs_to_static,
+    transform_quantized_weights,
 )
 
 
@@ -85,3 +86,74 @@ class TestTransformations:
         processed_model = ppp.build()
         assert list(processed_model.inputs[0].get_shape()) == [1, 64, 64, 3]
         assert processed_model.inputs[0].get_element_type() == ov.Type.u8
+
+    def test_transform_quantized_weights_int8(self):
+        class LinearModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(32, 64, bias=False)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        m = LinearModel().eval()
+        import intel_npu_acceleration as npu
+        from intel_npu_acceleration.frontend.compiler import (
+            _convert_to_ov_model,
+            _dequantized_linears,
+            _trace_model,
+        )
+
+        npu.nn.quantize(m, mode="int8")
+
+        x = torch.randn(1, 32)
+        traced = _trace_model(m)
+        with _dequantized_linears(traced):
+            ov_model = _convert_to_ov_model(m, (x,))
+
+        transformed = transform_quantized_weights(ov_model, m)
+
+        ops_types = [op.get_type_name() for op in transformed.get_ops()]
+        assert "Convert" in ops_types
+        assert "Multiply" in ops_types
+
+        # Verify an int8 Constant exists
+        int8_consts = [
+            op for op in transformed.get_ops()
+            if op.get_type_name() == "Constant" and op.get_element_type() == ov.Type.i8
+        ]
+        assert len(int8_consts) >= 1
+
+    def test_transform_quantized_weights_int4(self):
+        class LinearModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(32, 64, bias=False)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        m = LinearModel().eval()
+        import intel_npu_acceleration as npu
+        from intel_npu_acceleration.frontend.compiler import (
+            _convert_to_ov_model,
+            _dequantized_linears,
+            _trace_model,
+        )
+
+        npu.nn.quantize(m, mode="int4")
+
+        x = torch.randn(1, 32)
+        traced = _trace_model(m)
+        with _dequantized_linears(traced):
+            ov_model = _convert_to_ov_model(m, (x,))
+
+        transformed = transform_quantized_weights(ov_model, m)
+
+        # Verify a uint4 Constant exists
+        u4_consts = [
+            op for op in transformed.get_ops()
+            if op.get_type_name() == "Constant" and op.get_element_type() == ov.Type.u4
+        ]
+        assert len(u4_consts) >= 1
+

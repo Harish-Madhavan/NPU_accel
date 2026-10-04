@@ -5,7 +5,7 @@ This module gathers diagnostic metadata about the host operating system, PyTorch
 OpenVINO engine, oneAPI Level Zero driver, physical NPU hardware capabilities, and cache usage.
 """
 
-__all__ = ["get_system_info", "print_info"]
+__all__ = ["get_system_info", "print_info", "self_test"]
 
 import platform
 import sys
@@ -174,6 +174,89 @@ def print_info() -> None:
         f" In-Memory Graph Cache     : {info['in_memory_graph_cache_count']} active model graphs"
     )
     print(banner)
+
+
+def self_test(verbose: bool = True) -> bool:
+    """Run an automated self-test of the Intel NPU acceleration backend.
+
+    Verifies:
+      1. NPU hardware availability and driver status
+      2. PyTorch device integration ('npu' device placement)
+      3. TorchDynamo graph compilation (torch.compile(..., backend='npu'))
+      4. Numerical parity between NPU execution and standard CPU reference
+
+    Returns:
+        bool: True if all verification checks passed, False otherwise.
+    """
+    import time
+
+    import intel_npu_acceleration as npu
+
+    def log(msg: str):
+        if verbose:
+            print(msg)
+
+    banner = "=" * 65
+    log(banner)
+    log("       INTEL NPU ACCELERATION - HARDWARE SELF-TEST")
+    log(banner)
+
+    all_passed = True
+    start_time = time.perf_counter()
+
+    # Step 1: Hardware Availability
+    hw_avail = npu.is_available()
+    dev_name = npu.get_device_name() if hw_avail else "CPU Fallback"
+    if hw_avail:
+        log(f" [PASS] Hardware Probing: Detected '{dev_name}'")
+    else:
+        log(" [WARN] Hardware Probing: Intel NPU not detected. Running CPU fallback.")
+
+    # Step 2: PyTorch Device Integration
+    try:
+        t = torch.randn(2, 4, device="npu")
+        log(f" [PASS] PyTorch Device: torch.Tensor allocated on '{t.device}'")
+    except Exception as e:
+        log(f" [FAIL] PyTorch Device: Failed to create tensor on npu device ({e})")
+        all_passed = False
+
+    # Step 3: Graph Compilation & Numerical Parity
+    try:
+        class MiniModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = torch.nn.Linear(8, 4)
+                self.act = torch.nn.GELU()
+
+            def forward(self, x):
+                return self.act(self.fc(x))
+
+        m = MiniModel().eval()
+        x = torch.randn(2, 8)
+        expected = m(x)
+
+        compiled = npu.compile(m, x)
+        actual = compiled(x)
+
+        if torch.allclose(actual, expected, atol=1e-2, rtol=1e-2):
+            log(" [PASS] Graph Compilation & Numerics: NPU matches PyTorch CPU reference")
+        else:
+            diff = (actual - expected).abs().max().item()
+            log(f" [FAIL] Graph Compilation & Numerics: Discrepancy max diff = {diff}")
+            all_passed = False
+    except Exception as e:
+        log(f" [FAIL] Graph Compilation: {e}")
+        all_passed = False
+
+    elapsed = time.perf_counter() - start_time
+    log("-" * 65)
+    if all_passed:
+        log(f" [SUCCESS] All self-tests passed successfully in {elapsed:.2f}s!")
+    else:
+        log(f" [FAILURE] Some verification checks failed ({elapsed:.2f}s).")
+    log(banner)
+
+    return all_passed
 
 
 if __name__ == "__main__":

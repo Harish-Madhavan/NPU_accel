@@ -54,6 +54,10 @@ jobs:
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install openvino
         pip install ninja pytest pytest-cov build ruff
+        # Decline OpenVINO telemetry on CI runners: its Windows network send
+        # has no timeout and runs in a non-daemon thread, which hangs test
+        # processes indefinitely when the network stalls.
+        opt_in_out --opt_out || true
         cd intel_npu_lib
         python setup.py build_ext --inplace
         # Reuse the inplace-built _C binary instead of compiling a second time:

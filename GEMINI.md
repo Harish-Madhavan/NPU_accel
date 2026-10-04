@@ -32,4 +32,4 @@ python setup.py build_ext --inplace
 # 2. Run Test Suite
 pytest
 ```
-* **Required Standard**: All 120+ test suites must pass with **0 warnings and 0 errors**.
+* **Required Standard**: All 339 tests across 120+ test suites must pass with **0 warnings and 0 errors**.

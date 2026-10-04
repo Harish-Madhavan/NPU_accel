@@ -55,6 +55,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("npu_l1_loss", &npu_l1_loss, "NPU accelerated L1 Loss");
     m.def("npu_l1_loss_backward", &npu_l1_loss_backward, "NPU accelerated L1 Loss Backward");
     m.def("npu_adam_step", &npu_adam_step, "NPU accelerated Adam Optimizer Step");
+    m.def("npu_adamw_step", &npu_adamw_step, "NPU accelerated AdamW Optimizer Step");
     m.def("npu_sgd_step", &npu_sgd_step, "NPU accelerated SGD Optimizer Step");
     m.def("npu_sin", &npu_sin, "NPU accelerated Sine");
     m.def("npu_cos", &npu_cos, "NPU accelerated Cosine");

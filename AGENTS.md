@@ -17,6 +17,7 @@ NPU_accel/
 ├── examples/                  # Standard PyTorch example scripts
 │   ├── mnist_training.py
 │   ├── tiny_llama.py
+│   ├── smollm2.py
 │   ├── async_pipelined_inference.py
 │   ├── benchmark_npu_matmul.py
 │   └── profile_npu_models.py
@@ -40,14 +41,18 @@ NPU_accel/
     │       │   ├── compiler.py
     │       │   ├── dynamo.py  # torch.compile(model, backend="npu")
     │       │   ├── partitioner.py
+    │       │   ├── serialization.py # OpenVINO IR & .blob hardware persistence
     │       │   └── transformations.py
+    │       ├── llm/           # Small Language Model (SLM) hardware pipeline
+    │       │   ├── engine.py  # NPUCausalLM (from_pretrained, generate, stream)
+    │       │   └── model.py   # FusedStatefulAttention & StatefulTransformerBlock
     │       ├── nn/            # Drop-in PyTorch neural network modules
     │       │   ├── modules.py
     │       │   └── stateful_kv.py
     │       ├── autograd/      # PyTorch autograd Function definitions
     │       │   └── functions.py
     │       └── _functional/   # C++ dispatch and Python fallbacks
-    └── tests/                 # 120+ unit and integration test suites
+    └── tests/                 # 339 tests across 120+ unit and integration test suites
 ```
 
 ---
@@ -83,7 +88,7 @@ Always run the full test suite before concluding work:
 cd intel_npu_lib
 pytest
 ```
-* **Success Criteria**: 100% tests passing (120+ suites) with **0 errors and 0 warnings**.
+* **Success Criteria**: 100% tests passing (339 tests across 120+ suites) with **0 errors and 0 warnings**.
 
 ### 3. Adding a New Operator
 Follow the runbook in [`.agents/skills/add-npu-operator/SKILL.md`](.agents/skills/add-npu-operator/SKILL.md):

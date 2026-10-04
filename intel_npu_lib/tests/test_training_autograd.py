@@ -5,7 +5,7 @@ from torch.testing import assert_close
 
 import intel_npu_acceleration as npu
 import intel_npu_acceleration.functional as F_npu
-from intel_npu_acceleration.optim import NPUSGD, NPUAdam
+from intel_npu_acceleration.optim import NPUSGD, NPUAdam, NPUAdamW
 
 
 class TestTrainingAndOptimizers:
@@ -88,6 +88,25 @@ class TestTrainingAndOptimizers:
 
         for _ in range(5):
             grad = torch.randn(10, 10)
+            p_cpu.grad = grad.clone()
+            p_npu.grad = grad.clone()
+
+            opt_cpu.step()
+            opt_npu.step()
+
+            assert_close(p_npu, p_cpu, atol=1e-2, rtol=1e-2)
+
+    def test_npu_adamw_optimizer_step(self):
+        """Verify NPUAdamW optimization step with decoupled weight decay against torch.optim.AdamW."""
+        torch.manual_seed(42)
+        p_cpu = torch.randn(8, 8, requires_grad=True)
+        p_npu = p_cpu.detach().clone().requires_grad_(True)
+
+        opt_cpu = torch.optim.AdamW([p_cpu], lr=1e-3, weight_decay=1e-2)
+        opt_npu = NPUAdamW([p_npu], lr=1e-3, weight_decay=1e-2)
+
+        for _ in range(5):
+            grad = torch.randn(8, 8)
             p_cpu.grad = grad.clone()
             p_npu.grad = grad.clone()
 
@@ -205,3 +224,70 @@ class TestTrainingAndOptimizers:
             optimizer.step()
 
         assert loss.item() is not None
+
+    def test_npu_sgd_nesterov_and_dampening(self):
+        """Verify NPUSGD with dampening and nesterov matches torch.optim.SGD."""
+        torch.manual_seed(99)
+        p_cpu = torch.randn(6, 6, requires_grad=True)
+        p_npu = p_cpu.detach().clone().requires_grad_(True)
+
+        opt_cpu = torch.optim.SGD([p_cpu], lr=0.02, momentum=0.85, weight_decay=1e-3, nesterov=True)
+        opt_npu = NPUSGD([p_npu], lr=0.02, momentum=0.85, weight_decay=1e-3, nesterov=True)
+
+        for _ in range(4):
+            grad = torch.randn(6, 6)
+            p_cpu.grad = grad.clone()
+            p_npu.grad = grad.clone()
+
+            opt_cpu.step()
+            opt_npu.step()
+
+            assert_close(p_npu, p_cpu, atol=1e-2, rtol=1e-2)
+
+    def test_npu_sgd_zero_momentum(self):
+        """Verify NPUSGD with momentum=0 matches torch.optim.SGD standard gradient descent."""
+        torch.manual_seed(77)
+        p_cpu = torch.randn(5, 5, requires_grad=True)
+        p_npu = p_cpu.detach().clone().requires_grad_(True)
+
+        opt_cpu = torch.optim.SGD([p_cpu], lr=0.01, momentum=0.0, weight_decay=1e-4)
+        opt_npu = NPUSGD([p_npu], lr=0.01, momentum=0.0, weight_decay=1e-4)
+
+        for _ in range(3):
+            grad = torch.randn(5, 5)
+            p_cpu.grad = grad.clone()
+            p_npu.grad = grad.clone()
+
+            opt_cpu.step()
+            opt_npu.step()
+
+            assert_close(p_npu, p_cpu, atol=1e-2, rtol=1e-2)
+
+    def test_matmul_autograd_backward_3d_batched(self):
+        """Verify 3D batched matmul backward pass runs fused on Level Zero."""
+        a_cpu = torch.randn(2, 4, 8, requires_grad=True)
+        b_cpu = torch.randn(2, 8, 6, requires_grad=True)
+
+        a_npu = a_cpu.detach().clone().requires_grad_(True)
+        b_npu = b_cpu.detach().clone().requires_grad_(True)
+
+        out_cpu = torch.matmul(a_cpu, b_cpu)
+        out_npu = npu.matmul(a_npu, b_npu)
+        assert_close(out_npu, out_cpu, atol=1e-3, rtol=1e-3)
+
+        grad_out = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_out)
+        out_npu.backward(grad_out)
+
+        assert_close(a_npu.grad, a_cpu.grad, atol=1e-2, rtol=1e-2)
+        assert_close(b_npu.grad, b_cpu.grad, atol=1e-2, rtol=1e-2)
+
+    def test_npu_device_context_manager(self):
+        """Verify torch.npu.device context manager switching and restoration."""
+        orig = npu.current_device()
+        with torch.npu.device(0) as dev:
+            assert npu.current_device() == 0
+            assert dev.type == "npu"
+            assert dev.index == 0
+        assert npu.current_device() == orig
+

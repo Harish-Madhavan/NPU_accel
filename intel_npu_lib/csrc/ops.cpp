@@ -3,7 +3,6 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset1.hpp>
 #include <openvino/opsets/opset13.hpp>  // For ScaledDotProductAttention
@@ -11,7 +10,6 @@
 #include <openvino/opsets/opset4.hpp>   // For Swish (SiLU)
 #include <openvino/opsets/opset5.hpp>   // For LogSoftmax
 #include <openvino/opsets/opset8.hpp>   // For GELU
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -64,21 +62,43 @@ static ov::Shape get_ov_shape(const torch::Tensor& t) {
     return shape;
 }
 
+static inline std::string format_int_list(const std::string& prefix, const std::vector<int64_t>& vec) {
+    std::string s;
+    s.reserve(prefix.size() + vec.size() * 8);
+    s += prefix;
+    for (auto v : vec) {
+        s += std::to_string(v);
+        s += ',';
+    }
+    return s;
+}
+
 std::string get_shape_str(const torch::Tensor& t) {
-    std::stringstream ss;
-    for (auto s : t.sizes()) ss << s << "x";
-    return ss.str();
+    std::string s;
+    s.reserve(t.dim() * 8);
+    for (auto d : t.sizes()) {
+        s += std::to_string(d);
+        s += 'x';
+    }
+    return s;
 }
 
 std::string get_key(const std::string& op_name, const std::vector<torch::Tensor>& inputs,
                     const std::string& extra_args = "") {
-    std::stringstream ss;
-    ss << op_name << "_";
+    std::string key;
+    key.reserve(op_name.size() + inputs.size() * 24 + extra_args.size() + 8);
+    key += op_name;
+    key += '_';
     for (const auto& t : inputs) {
-        ss << get_shape_str(t) << t.scalar_type() << "_";
+        for (auto s : t.sizes()) {
+            key += std::to_string(s);
+            key += 'x';
+        }
+        key += c10::toString(t.scalar_type());
+        key += '_';
     }
-    ss << extra_args;
-    return ss.str();
+    key += extra_args;
+    return key;
 }
 
 // Constant::create cannot deduce braced lists holding int64_t variables
@@ -163,6 +183,75 @@ torch::Tensor execute_op(const std::string& key, std::shared_ptr<ov::Model> mode
     }
     // Unreachable — TORCH_CHECK always throws; silences C4715.
     return torch::Tensor();
+}
+
+std::vector<torch::Tensor> execute_multi_output_op(const std::string& key,
+                                                   std::shared_ptr<ov::Model> model,
+                                                   const std::vector<torch::Tensor>& inputs) {
+    try {
+        auto& backend = NPUBackend::getInstance();
+        const std::string full_key = key + "_" + backend.getCompileConfigKey();
+        backend.getOrCompileModel(full_key, model);
+        auto infer_request = backend.getOrCachedInferRequest(full_key);
+
+        std::vector<torch::Tensor> contiguous_inputs;
+        contiguous_inputs.reserve(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            contiguous_inputs.push_back(ensure_contiguous(inputs[i]));
+        }
+
+        for (size_t i = 0; i < contiguous_inputs.size(); ++i) {
+            const auto& t = contiguous_inputs[i];
+            ov::element::Type ov_type = torch_dtype_to_ov(t);
+            ov::Shape shape(t.sizes().begin(), t.sizes().end());
+
+            ov::Tensor input_tensor(ov_type, shape, t.data_ptr());
+            infer_request.set_input_tensor(i, input_tensor);
+        }
+
+        auto compiled_model = infer_request.get_compiled_model();
+        size_t num_outputs = compiled_model.outputs().size();
+        std::vector<torch::Tensor> results(num_outputs);
+        std::vector<bool> preallocated(num_outputs, false);
+
+        for (size_t i = 0; i < num_outputs; ++i) {
+            auto out_port = compiled_model.output(i);
+            auto partial_shape = out_port.get_partial_shape();
+            if (partial_shape.is_static()) {
+                auto output_shape = partial_shape.get_shape();
+                auto output_ov_type = out_port.get_element_type();
+                std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
+                torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
+                results[i] = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
+                ov::Tensor output_tensor(output_ov_type, output_shape, results[i].data_ptr());
+                infer_request.set_output_tensor(i, output_tensor);
+                preallocated[i] = true;
+            }
+        }
+
+        infer_request.infer();
+
+        for (size_t i = 0; i < num_outputs; ++i) {
+            if (!preallocated[i]) {
+                auto output_tensor = infer_request.get_output_tensor(i);
+                auto output_shape = output_tensor.get_shape();
+                auto output_ov_type = output_tensor.get_element_type();
+
+                std::vector<int64_t> torch_shape(output_shape.begin(), output_shape.end());
+                torch::Dtype torch_out_dtype = ov_dtype_to_torch(output_ov_type);
+
+                results[i] = torch::empty(torch_shape, torch::TensorOptions().dtype(torch_out_dtype));
+                std::memcpy(results[i].data_ptr(), output_tensor.data(), output_tensor.get_byte_size());
+            }
+        }
+
+        return results;
+
+    } catch (const std::exception& e) {
+        TORCH_CHECK(false,
+                    "[Intel NPU] Multi-output execution failed for key '" + key + "': " + std::string(e.what()));
+    }
+    return {};
 }
 
 template <typename OpT>
@@ -372,10 +461,7 @@ torch::Tensor npu_linear(torch::Tensor input, torch::Tensor weight, torch::Tenso
 }
 
 torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutation) {
-    std::stringstream ss;
-    ss << "transpose_";
-    for (auto p : permutation) ss << p << ",";
-    std::string key = get_key("transpose", {input}, ss.str());
+    std::string key = get_key("transpose", {input}, format_int_list("transpose_", permutation));
     auto arg_input =
         std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto perm_const =
@@ -386,10 +472,7 @@ torch::Tensor npu_transpose(torch::Tensor input, std::vector<int64_t> permutatio
 }
 
 torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
-    std::stringstream ss;
-    ss << "reshape_";
-    for (auto s : shape) ss << s << ",";
-    std::string key = get_key("reshape", {input}, ss.str());
+    std::string key = get_key("reshape", {input}, format_int_list("reshape_", shape));
     auto arg_input =
         std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto shape_const =
@@ -400,10 +483,7 @@ torch::Tensor npu_reshape(torch::Tensor input, std::vector<int64_t> shape) {
 }
 
 torch::Tensor npu_squeeze(torch::Tensor input, std::vector<int64_t> dims) {
-    std::stringstream ss;
-    ss << "squeeze_";
-    for (auto d : dims) ss << d << ",";
-    std::string key = get_key("squeeze", {input}, ss.str());
+    std::string key = get_key("squeeze", {input}, format_int_list("squeeze_", dims));
     auto arg_input =
         std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
 
@@ -421,10 +501,7 @@ torch::Tensor npu_squeeze(torch::Tensor input, std::vector<int64_t> dims) {
 }
 
 torch::Tensor npu_unsqueeze(torch::Tensor input, std::vector<int64_t> dims) {
-    std::stringstream ss;
-    ss << "unsqueeze_";
-    for (auto d : dims) ss << d << ",";
-    std::string key = get_key("unsqueeze", {input}, ss.str());
+    std::string key = get_key("unsqueeze", {input}, format_int_list("unsqueeze_", dims));
     auto arg_input =
         std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
     auto axes_const = ov::opset1::Constant::create(ov::element::i64, ov::Shape{dims.size()}, dims);
@@ -477,9 +554,14 @@ torch::Tensor npu_stack(std::vector<torch::Tensor> tensors, int64_t dim) {
 }
 
 torch::Tensor npu_mean(torch::Tensor input, std::vector<int64_t> dim, bool keepdim) {
-    std::stringstream ss;
-    for (auto d : dim) ss << d << ",";
-    std::string key = get_key("mean", {input}, ss.str() + std::to_string(keepdim));
+    std::string extra;
+    extra.reserve(32);
+    for (auto d : dim) {
+        extra += std::to_string(d);
+        extra += ",";
+    }
+    extra += keepdim ? "1" : "0";
+    std::string key = get_key("mean", {input}, extra);
 
     auto arg_input =
         std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(input), get_ov_shape(input));
@@ -513,11 +595,14 @@ torch::Tensor npu_index_select(torch::Tensor input, int64_t dim, torch::Tensor i
 torch::Tensor npu_scaled_dot_product_attention(torch::Tensor query, torch::Tensor key,
                                                torch::Tensor value, torch::Tensor attn_mask,
                                                double dropout_p, bool is_causal, double scale) {
-    std::stringstream ss;
-    ss << "sdpa_" << is_causal << "_" << scale << "_";
-    if (attn_mask.defined() && attn_mask.numel() > 0) ss << "mask_";
+    std::string extra;
+    extra.reserve(64);
+    extra += "sdpa_";
+    extra += is_causal ? "1_" : "0_";
+    extra += std::to_string(scale);
+    extra += "_";
+    if (attn_mask.defined() && attn_mask.numel() > 0) extra += "mask_";
 
-    std::string extra = ss.str();
     std::vector<torch::Tensor> key_inputs = {query, key, value};
     if (attn_mask.defined() && attn_mask.numel() > 0) key_inputs.push_back(attn_mask);
 
@@ -567,14 +652,15 @@ torch::Tensor npu_scaled_dot_product_attention(torch::Tensor query, torch::Tenso
 torch::Tensor npu_conv2d(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
                          std::vector<int64_t> stride, std::vector<int64_t> padding,
                          std::vector<int64_t> dilation, int64_t groups) {
-    std::stringstream ss;
-    ss << "conv2d_";
-    for (auto s : stride) ss << s << ",";
-    for (auto p : padding) ss << p << ",";
-    for (auto d : dilation) ss << d << ",";
-    ss << groups;
+    std::string extra;
+    extra.reserve(64);
+    extra += "conv2d_";
+    for (auto s : stride) { extra += std::to_string(s); extra += ","; }
+    for (auto p : padding) { extra += std::to_string(p); extra += ","; }
+    for (auto d : dilation) { extra += std::to_string(d); extra += ","; }
+    extra += std::to_string(groups);
 
-    std::string key = get_key("conv2d", {input, weight}, ss.str());
+    std::string key = get_key("conv2d", {input, weight}, extra);
     if (bias.defined() && bias.numel() > 0) key += "_bias";
 
     ov::element::Type ov_type = torch_dtype_to_ov(input);
@@ -883,6 +969,28 @@ std::vector<torch::Tensor> npu_matmul_backward(torch::Tensor grad_output, torch:
     auto a_dim = a.dim();
     auto b_dim = b.dim();
 
+    if (a_dim >= 2 && b_dim >= 2 && a_dim == b_dim && grad_output.dim() == a_dim) {
+        std::string key = get_key("matmul_backward", {grad_output, a, b});
+        auto ov_g_type = torch_dtype_to_ov(grad_output);
+        auto ov_a_type = torch_dtype_to_ov(a);
+        auto ov_b_type = torch_dtype_to_ov(b);
+
+        auto arg_g = std::make_shared<ov::opset1::Parameter>(ov_g_type, get_ov_shape(grad_output));
+        auto arg_a = std::make_shared<ov::opset1::Parameter>(ov_a_type, get_ov_shape(a));
+        auto arg_b = std::make_shared<ov::opset1::Parameter>(ov_b_type, get_ov_shape(b));
+
+        // grad_a = grad_output @ b^T
+        auto grad_a = std::make_shared<ov::opset1::MatMul>(arg_g, arg_b, false, true);
+        // grad_b = a^T @ grad_output
+        auto grad_b = std::make_shared<ov::opset1::MatMul>(arg_a, arg_g, true, false);
+
+        auto model = std::make_shared<ov::Model>(
+            ov::OutputVector{grad_a, grad_b},
+            ov::ParameterVector{arg_g, arg_a, arg_b}
+        );
+        return execute_multi_output_op(key, model, {grad_output, a, b});
+    }
+
     std::vector<int64_t> perm_a(a_dim);
     for (int64_t i = 0; i < a_dim; ++i) perm_a[i] = i;
     if (a_dim >= 2) std::swap(perm_a[a_dim - 1], perm_a[a_dim - 2]);
@@ -912,7 +1020,12 @@ std::vector<torch::Tensor> npu_linear_backward(torch::Tensor grad_output, torch:
     }
     if (needs_bias_grad) {
         auto grad_out_2d = grad_output.reshape({-1, grad_output.size(-1)});
-        grad_bias = npu_mean(grad_out_2d, {0}, false) * static_cast<float>(grad_out_2d.size(0));
+        std::string key = get_key("linear_backward_bias", {grad_out_2d});
+        auto arg_dy = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_out_2d), get_ov_shape(grad_out_2d));
+        auto axes = ov::opset1::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+        auto sum = std::make_shared<ov::opset1::ReduceSum>(arg_dy, axes, false);
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{sum}, ov::ParameterVector{arg_dy});
+        grad_bias = execute_op(key, model, {grad_out_2d});
     }
     return {grad_input, grad_weight, grad_bias};
 }
@@ -1018,56 +1131,41 @@ RmsNormBwdNodes build_rmsnorm_bwd_core(const ov::Output<ov::Node>& arg_x,
 }  // namespace
 
 std::vector<torch::Tensor> npu_rmsnorm_backward(torch::Tensor grad_output, torch::Tensor input, torch::Tensor weight, float epsilon) {
-    // RMSNorm backward as Level Zero graphs (previously torch-CPU composition):
+    // RMSNorm backward as a single fused multi-output Level Zero graph:
     //   rms = sqrt(mean(x^2) + eps); xn = x / rms
     //   grad_w = sum(go * xn) over leading dims
     //   grad_in = (go * w - xn * mean(go * w * xn)) / rms
     int64_t rank = input.dim();
     ov::element::Type ov_type = torch_dtype_to_ov(input);
     std::string suffix = std::to_string(epsilon);
+    std::string key = get_key("rmsnorm_backward", {grad_output, input, weight}, suffix);
 
-    // --- grad_input graph ---
-    torch::Tensor grad_in;
-    {
-        std::string key = get_key("rmsnorm_backward_input", {grad_output, input, weight}, suffix);
-        auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
-        auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
-        auto arg_w = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
-        auto core = build_rmsnorm_bwd_core(arg_x, rank, epsilon);
-        auto dl_dxn = std::make_shared<ov::opset1::Multiply>(arg_go, arg_w);
-        auto axes_last = i64_const({rank - 1});
-        auto correction = std::make_shared<ov::opset1::ReduceMean>(
-            std::make_shared<ov::opset1::Multiply>(dl_dxn, core.xn), axes_last, true);
-        auto grad = std::make_shared<ov::opset1::Divide>(
-            std::make_shared<ov::opset1::Subtract>(
-                dl_dxn, std::make_shared<ov::opset1::Multiply>(core.xn, correction)),
-            core.rms);
-        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
-                                                 ov::ParameterVector{arg_go, arg_x, arg_w});
-        grad_in = execute_op(key, model, {grad_output, input, weight});
+    auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
+    auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
+    auto arg_w = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(weight));
+
+    auto core = build_rmsnorm_bwd_core(arg_x, rank, epsilon);
+    auto dl_dxn = std::make_shared<ov::opset1::Multiply>(arg_go, arg_w);
+    auto axes_last = i64_const({rank - 1});
+    auto correction = std::make_shared<ov::opset1::ReduceMean>(
+        std::make_shared<ov::opset1::Multiply>(dl_dxn, core.xn), axes_last, true);
+    auto grad_in_node = std::make_shared<ov::opset1::Divide>(
+        std::make_shared<ov::opset1::Subtract>(
+            dl_dxn, std::make_shared<ov::opset1::Multiply>(core.xn, correction)),
+        core.rms);
+
+    std::shared_ptr<ov::Node> grad_w_node = std::make_shared<ov::opset1::Multiply>(arg_go, core.xn);
+    if (rank > 1) {
+        std::vector<int64_t> axes_lead(rank - 1);
+        std::iota(axes_lead.begin(), axes_lead.end(), 0);
+        auto axes = ov::opset1::Constant::create(ov::element::i64,
+                                                 ov::Shape{axes_lead.size()}, axes_lead);
+        grad_w_node = std::make_shared<ov::opset1::ReduceSum>(grad_w_node, axes, false);
     }
 
-    // --- grad_weight graph ---
-    torch::Tensor grad_w;
-    {
-        std::string key = get_key("rmsnorm_backward_weight", {grad_output, input, weight}, suffix);
-        auto arg_go = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(grad_output));
-        auto arg_x = std::make_shared<ov::opset1::Parameter>(ov_type, get_ov_shape(input));
-        std::shared_ptr<ov::Node> gw = std::make_shared<ov::opset1::Multiply>(
-            arg_go, build_rmsnorm_bwd_core(arg_x, rank, epsilon).xn);
-        if (rank > 1) {
-            std::vector<int64_t> axes_lead(rank - 1);
-            std::iota(axes_lead.begin(), axes_lead.end(), 0);
-            auto axes = ov::opset1::Constant::create(ov::element::i64,
-                                                     ov::Shape{axes_lead.size()}, axes_lead);
-            gw = std::make_shared<ov::opset1::ReduceSum>(gw, axes, false);
-        }
-        auto model = std::make_shared<ov::Model>(ov::OutputVector{gw},
-                                                 ov::ParameterVector{arg_go, arg_x});
-        grad_w = execute_op(key, model, {grad_output, input});
-    }
-
-    return {grad_in, grad_w};
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad_in_node, grad_w_node},
+                                             ov::ParameterVector{arg_go, arg_x, arg_w});
+    return execute_multi_output_op(key, model, {grad_output, input, weight});
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,10 +1388,12 @@ std::vector<torch::Tensor> npu_conv2d_backward(torch::Tensor grad_output, torch:
                                                std::vector<int64_t> padding, std::vector<int64_t> dilation,
                                                int64_t groups, bool needs_input_grad,
                                                bool needs_weight_grad, bool needs_bias_grad) {
-    std::stringstream ss;
-    ss << "s" << stride[0] << "x" << stride[1] << "_p" << padding[0] << "x" << padding[1]
-       << "_d" << dilation[0] << "x" << dilation[1] << "_g" << groups;
-    std::string cfg = ss.str();
+    std::string cfg;
+    cfg.reserve(64);
+    cfg += "s"; cfg += std::to_string(stride[0]); cfg += "x"; cfg += std::to_string(stride[1]);
+    cfg += "_p"; cfg += std::to_string(padding[0]); cfg += "x"; cfg += std::to_string(padding[1]);
+    cfg += "_d"; cfg += std::to_string(dilation[0]); cfg += "x"; cfg += std::to_string(dilation[1]);
+    cfg += "_g"; cfg += std::to_string(groups);
 
     int64_t N = input.size(0);
     int64_t Ci = input.size(1);
@@ -1573,16 +1673,6 @@ torch::Tensor npu_triu(torch::Tensor a, int64_t diagonal) {
 // Elementwise backward kernels (Level Zero graphs / NPU compositions)
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// Elementwise multiply by a host scalar through the NPU multiply kernel.
-torch::Tensor mul_scalar_local(const torch::Tensor& t, double value) {
-    auto scalar = torch::full({}, value, t.options());
-    return npu_mul(t, scalar);
-}
-
-}  // namespace
-
 torch::Tensor npu_sin_backward(torch::Tensor grad_output, torch::Tensor input) {
     return npu_mul(grad_output, npu_cos(input));
 }
@@ -1597,7 +1687,7 @@ torch::Tensor npu_exp_backward(torch::Tensor grad_output, torch::Tensor input) {
 
 torch::Tensor npu_sqrt_backward(torch::Tensor grad_output, torch::Tensor input) {
     // d/dx sqrt(x) = 0.5 / sqrt(x)
-    return mul_scalar_local(npu_mul(grad_output, npu_rsqrt(input)), 0.5);
+    return mul_scalar(npu_mul(grad_output, npu_rsqrt(input)), 0.5);
 }
 
 torch::Tensor npu_abs_backward(torch::Tensor grad_output, torch::Tensor input) {
@@ -1607,7 +1697,7 @@ torch::Tensor npu_abs_backward(torch::Tensor grad_output, torch::Tensor input) {
 torch::Tensor npu_rsqrt_backward(torch::Tensor grad_output, torch::Tensor input) {
     // d/dx x^(-0.5) = -0.5 * x^(-1.5)
     auto exp = torch::full({}, -1.5, input.options());
-    return mul_scalar_local(npu_mul(grad_output, npu_pow(input, exp)), -0.5);
+    return mul_scalar(npu_mul(grad_output, npu_pow(input, exp)), -0.5);
 }
 
 torch::Tensor npu_pow_backward(torch::Tensor grad_output, torch::Tensor a, torch::Tensor exponent) {
@@ -1639,7 +1729,7 @@ torch::Tensor npu_clamp_backward(torch::Tensor grad_output, torch::Tensor input,
 }
 
 std::vector<torch::Tensor> npu_where_backward(torch::Tensor grad_output, torch::Tensor condition) {
-    // grad_a = go * mask; grad_b = go * (1 - mask). Two graphs, one helper.
+    // grad_a = go * mask; grad_b = go * (1 - mask) in a single fused Level Zero graph.
     std::string key = get_key("where_backward", {grad_output, condition});
     auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad_output),
                                                          get_ov_shape(grad_output));
@@ -1648,21 +1738,12 @@ std::vector<torch::Tensor> npu_where_backward(torch::Tensor grad_output, torch::
     auto elem_type = arg_g->get_element_type();
     auto mask = std::make_shared<ov::opset1::Convert>(arg_c, elem_type);
     auto one = ov::opset1::Constant::create(elem_type, ov::Shape{}, {1.0f});
-    torch::Tensor grad_a, grad_b;
-    {
-        auto grad = std::make_shared<ov::opset1::Multiply>(arg_g, mask);
-        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
-                                                 ov::ParameterVector{arg_g, arg_c});
-        grad_a = execute_op(key + "_a", model, {grad_output, condition});
-    }
-    {
-        auto grad = std::make_shared<ov::opset1::Multiply>(
-            arg_g, std::make_shared<ov::opset1::Subtract>(one, mask));
-        auto model = std::make_shared<ov::Model>(ov::OutputVector{grad},
-                                                 ov::ParameterVector{arg_g, arg_c});
-        grad_b = execute_op(key + "_b", model, {grad_output, condition});
-    }
-    return {grad_a, grad_b};
+    auto grad_a = std::make_shared<ov::opset1::Multiply>(arg_g, mask);
+    auto grad_b = std::make_shared<ov::opset1::Multiply>(
+        arg_g, std::make_shared<ov::opset1::Subtract>(one, mask));
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{grad_a, grad_b},
+                                             ov::ParameterVector{arg_g, arg_c});
+    return execute_multi_output_op(key, model, {grad_output, condition});
 }
 
 torch::Tensor npu_triu_backward(torch::Tensor grad_output, int64_t diagonal) {
@@ -1779,38 +1860,162 @@ std::vector<torch::Tensor> npu_adam_step(torch::Tensor param, torch::Tensor grad
         ov::ParameterVector{arg_p, arg_g, arg_m, arg_v}
     );
 
-    // Execute combined optimizer step
-    auto res_p = execute_op(key + "_p", std::make_shared<ov::Model>(ov::OutputVector{new_p}, ov::ParameterVector{arg_p, arg_g, arg_m, arg_v}), {param, grad, exp_avg, exp_avg_sq});
-    auto res_m = execute_op(key + "_m", std::make_shared<ov::Model>(ov::OutputVector{new_m}, ov::ParameterVector{arg_p, arg_g, arg_m, arg_v}), {param, grad, exp_avg, exp_avg_sq});
-    auto res_v = execute_op(key + "_v", std::make_shared<ov::Model>(ov::OutputVector{new_v}, ov::ParameterVector{arg_p, arg_g, arg_m, arg_v}), {param, grad, exp_avg, exp_avg_sq});
-
-    return {res_p, res_m, res_v};
+    // Execute single fused multi-output optimizer step on Level Zero NPU
+    return execute_multi_output_op(key, model, {param, grad, exp_avg, exp_avg_sq});
 }
+
+std::vector<torch::Tensor> npu_adamw_step(torch::Tensor param, torch::Tensor grad,
+                                          torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+                                          double lr, double beta1, double beta2, double eps,
+                                          double weight_decay, int64_t step) {
+    std::string extra = std::to_string(lr) + "_" + std::to_string(beta1) + "_" +
+                        std::to_string(beta2) + "_" + std::to_string(eps) + "_" +
+                        std::to_string(weight_decay) + "_" + std::to_string(step);
+    std::string key = get_key("adamw_step", {param, grad, exp_avg, exp_avg_sq}, extra);
+
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(param), get_ov_shape(param));
+    auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad), get_ov_shape(grad));
+    auto arg_m = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(exp_avg), get_ov_shape(exp_avg));
+    auto arg_v = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(exp_avg_sq), get_ov_shape(exp_avg_sq));
+
+    auto elem_type = arg_p->get_element_type();
+
+    // AdamW: pure gradient (weight decay is decoupled and applied directly to param)
+    // m_t = beta1 * m_{t-1} + (1 - beta1) * g
+    auto b1_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(beta1)});
+    auto b1_inv = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(1.0 - beta1)});
+    auto new_m = std::make_shared<ov::opset1::Add>(
+        std::make_shared<ov::opset1::Multiply>(b1_c, arg_m),
+        std::make_shared<ov::opset1::Multiply>(b1_inv, arg_g)
+    );
+
+    // v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
+    auto b2_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(beta2)});
+    auto b2_inv = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(1.0 - beta2)});
+    auto g_sq = std::make_shared<ov::opset1::Multiply>(arg_g, arg_g);
+    auto new_v = std::make_shared<ov::opset1::Add>(
+        std::make_shared<ov::opset1::Multiply>(b2_c, arg_v),
+        std::make_shared<ov::opset1::Multiply>(b2_inv, g_sq)
+    );
+
+    // Bias corrections
+    float bias_correction1 = static_cast<float>(1.0 - std::pow(beta1, step));
+    float bias_correction2 = static_cast<float>(1.0 - std::pow(beta2, step));
+    auto bc1_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {bias_correction1});
+    auto bc2_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {bias_correction2});
+
+    auto m_hat = std::make_shared<ov::opset1::Divide>(new_m, bc1_c);
+    auto v_hat = std::make_shared<ov::opset1::Divide>(new_v, bc2_c);
+
+    auto eps_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(eps)});
+    auto sqrt_v = std::make_shared<ov::opset1::Sqrt>(v_hat);
+    auto denom = std::make_shared<ov::opset1::Add>(sqrt_v, eps_c);
+    auto step_val = std::make_shared<ov::opset1::Divide>(m_hat, denom);
+
+    auto lr_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(lr)});
+    auto update = std::make_shared<ov::opset1::Multiply>(lr_c, step_val);
+
+    // Decoupled weight decay: p_t = p_{t-1} * (1 - lr * weight_decay) - update
+    std::shared_ptr<ov::Node> p_decayed = arg_p;
+    if (weight_decay != 0.0) {
+        float factor = static_cast<float>(1.0 - lr * weight_decay);
+        auto factor_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {factor});
+        p_decayed = std::make_shared<ov::opset1::Multiply>(arg_p, factor_c);
+    }
+    auto new_p = std::make_shared<ov::opset1::Subtract>(p_decayed, update);
+
+    auto model = std::make_shared<ov::Model>(
+        ov::OutputVector{new_p, new_m, new_v},
+        ov::ParameterVector{arg_p, arg_g, arg_m, arg_v}
+    );
+
+    return execute_multi_output_op(key, model, {param, grad, exp_avg, exp_avg_sq});
+}
+
 
 std::vector<torch::Tensor> npu_sgd_step(torch::Tensor param, torch::Tensor grad,
                                         torch::Tensor momentum_buffer, double lr,
                                         double momentum, double weight_decay,
                                         double dampening, bool nesterov, bool has_momentum_buffer) {
-    torch::Tensor effective_grad = grad;
+    std::string extra;
+    extra.reserve(64);
+    extra += std::to_string(lr);
+    extra += "_";
+    extra += std::to_string(momentum);
+    extra += "_";
+    extra += std::to_string(weight_decay);
+    extra += "_";
+    extra += std::to_string(dampening);
+    extra += "_";
+    extra += nesterov ? "1" : "0";
+    extra += "_";
+    extra += has_momentum_buffer ? "1" : "0";
+
+    auto elem_type = torch_dtype_to_ov(param);
+    auto p_shape = get_ov_shape(param);
+    auto g_shape = get_ov_shape(grad);
+
+    auto arg_p = std::make_shared<ov::opset1::Parameter>(elem_type, p_shape);
+    auto arg_g = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(grad), g_shape);
+
+    std::shared_ptr<ov::Node> effective_grad = arg_g;
     if (weight_decay != 0.0) {
-        effective_grad = npu_add(grad, param * weight_decay);
+        auto wd_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(weight_decay)});
+        auto decay = std::make_shared<ov::opset1::Multiply>(arg_p, wd_c);
+        effective_grad = std::make_shared<ov::opset1::Add>(arg_g, decay);
     }
-    torch::Tensor new_buf;
-    torch::Tensor update_dir;
+
+    auto lr_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(lr)});
+
     if (momentum != 0.0) {
+        std::shared_ptr<ov::Node> new_buf;
+        ov::ParameterVector params = {arg_p, arg_g};
+        std::vector<torch::Tensor> inputs = {param, grad};
+
         if (!has_momentum_buffer) {
-            new_buf = effective_grad.clone();
+            new_buf = effective_grad;
         } else {
-            new_buf = npu_add(momentum_buffer * momentum, effective_grad * (1.0 - dampening));
+            auto buf_shape = get_ov_shape(momentum_buffer);
+            auto arg_buf = std::make_shared<ov::opset1::Parameter>(torch_dtype_to_ov(momentum_buffer), buf_shape);
+            params.push_back(arg_buf);
+            inputs.push_back(momentum_buffer);
+
+            auto mom_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(momentum)});
+            auto damp_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(1.0 - dampening)});
+
+            auto term1 = std::make_shared<ov::opset1::Multiply>(arg_buf, mom_c);
+            auto term2 = std::make_shared<ov::opset1::Multiply>(effective_grad, damp_c);
+            new_buf = std::make_shared<ov::opset1::Add>(term1, term2);
         }
+
+        std::shared_ptr<ov::Node> update_dir;
         if (nesterov) {
-            update_dir = npu_add(effective_grad, new_buf * momentum);
+            auto mom_c = ov::opset1::Constant::create(elem_type, ov::Shape{}, {static_cast<float>(momentum)});
+            auto nest_term = std::make_shared<ov::opset1::Multiply>(new_buf, mom_c);
+            update_dir = std::make_shared<ov::opset1::Add>(effective_grad, nest_term);
         } else {
             update_dir = new_buf;
         }
+
+        auto step_val = std::make_shared<ov::opset1::Multiply>(update_dir, lr_c);
+        auto new_p = std::make_shared<ov::opset1::Subtract>(arg_p, step_val);
+
+        std::string key = get_key("sgd_step", inputs, extra);
+        auto model = std::make_shared<ov::Model>(
+            ov::OutputVector{new_p, new_buf},
+            params
+        );
+        return execute_multi_output_op(key, model, inputs);
     } else {
-        update_dir = effective_grad;
+        auto step_val = std::make_shared<ov::opset1::Multiply>(effective_grad, lr_c);
+        auto new_p = std::make_shared<ov::opset1::Subtract>(arg_p, step_val);
+
+        std::string key = get_key("sgd_step", {param, grad}, extra);
+        auto model = std::make_shared<ov::Model>(
+            ov::OutputVector{new_p},
+            ov::ParameterVector{arg_p, arg_g}
+        );
+        auto out_p = execute_op(key, model, {param, grad});
+        return {out_p, momentum_buffer};
     }
-    torch::Tensor new_param = npu_sub(param, update_dir * lr);
-    return {new_param, new_buf};
 }

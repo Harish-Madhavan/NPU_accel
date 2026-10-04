@@ -1,7 +1,6 @@
 #include "include/device.h"
 
 #include <iostream>
-#include <sstream>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -38,9 +37,12 @@ bool NPUBackend::isPropertySupported(const std::string& key) const {
 }
 
 std::string NPUBackend::getSupportedPropertiesList() const {
-    std::ostringstream ss;
-    for (const auto& p : m_supported_props) ss << p << " ";
-    return ss.str();
+    std::string res;
+    for (const auto& p : m_supported_props) {
+        res += p;
+        res += " ";
+    }
+    return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +147,16 @@ bool NPUBackend::isAvailable() {
     return m_is_available;
 }
 
+void NPUBackend::updateCompileConfigKey() {
+    std::string hint = "LATENCY";
+    if (m_performance_hint == ov::hint::PerformanceMode::THROUGHPUT) {
+        hint = "THROUGHPUT";
+    } else if (m_performance_hint == ov::hint::PerformanceMode::CUMULATIVE_THROUGHPUT) {
+        hint = "CUMULATIVE_THROUGHPUT";
+    }
+    m_compile_config_key = hint + "_" + m_eager_device;
+}
+
 void NPUBackend::setPerformanceHint(const std::string& hint) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (hint == "THROUGHPUT") {
@@ -154,6 +166,7 @@ void NPUBackend::setPerformanceHint(const std::string& hint) {
     } else {
         m_performance_hint = ov::hint::PerformanceMode::LATENCY;
     }
+    updateCompileConfigKey();
     // Apply immediately so in-flight and future compiles observe it —
     // previously the member was only consulted by the eager compile path.
     if (m_core) {
@@ -172,18 +185,13 @@ std::string NPUBackend::getEagerDevice() const {
 
 std::string NPUBackend::getCompileConfigKey() const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    std::string hint = "LATENCY";
-    if (m_performance_hint == ov::hint::PerformanceMode::THROUGHPUT) {
-        hint = "THROUGHPUT";
-    } else if (m_performance_hint == ov::hint::PerformanceMode::CUMULATIVE_THROUGHPUT) {
-        hint = "CUMULATIVE_THROUGHPUT";
-    }
-    return hint + "_" + m_eager_device;
+    return m_compile_config_key;
 }
 
 void NPUBackend::setEagerDevice(const std::string& device) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_eager_device = device;
+    updateCompileConfigKey();
 }
 
 // ---------------------------------------------------------------------------

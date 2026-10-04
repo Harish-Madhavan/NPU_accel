@@ -101,3 +101,24 @@ for i in range(100):
 # Reset internal hardware variables back to 0 for a new sequence
 npu_model.reset_states()
 ```
+
+---
+
+## 🦙 5. High-Level SLM Engine (`NPUCausalLM`)
+
+For complete transformer decoders (such as `SmolLM2-135M` or `TinyLlama`), `intel_npu_acceleration.llm.NPUCausalLM` automatically constructs fused attention layers with stateful KV caches across all layers, precomputed RoPE tables, and Level Zero hardware binary caching:
+
+```python
+from intel_npu_acceleration.llm import NPUCausalLM
+
+# Instant initialization from Hugging Face or local checkpoint
+model = NPUCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M", max_seq_len=256)
+
+# Autoregressive generation with zero host-to-device KV transfer
+response = model.generate("The capital of France is", max_new_tokens=30)
+print(response)
+
+# Low-latency streaming generation
+for token in model.stream_generate("Paris is known for"):
+    print(token, end="", flush=True)
+```

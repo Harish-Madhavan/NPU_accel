@@ -1,17 +1,18 @@
 # 🗺️ Roadmap: Intel NPU Acceleration Library → Proper PyTorch Backend
 
-**Owner:** Intel NPU Acceleration maintainers · **Current version:** `0.2.0` · **Last updated:** 2026-09-21
+**Owner:** Intel NPU Acceleration maintainers · **Current version:** `0.2.0` · **Last updated:** 2026-09-26
 
 This document is the single source of truth for where the backend stands and what
 "proper PyTorch backend" means for this project. It replaces all prior roadmap
-claims with status grounded in the current tree (`223` pytest tests, full
-`torch.npu` / `torch.backends.npu` / `torch.accelerator` / TorchDynamo surface).
+claims with status grounded in the current tree (`339` pytest tests, full
+`torch.npu` / `torch.backends.npu` / `torch.accelerator` / TorchDynamo surface,
+native `NPUCausalLM` SLM pipeline, SmolLM2-135M at 57+ tok/s).
 
 **Status legend:** ✅ done · 🚧 in progress · 📋 planned · 🔬 research spike first
 
 ---
 
-## 1. Where we are (v0.2.0 — audited 2026-09-21)
+## 1. Where we are (v0.2.0 — audited 2026-10-03)
 
 ### 1.1 Backend surface inventory
 
@@ -30,13 +31,15 @@ claims with status grounded in the current tree (`223` pytest tests, full
 | Fused optimizers `NPUAdam` / `NPUSGD` + `clip_grad_norm_` (= torch impl) | ✅ | |
 | INT8 per-channel + packed INT4 `quantize()` / `quantized_linear` | ✅ | Eager + compiled paths tested |
 | Stateful KV-cache (`NPUStatefulKVCache`, ReadValue/Assign registers) | ✅ | Single + multi-layer auto-mapping tested |
-| Async infer (`infer_async`/`wait_async`/`submit`/`batch_infer`), multi-stream | ✅ | Double-buffered output leases |
+| Async infer (`infer_async`/`wait_async`/`submit`/`batch_infer`), multi-stream | ✅ | Double-buffered output leases with partitioned hybrid module parity |
+| Small Language Model Pipeline (`intel_npu_acceleration.llm.NPUCausalLM`) | ✅ | Hugging Face loading, tokenizer, fused QKV/MLP, 57+ tok/s on SmolLM2-135M |
+| Disk serialization (`frontend.serialization`) | ✅ | OpenVINO IR export & instant sub-second Level Zero `.blob` reloading |
 | PPP offload (layout/dtype/normalize baked into graph) | ✅ | Static configs; dynamic crop/resize/pad missing (see Phase 3) |
 | Disk + in-memory graph cache (`INTEL_NPU_CACHE_DIR` honored) | ✅ | LRU prune, adaptive dropped-key ladder for old drivers |
 
 ### 1.2 Quality gates (all green on NPU hardware)
 
-- **235 pytest tests**, plain pytest style (`unittest` fully removed), parametrized shape/dtype/op matrices, `slow`/`npu` markers — `cd intel_npu_lib && pytest`.
+- **339 pytest tests**, plain pytest style (`unittest` fully removed), parametrized shape/dtype/op matrices, `slow`/`npu` markers — `cd intel_npu_lib && pytest`.
 - **Ruff lint clean** (`ruff check intel_npu_lib` from repo root); import sorting enforced.
 - **CI (GitHub Actions):** Windows-only, Python 3.12, CPU torch + OpenVINO from PyPI, C++ extension build, lint, full suite with coverage, wheel artifact. No-driver runners exercise the CPU-fallback path (hardware-only tests skip via availability probes).
 - **Packaging:** `pyproject.toml` is the single source of truth; `setup.py` builds only the `_C` extension; `NPU_NO_BUILD_EXT=1` yields a pure-Python wheel; `intel-npu-info` console script.
@@ -109,7 +112,58 @@ The project is a *proper backend* when **all** of these hold on a clean contribu
 *Goal: graduate from blocks to end-to-end models users actually run.*
 
 - [x] TinyLlama decode example; encoder/CV workloads; Llama attention+FFN unit coverage.
-- [ ] **Full SLM decode e2e**: Llama-3.2-1B (or TinyLlama-1.1B) and Qwen2.5-0.5B: prefill + stateful autoregressive decode to N tokens, tokens/s + accuracy-vs-CPU parity test (small, deterministic, CPU-fallback-runnable for shape; NPU-gated for perf).
+- [x] **Full SLM decode e2e**: SmolLM2-135M (Llama-arch, GQA) prefills and
+  autoregressively decodes on NPU+CPU hybrid partitioning with **18/18 token
+  parity vs CPU** (`torch.compile(backend="npu")`). Two backend bugs found and
+  fixed along the way (see below); steady-state per-step latency is dominated
+  by per-length dynamo recompiles — the dynamic-shapes work below.
+- [x] **NPU boundary dtype contract**: attention-mask subgraphs compiled for
+  NPU materialized boolean outputs as u8 at runtime, breaking downstream
+  eager SDPA. Fixed at two layers: the partitioner reverts segments whose
+  NPU binary changes output dtypes vs calibration (`_outputs_match_calibration`),
+  and `_collect_outputs` restores `torch.bool` for model-declared boolean
+  outputs. Pinned by `tests/test_partition_bool_boundary.py`.
+- [x] **Dynamo-tracing compatibility**: importing the package broke *every*
+  `torch.compile` on the machine (accelerator patches pulled Dynamo into C++
+  stream queries with no npu support). `torch.accelerator.is_available()`
+  now reports False during graph capture (CPU-only torch behaves identically);
+  runtime answers unchanged. Pinned by `tests/test_dynamo_compat.py`.
+- [x] **OpRegistry canonical matching**: the partitioner only recognized
+  `torch.*` spellings, but dynamo emits `torch.ops.aten.*` — so every linear,
+  norm, and matmul in real models fell back to CPU (measured 1–2% NPU duty).
+  Canonical op-name matching now unifies `torch.*` / `aten.*` / `torch._C.*` /
+  `operator.*` spellings (with deliberate exclusions: in-place ops, RNG,
+  scatter/gather, sorting, comparisons, erf). Pinned by 50 new
+  `tests/test_registry.py` cases.
+- [x] **Dynamo noop pruning**: a single `_set_grad_enabled` node poisoned
+  1000+ compute nodes to CPU; pruned before partitioning.
+- [ ] **Mega-segment driver crash (OPEN)**: ~1900-node/135M-param segments crash
+  the NPU compiler (`ZE_RESULT_ERROR_INVALID_NULL_POINTER`, intermittent);
+  bounded recursive splitting degrades gracefully to CPU. Still to isolate:
+  scale threshold vs specific op (1- and 5-layer slices pass exactly).
+  Next: bisect 15-layer point, then file Intel repro if scale-triggered.
+- [x] **Adaptive re-splitting**: segments that fail NPU compilation are
+  bisected (bounded depth, flat graphs only) so oversized/fragile graphs
+  degrade to compilable chunks instead of falling back wholesale. Pinned by
+  `tests/test_splitter_registration.py` (simulated failure → halves recover).
+- [x] **Backend double-registration**: `torch.compile(backend="npu")` without
+  prior import raised `duplicate name` (entry points vs explicit registration
+  collide in torch's lookup). Now mutually exclusive; pinned by subprocess
+  test in `tests/test_splitter_registration.py`.
+- [x] **Native SLM Architecture & HF Integration (`NPUCausalLM`)**: Implemented
+  `intel_npu_acceleration.llm` with `NPUCausalLM.from_pretrained()`, token streaming,
+  fused QKV/MLP blocks, precomputed RoPE tables, and hardware KV-cache state registers
+  executing SmolLM2-135M at 57+ tokens/s on Intel AI Boost NPU.
+- [x] **Modular Serialization Subsystem**: Extracted `frontend/serialization.py`
+  providing dedicated `export_openvino_ir`, `export_compiled_model`, and `import_compiled_model`
+  for sub-second Level Zero binary blob (.blob) reloads.
+- [x] **Hybrid Partitioned Module Parity**: Enriched `partition_and_compile_hybrid`
+  output (`split_parent`) with `.submit()`, `.batch_infer()`, `.reset_states()`, and
+  submodule reflection while strictly preserving the `torch.fx.GraphModule` contract.
+- [ ] **Exit hangs (documented)**: OpenVINO telemetry does a blocking network
+  send with no timeout on Windows in non-daemon threads — opt out via
+  `opt_in_out --opt_out` (done in CI). A second 100%-CPU teardown spinner is
+  suspected driver-level post-crash fallout; reboot clears it.
 - [ ] **SLM readiness report, automated**: turn `slm_readiness_report.md` into a generated artifact (script that probes op coverage for a target architecture and lists missing kernels) instead of a hand-written note.
 - [ ] **Vision transformer e2e**: ViT-Tiny/Small classification parity + latency (exercises reshape/permute/softmax/linear at realistic sizes).
 - [ ] **Dynamic shapes GA**: bucketing policies documented + tested for batch and sequence dims; failure mode (recompile storm) has a logged warning and a test.

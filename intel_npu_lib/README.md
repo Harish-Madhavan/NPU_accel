@@ -34,3 +34,15 @@ python -m intel_npu_acceleration --info  # also installed as `intel-npu-info`
 import intel_npu_acceleration as npu
 print(npu.is_available(), npu.get_device_name(), npu.device_count())
 ```
+
+## Test Suite & Verification
+
+```bash
+pytest  # 339 tests passing, 0 warnings, 0 errors
+```
+
+## Run Small Language Model (SLM)
+
+```bash
+python ../examples/smollm2.py --prompt "Paris is" --max-new-tokens 20
+```

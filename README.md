@@ -58,22 +58,33 @@ When you use `intel_npu_acceleration`, the following hardware optimizations are 
 - **Windows**: Visual Studio 2022 with *Desktop development with C++* (provides `cl.exe`), or run `build_npu.bat` which locates it via `vswhere`
 - **Linux**: `sudo apt install build-essential python3-dev`
 
-### Option A — Editable install (recommended for development)
+### Option 1 — Automated Installer (Recommended)
 ```bash
 # Clone the repository
 git clone https://github.com/Harish-Madhavan/NPU_accel.git
-cd NPU_accel/intel_npu_lib
+cd NPU_accel
+
+# Single command to setup prerequisites, compile C++ extension, and verify hardware
+python install.py
+```
+> Automatically validates Python (>=3.10), configures dependencies, detects your C++ compiler (MSVC on Windows, GCC/Clang on Linux with graceful pure-Python fallback), builds the Level Zero extension inplace, installs in editable mode, and runs an automated hardware self-test!
+
+### Option 2 — Standard Pip Install (From Repository Root)
+```bash
+git clone https://github.com/Harish-Madhavan/NPU_accel.git
+cd NPU_accel
 
 # CPU-only PyTorch is enough (much smaller download than the default CUDA wheel)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install openvino "numpy>=1.24"
 
-# Windows (configures MSVC automatically and builds the C++ extension):
-#   ..\build_npu.bat
-# Any OS / manual build:
-python setup.py build_ext --inplace
+# Install package directly from the repository root
 pip install --no-build-isolation --no-deps -e .
 ```
+
+### Option 3 — OS-Specific Build Scripts
+* **Windows**: `.\build_npu.bat` (automatically locates Visual Studio 2022 and `vcvars64.bat`)
+* **Linux**: `./build_npu.sh` (detects `g++`/`clang++` and installs in editable mode)
 
 Environment knobs for the build:
 | Variable | Effect |
@@ -82,25 +93,21 @@ Environment knobs for the build:
 | `NPU_VERBOSE_BUILD=1` | Verbose OpenVINO header/lib discovery logging |
 | `OPENVINO_DIR` / `INTEL_OPENVINO_DIR` | Extra hint for a non-PyPI OpenVINO toolkit install |
 
-### Option B — Build a wheel
+### Verify Hardware Acceleration & Run Self-Test
 ```bash
-cd NPU_accel/intel_npu_lib
-pip install build
-python -m build --wheel --no-isolation
-pip install dist/*.whl
-```
+# Print comprehensive diagnostic report (also installed as `intel-npu-info`)
+python -m intel_npu_acceleration --info
 
-### Verify NPU Availability
+# Run end-to-end hardware acceleration verification self-test
+python -m intel_npu_acceleration --self-test
+```
+Or directly from Python:
 ```python
 import intel_npu_acceleration as npu
 
 print(f"NPU Available : {npu.is_available()}")
 print(f"Device Name   : {npu.get_device_name()}")
-print(f"Device Count  : {npu.device_count()}")
-```
-Or from a terminal (also available as `intel-npu-info` after install):
-```bash
-python -m intel_npu_acceleration --info
+npu.self_test()  # Verifies hardware, PyTorch device placement, and numerics
 ```
 
 ### Troubleshooting
@@ -111,6 +118,8 @@ python -m intel_npu_acceleration --info
 | `pip install -e .` downloads a huge CUDA torch | Pre-install CPU torch first: `pip install torch --index-url https://download.pytorch.org/whl/cpu` |
 | Compiled-model cache grows unbounded | Set `INTEL_NPU_CACHE_DIR` (or `NPU_CACHE_DIR`) to a dedicated folder; prune with `python -m intel_npu_acceleration --clear-cache` |
 | No NPU hardware | Library still imports and falls back to CPU; `npu.is_available()` returns `False` |
+| Python process hangs on exit after NPU runs | OpenVINO telemetry does a blocking network send with no timeout on Windows. Opt out persistently with `opt_in_out --opt_out` (ships with `pip install openvino`) |
+| NPU driver errors / wedged device after a failed compile | A crashed NPU compile can wedge driver state (unkillable processes, later compiles failing). Reboot, or disable/re-enable the Intel AI Boost device in Device Manager, then retry |
 
 ---
 
@@ -217,6 +226,53 @@ kv_cache = npu.nn.NPUStatefulKVCache(
 npu_model = npu.compile(kv_cache, torch.randn(1, 1, 32, 64), strict=True)
 ```
 
+### 🦙 Run SmolLM2-135M on Intel NPU
+
+Execute Hugging Face's `SmolLM2-135M` at **~56–60 tokens/second** (~17.5 ms decode latency per token) natively on Intel Core Ultra NPU using zero-transfer hardware state registers (`NPUStatefulKVCache`), fused QKV/MLP projections, and instant binary blob caching (`.blob`):
+
+```python
+from intel_npu_acceleration.llm import NPUCausalLM
+
+# Load and compile model for NPU with a single high-level API call
+model = NPUCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M", max_seq_len=256)
+
+# Generate text with zero CPU host-to-device KV transfer overhead
+output = model.generate("The capital of France is", max_new_tokens=40, temperature=0.7)
+print(output)
+```
+
+Or run the bundled example directly:
+
+```powershell
+# Autoregressive generation (loads pre-compiled hardware binary instantly in ~0.35s!)
+python examples/smollm2.py --prompt "The capital of France is" --max-new-tokens 40
+
+# Custom prompt & sampling
+python examples/smollm2.py --prompt "Artificial intelligence on Intel NPUs enables" --temperature 0.7
+
+# Run instruction-tuned SmolLM2-135M-Instruct
+python examples/smollm2.py --model-id "HuggingFaceTB/SmolLM2-135M-Instruct" --prompt "Explain quantum computing in one sentence."
+```
+
+### ⚡ Persistent Hardware Binary Caching (`.blob`)
+
+Export pre-compiled Level Zero hardware binaries to disk and reload them in fractions of a second, eliminating PyTorch FX tracing, OpenVINO IR conversion, and CPU compiler overhead:
+
+```python
+import intel_npu_acceleration as npu
+
+# Option A: Compile and export hardware binary blob
+npu_model = npu.compile_to_npu(model, example_inputs, precision="fp16")
+npu.export_compiled_model(npu_model, "npu_cache/my_model.blob")
+
+# Option B: Instant sub-second reload on subsequent application launches
+npu_model = npu.import_compiled_model("npu_cache/my_model.blob", clone_outputs=False)
+out = npu_model(*inputs)
+
+# Option C: Export OpenVINO Intermediate Representation (.xml / .bin) for Netron inspection
+xml_path = npu.export_openvino_ir(model, example_inputs, "npu_cache/model.xml")
+```
+
 ---
 
 ## 📋 Supported Operators
@@ -231,7 +287,7 @@ Run the full automated test suite:
 ```powershell
 pytest
 ```
-* **Status**: 259 tests passing with 0 warnings (upstream `torch.jit.trace` deprecation warnings from OpenVINO conversion are suppressed both in-library and via pytest `filterwarnings`).
+* **Status**: 339 tests passing with 0 warnings and 0 errors across 120+ parametrized test suites (upstream `torch.jit.trace` deprecation warnings from OpenVINO conversion are suppressed both in-library and via pytest `filterwarnings`).
 
 ---
 

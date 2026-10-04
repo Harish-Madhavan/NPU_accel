@@ -33,9 +33,8 @@ from ._dll import setup_windows_dll_directories
 
 setup_windows_dll_directories()
 
-# --- Exceptions ---
-# --- Neural Network Modules & Quantization ---
-from . import nn, optim
+# --- Neural Network Modules, Quantization & LLM ---
+from . import llm, nn, optim
 
 # --- Disk & Memory Cache Management ---
 from .cache import (  # noqa: E402
@@ -60,10 +59,13 @@ from .device import (  # noqa: E402
     get_device_name,
     get_device_properties,
     get_eager_device,
+    get_memory_info,
     get_performance_hint,
     get_turbo_state,
     is_available,
+    mem_get_info,
     performance_mode,
+    set_device,
     set_eager_device,
     set_performance_hint,
     set_property,
@@ -85,7 +87,9 @@ from .frontend import (  # noqa: E402
     clear_graph_cache,
     compile,
     compile_to_npu,
+    export_compiled_model,
     export_openvino_ir,
+    import_compiled_model,
 )
 
 # --- Functional & Autograd Operations ---
@@ -141,12 +145,12 @@ from .functional import (  # noqa: E402
 )
 
 # --- Diagnostic Introspection ---
-from .info import get_system_info, print_info  # noqa: E402
+from .info import get_system_info, print_info, self_test  # noqa: E402
 from .nn import (  # noqa: E402
     NPUStatefulKVCache,
     quantize,
 )
-from .optim import NPUSGD, NPUAdam, clip_grad_norm_
+from .optim import NPUSGD, NPUAdam, NPUAdamW, clip_grad_norm_
 
 # --- Register as proper PyTorch backend (torch.device("npu"), torch.npu, torch.backends.npu) ---
 try:
@@ -169,8 +173,11 @@ __all__ = [
     "is_available",
     "device_count",
     "current_device",
+    "set_device",
     "get_device_name",
     "get_device_properties",
+    "get_memory_info",
+    "mem_get_info",
     "empty_cache",
     "synchronize",
     "turbo",
@@ -196,10 +203,13 @@ __all__ = [
     # Diagnostics
     "get_system_info",
     "print_info",
+    "self_test",
     # Compiler
     "compile",
     "compile_to_npu",
     "export_openvino_ir",
+    "export_compiled_model",
+    "import_compiled_model",
     "NPUGraphModule",
     "NPUDynamicGraphModule",
     # NN Modules
@@ -253,5 +263,13 @@ __all__ = [
     "cross_entropy_loss",
     "l1_loss",
     "bce_with_logits_loss",
+    # Subpackages
+    "llm",
+    "nn",
+    "optim",
+    # Optimizers
+    "NPUSGD",
+    "NPUAdam",
+    "NPUAdamW",
     "clip_grad_norm_",
 ]
