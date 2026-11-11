@@ -90,19 +90,11 @@ class NPUCausalLM:
 
         clean_name = re.sub(r"[^\w\-_\.]", "_", os.path.basename(model_id_or_path.rstrip("/\\")))
         normalized_name = clean_name.lower().replace("-", "_")
-        if quantization in ("int8", "int4"):
-            q_tag = f"_{quantization}"
-            candidate_blobs = [
-                os.path.join(resolved_cache_dir, f"{clean_name}{q_tag}_seq{max_seq_len}_fused_l0.blob"),
-                os.path.join(resolved_cache_dir, f"{normalized_name}{q_tag}_seq{max_seq_len}_fused_l0.blob"),
-                os.path.join(resolved_cache_dir, f"{normalized_name}{q_tag}_fused_l0.blob"),
-            ]
-        else:
-            candidate_blobs = [
-                os.path.join(resolved_cache_dir, f"{clean_name}_seq{max_seq_len}_fused_l0.blob"),
-                os.path.join(resolved_cache_dir, f"{normalized_name}_seq{max_seq_len}_fused_l0.blob"),
-                os.path.join(resolved_cache_dir, f"{normalized_name}_fused_l0.blob"),
-            ]
+        q_tag = f"_{quantization}" if quantization in ("int8", "int4", "int4_sym") else ""
+        candidate_blobs = [
+            os.path.join(resolved_cache_dir, f"{clean_name}{q_tag}_seq{max_seq_len}_gqa_l0.blob"),
+            os.path.join(resolved_cache_dir, f"{normalized_name}{q_tag}_seq{max_seq_len}_gqa_l0.blob"),
+        ]
         blob_path = candidate_blobs[0]
         for c in candidate_blobs:
             if os.path.exists(c):
@@ -160,9 +152,16 @@ class NPUCausalLM:
         del hf_model
         gc.collect()
 
-        if quantization in ("int8", "int4"):
+        if quantization in ("int8", "int4", "int4_sym"):
             logger.info(f"Applying {quantization.upper()} weight quantization for maximum NPU hardware efficiency...")
-            npu.nn.quantize(raw_model, mode=quantization)
+            if quantization == "int4_sym":
+                # Keep sensitive vocab projection in INT8 while compressing transformer body to INT4
+                orig_head_w = raw_model.lm_head.weight.data.clone()
+                npu.nn.quantize(raw_model, mode="int4_sym")
+                raw_model.lm_head.weight.data = orig_head_w
+                npu.nn.quantize(raw_model.lm_head, mode="int8")
+            else:
+                npu.nn.quantize(raw_model, mode=quantization)
 
         compile_input_token = torch.tensor([[65]], dtype=torch.long)
         compile_cos = torch.zeros(1, cfg.dim // (2 * cfg.n_heads))

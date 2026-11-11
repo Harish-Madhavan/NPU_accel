@@ -257,8 +257,9 @@ def _trace_and_convert_to_ov(
         freeze_inferred_reshape_dims(ov_model)
     stateful_modules = _collect_stateful_modules(model, traced)
     ov_model = transform_stateful_kv_cache(ov_model, stateful, stateful_modules)
-    ov_model = transform_quantized_weights(ov_model, model)
     ov_model = optimize_ov_model(ov_model, precision=precision)
+    # Run AFTER optimize_ov_model so ConstantFolding does not fold QDQ back into dense FP16 constants.
+    ov_model = transform_quantized_weights(ov_model, model)
     return ov_model, traced, example_input_tuple, all_placeholder_names
 
 

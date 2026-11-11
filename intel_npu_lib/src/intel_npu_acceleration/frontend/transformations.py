@@ -315,14 +315,15 @@ def transform_quantized_weights(
 ) -> ov.Model:
     """Transform dequantized Linear weights into native OpenVINO INT8/INT4 QDQ nodes.
 
-    Scans torch.nn.Linear modules in `model` that have quantization metadata
-    (mode='int8' with weight_scale, or mode='int4' with weight_scale and weight_zero_point),
-    locates their corresponding Constant nodes in `ov_model`, and substitutes them with
-    hardware QDQ subgraphs:
-      - INT8: Constant(int8) -> Convert(f32) -> Multiply(scale_f32)
-      - INT4: Constant(uint4) -> Convert(f32) -> Subtract(zp_f32) -> Multiply(scale_f32)
+    Must run after `optimize_ov_model()` (specifically after `ConstantFolding`) so
+    OpenVINO does not fold the QDQ subgraphs back into dense FP16/FP32 Constants.
+    Matches the existing Constant element type (`f16` or `f32`) so downstream
+    MatMul nodes remain type-consistent.
 
-    Enables Level Zero NPU QDQ hardware acceleration, reducing memory traffic and blob size.
+    Supported quantization metadata on `torch.nn.Linear`:
+      - `int8`: Constant(i8) -> Convert(target_t) -> Multiply(scale)
+      - `int4`: Constant(u4) -> Convert(target_t) -> Subtract(zp) -> Multiply(scale)
+      - `int4_sym`: Constant(i4) -> Convert(target_t) -> Multiply(scale)
     """
     import torch
     import torch.nn as nn
@@ -336,7 +337,7 @@ def transform_quantized_weights(
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             qm = getattr(module, "quantization_mode", None)
-            if qm in ("int8", "int4") and hasattr(module, "weight_scale"):
+            if qm in ("int8", "int4", "int4_sym") and hasattr(module, "weight_scale"):
                 quantized_linears[f"{name}.weight"] = module
 
     if not quantized_linears:
@@ -362,14 +363,17 @@ def transform_quantized_weights(
                 continue
 
         lmod = quantized_linears[pname]
-        scale = lmod.weight_scale.detach().cpu().numpy().astype(np.float32)
+        target_ov_type = op.get_output_element_type(0)
+        np_dtype = np.float16 if target_ov_type == ov.Type.f16 else np.float32
+        scale = lmod.weight_scale.detach().cpu().numpy().astype(np_dtype)
 
-        if lmod.quantization_mode == "int8":
-            w_i8 = lmod.weight.data.detach().cpu().numpy()
-            c_i8 = ops.constant(w_i8, dtype=ov.Type.i8, name=fname + "/int8")
-            c_f32 = ops.convert(c_i8, destination_type=ov.Type.f32)
-            s_const = ops.constant(scale, dtype=ov.Type.f32, name=fname + "/scale")
-            qdq = ops.multiply(c_f32, s_const, name=fname + "/dequant")
+        if lmod.quantization_mode in ("int8", "int4_sym"):
+            ov_q_type = ov.Type.i8 if lmod.quantization_mode == "int8" else ov.Type.i4
+            w_q = lmod.weight.data.detach().cpu().numpy()
+            c_q = ops.constant(w_q, dtype=ov_q_type, name=fname + "/quant")
+            c_f = ops.convert(c_q, destination_type=target_ov_type)
+            s_const = ops.constant(scale, dtype=target_ov_type, name=fname + "/scale")
+            qdq = ops.multiply(c_f, s_const, name=fname + "/dequant")
             op.output(0).replace(qdq.output(0))
             replaced_count += 1
         elif lmod.quantization_mode == "int4":
@@ -377,23 +381,24 @@ def transform_quantized_weights(
             w_unp = unpack_int4_packed(w_u8).numpy().astype(np.uint8)
             zp = getattr(lmod, "weight_zero_point", None)
             c_u4 = ops.constant(w_unp, dtype=ov.Type.u4, name=fname + "/int4")
-            c_f32 = ops.convert(c_u4, destination_type=ov.Type.f32)
-            s_const = ops.constant(scale, dtype=ov.Type.f32, name=fname + "/scale")
+            c_f = ops.convert(c_u4, destination_type=target_ov_type)
+            s_const = ops.constant(scale, dtype=target_ov_type, name=fname + "/scale")
             if zp is not None:
                 zp_np = (
-                    zp.detach().cpu().numpy().astype(np.float32)
+                    zp.detach().cpu().numpy().astype(np_dtype)
                     if isinstance(zp, torch.Tensor)
-                    else np.float32(zp)
+                    else np_dtype(zp)
                 )
-                zp_const = ops.constant(zp_np, dtype=ov.Type.f32, name=fname + "/zp")
-                sub_zp = ops.subtract(c_f32, zp_const, name=fname + "/sub_zp")
+                zp_const = ops.constant(zp_np, dtype=target_ov_type, name=fname + "/zp")
+                sub_zp = ops.subtract(c_f, zp_const, name=fname + "/sub_zp")
                 qdq = ops.multiply(sub_zp, s_const, name=fname + "/dequant")
             else:
-                qdq = ops.multiply(c_f32, s_const, name=fname + "/dequant")
+                qdq = ops.multiply(c_f, s_const, name=fname + "/dequant")
             op.output(0).replace(qdq.output(0))
             replaced_count += 1
 
     if replaced_count > 0:
+        ov_model.validate_nodes_and_infer_types()
         logger.info(
             f"Successfully converted {replaced_count} quantized weights into native OpenVINO QDQ hardware nodes."
         )

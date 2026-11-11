@@ -86,8 +86,8 @@ def main():
         "--quantization",
         type=str,
         default="none",
-        choices=["none", "int8", "int4"],
-        help="Weight quantization mode ('none', 'int8', 'int4') for higher memory bandwidth and throughput",
+        choices=["none", "int8", "int4", "int4_sym"],
+        help="Weight quantization mode ('none', 'int8', 'int4', 'int4_sym') for higher memory bandwidth and throughput",
     )
     parser.add_argument(
         "--force-recompile",

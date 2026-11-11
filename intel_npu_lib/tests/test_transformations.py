@@ -157,3 +157,50 @@ class TestTransformations:
         ]
         assert len(u4_consts) >= 1
 
+    def test_transform_quantized_weights_int4_sym(self):
+        class LinearModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(32, 64, bias=False)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        m = LinearModel().eval()
+        import intel_npu_acceleration as npu
+        from intel_npu_acceleration.frontend.compiler import _trace_and_convert_to_ov
+
+        npu.nn.quantize(m, mode="int4_sym")
+        x = torch.randn(1, 32)
+        ov_model, _, _, _ = _trace_and_convert_to_ov(m, (x,), precision="fp16")
+
+        i4_consts = [
+            op for op in ov_model.get_ops()
+            if op.get_type_name() == "Constant" and op.get_element_type() == ov.Type.i4
+        ]
+        assert len(i4_consts) >= 1
+
+    def test_trace_and_convert_preserves_int8_qdq_after_optimization(self):
+        class LinearModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(32, 64, bias=False)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        m = LinearModel().eval()
+        import intel_npu_acceleration as npu
+        from intel_npu_acceleration.frontend.compiler import _trace_and_convert_to_ov
+
+        npu.nn.quantize(m, mode="int8")
+        x = torch.randn(1, 32)
+        ov_model, _, _, _ = _trace_and_convert_to_ov(m, (x,), precision="fp16")
+
+        i8_consts = [
+            op for op in ov_model.get_ops()
+            if op.get_type_name() == "Constant" and op.get_element_type() == ov.Type.i8
+        ]
+        assert len(i8_consts) >= 1
+
+

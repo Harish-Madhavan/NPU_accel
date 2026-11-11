@@ -78,14 +78,16 @@ class FusedStatefulAttention(nn.Module):
 
         self.q_dim = args.n_heads * self.head_dim
         self.kv_dim = self.n_kv_heads * self.head_dim
+        self.inv_sqrt_d = 1.0 / math.sqrt(self.head_dim)
 
         # Fused QKV Projection: single GEMM replaces 3 separate linear passes per layer
         self.wqkv = nn.Linear(args.dim, self.q_dim + 2 * self.kv_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wo = nn.Linear(self.q_dim, args.dim, bias=False)
 
-        # Hardware-offloaded state registers residing directly in NPU SRAM / USM
-        self.cache_k = NPUStatefulKVCache(1, args.max_seq_len, self.n_kv_heads, self.head_dim)
-        self.cache_v = NPUStatefulKVCache(1, args.max_seq_len, self.n_kv_heads, self.head_dim)
+        # Zero-transpose GQA KV state layout: [n_kv_heads, max_seq_len, 1, head_dim]
+        # Keeps dim=1 as sequence axis for NPUStatefulKVCache while eliminating repeat_kv and cache transposes
+        self.cache_k = NPUStatefulKVCache(self.n_kv_heads, args.max_seq_len, 1, self.head_dim)
+        self.cache_v = NPUStatefulKVCache(self.n_kv_heads, args.max_seq_len, 1, self.head_dim)
 
     def forward(
         self,
@@ -105,21 +107,22 @@ class FusedStatefulAttention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cos, freqs_sin)
         xk = apply_rotary_emb(xk, freqs_cos, freqs_sin)
 
-        # Update cache in hardware without host round-trip memory copies
-        keys = self.cache_k(xk)
-        values = self.cache_v(xv)
+        # Transpose only the incoming token slice to [n_kv_heads, seqlen, 1, head_dim]
+        k_in = xk.squeeze(0).transpose(0, 1).unsqueeze(2)
+        v_in = xv.squeeze(0).transpose(0, 1).unsqueeze(2)
 
-        keys = repeat_kv(keys, self.n_rep)
-        values = repeat_kv(values, self.n_rep)
+        keys = self.cache_k(k_in).squeeze(2)
+        values = self.cache_v(v_in).squeeze(2)
 
-        xq = xq.transpose(1, 2)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
-
-        output = torch.nn.functional.scaled_dot_product_attention(
-            xq, keys, values, attn_mask=mask, is_causal=False
-        )
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        # Native GQA batched attention without repeat_kv memory expansion
+        xq_gqa = xq.squeeze(0).transpose(0, 1).reshape(self.n_kv_heads, self.n_rep * seqlen, self.head_dim)
+        scores = torch.matmul(xq_gqa, keys.transpose(-2, -1)) * self.inv_sqrt_d
+        scores = (
+            scores.view(self.n_kv_heads, self.n_rep, seqlen, -1) + mask
+        ).view(self.n_kv_heads, self.n_rep * seqlen, -1)
+        probs = torch.softmax(scores, dim=-1)
+        output = torch.matmul(probs, values)
+        output = output.view(self.n_heads, seqlen, self.head_dim).transpose(0, 1).reshape(bsz, seqlen, self.q_dim)
         return self.wo(output)
 
 

@@ -537,6 +537,10 @@ def _setup_torch_npu_module() -> None:
             def __init__(self, device=None, priority=0):
                 self.device = _safe_device(device if device is not None else "npu:0")
                 self.priority = priority
+                self.stream_id = 0
+                self.device_index = self.device.index if self.device.index is not None else 0
+                self.device_type = self.device.type
+                self.native_handle = 0
 
             def __enter__(self):
                 self._prev = getattr(torch.npu, "_current_stream_obj", None)
@@ -545,6 +549,9 @@ def _setup_torch_npu_module() -> None:
 
             def __exit__(self, *args):
                 torch.npu._current_stream_obj = getattr(self, "_prev", None)
+
+            def is_capturing(self) -> bool:
+                return False
 
             def synchronize(self):
                 device_mod.synchronize()
