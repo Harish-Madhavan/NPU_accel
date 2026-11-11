@@ -270,7 +270,7 @@ def clean_old_cache(max_size_mb: int = 2048, max_files: int = 10000) -> None:
             files.sort(key=lambda x: x[1])
 
             removed = 0
-            for file_path, _, size in list(files):
+            for file_path, _, size in files:
                 if total_size <= max_bytes and (len(files) - removed) <= max_files:
                     break
                 try:

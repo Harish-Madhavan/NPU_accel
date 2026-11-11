@@ -83,7 +83,6 @@ _GRAPH_CACHE_LOCK = threading.Lock()
 
 def clear_graph_cache():
     """Clear all in-memory compiled model graphs from both Python and C++ backend caches."""
-    global _GRAPH_CACHE
     with _GRAPH_CACHE_LOCK:
         _GRAPH_CACHE.clear()
     if npu_lib._C is not None and hasattr(npu_lib._C, "clear_cpp_model_cache"):
@@ -292,8 +291,8 @@ def _convert_to_ov_model(model: torch.nn.Module, converted_inputs: tuple) -> Any
                             warnings.simplefilter("ignore")
                             traced_jit = torch.jit.trace(model, converted_inputs, check_trace=False)
                             return ov.convert_model(traced_jit)
-                    except Exception:
-                        raise direct_err
+                    except Exception as fallback_err:
+                        raise direct_err from fallback_err
         except Exception as e:
             raise NPUCompilationError(f"Failed to natively convert PyTorch model: {e}") from e
 
@@ -530,8 +529,6 @@ def compile_to_npu(
         >>> npu_model = npu.compile_to_npu(model, x, performance_hint="LATENCY")
         >>> out = npu_model(x)
     """
-    global _GRAPH_CACHE
-
     if performance_hint is None:
         from intel_npu_acceleration.device import get_performance_hint
 

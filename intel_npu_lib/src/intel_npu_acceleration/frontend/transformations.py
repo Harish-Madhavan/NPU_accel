@@ -496,7 +496,7 @@ def apply_pre_post_processing(
         inp_cfg = preprocess_config["input"]
         if isinstance(inp_cfg, dict) and not any(
             k in ["layout", "element_type", "model_layout", "mean", "scale"]
-            for k in inp_cfg.keys()
+            for k in inp_cfg
         ):
             for idx, item_cfg in inp_cfg.items():
                 configure_input_ppp(ppp.input(idx), item_cfg)
@@ -506,7 +506,7 @@ def apply_pre_post_processing(
     if "output" in preprocess_config:
         out_cfg = preprocess_config["output"]
         if isinstance(out_cfg, dict) and not any(
-            k in ["element_type"] for k in out_cfg.keys()
+            k in ["element_type"] for k in out_cfg
         ):
             for idx, item_cfg in out_cfg.items():
                 configure_output_ppp(ppp.output(idx), item_cfg)

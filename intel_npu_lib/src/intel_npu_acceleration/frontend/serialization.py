@@ -53,7 +53,7 @@ def export_openvino_ir(
     from .compiler import _trace_and_convert_to_ov
     from .transformations import apply_pre_post_processing, serialize_openvino_model
 
-    ov_model, _, example_input_tuple, _ = _trace_and_convert_to_ov(
+    ov_model, _, _, _ = _trace_and_convert_to_ov(
         model, example_input, stateful=stateful, precision="auto"
     )
 

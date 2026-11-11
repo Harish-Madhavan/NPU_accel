@@ -36,7 +36,7 @@ def quantize(
         for _name, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 w = module.weight.data
-                c_out, c_in = w.shape
+                _, c_in = w.shape
 
                 if mode == "int8":
                     if granularity == "per-channel":

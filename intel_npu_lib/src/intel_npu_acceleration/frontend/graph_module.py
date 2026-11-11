@@ -93,7 +93,7 @@ class NPUAsyncFuture:
 class LeasedBufferPool:
     """Pool of pre-allocated tensors with weakref-based auto-return."""
 
-    __slots__ = ("shape", "dtype", "idle_buffers", "_active", "_lock", "_cached_ov_tensors")
+    __slots__ = ("_active", "_cached_ov_tensors", "_lock", "dtype", "idle_buffers", "shape")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
         self.shape = shape
@@ -584,13 +584,12 @@ class NPUGraphModule(torch.nn.Module):
             return []
         results: list[Any] = [None] * len(inputs_list)
         active: list[tuple[int, NPUAsyncFuture]] = []
-        for i, inp_args in enumerate(inputs_list):
-            if not isinstance(inp_args, tuple):
-                inp_args = (inp_args,)  # type: ignore[assignment]
+        for i, entry in enumerate(inputs_list):
+            args = entry if isinstance(entry, tuple) else (entry,)
             while len(active) >= self.num_streams:
                 idx, fut = active.pop(0)
                 results[idx] = fut.result()
-            active.append((i, self.submit(*inp_args)))
+            active.append((i, self.submit(*args)))
         for idx, fut in active:
             results[idx] = fut.result()
         return results

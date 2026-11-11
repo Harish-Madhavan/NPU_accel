@@ -148,7 +148,6 @@ __all__ = [
     "bce_with_logits_loss_backward",
     "matmul_backward",
     "linear_backward",
-    "conv2d_backward",
     "max_pool2d_backward",
     "relu_backward",
     "gelu_backward",

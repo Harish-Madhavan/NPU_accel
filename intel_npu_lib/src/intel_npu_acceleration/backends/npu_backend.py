@@ -270,18 +270,18 @@ def _register_privateuse1_backend() -> bool:
                     _acc.current_device_idx = lambda: _acc.current_device_index()  # type: ignore[attr-defined]
 
                 _orig_sdi = getattr(_acc, "set_device_index", None)
-                if _orig_sdi:
+                _orig_sd_idx = getattr(_acc, "set_device_idx", None)
+                if _orig_sdi or _orig_sd_idx:
                     def _patched_sdi(device_index):
                         try:
                             if hasattr(torch, "npu"):
                                 return torch.npu.set_device(device_index)
                         except Exception:
                             pass
-                    _acc.set_device_index = _patched_sdi  # type: ignore[attr-defined]
-
-                _orig_sd_idx = getattr(_acc, "set_device_idx", None)
-                if _orig_sd_idx:
-                    _acc.set_device_idx = _patched_sdi  # type: ignore[attr-defined]
+                    if _orig_sdi:
+                        _acc.set_device_index = _patched_sdi  # type: ignore[attr-defined]
+                    if _orig_sd_idx:
+                        _acc.set_device_idx = _patched_sdi  # type: ignore[attr-defined]
 
                 class _PatchedDeviceIndex:
                     def __init__(self, device: int | None = None, /) -> None:

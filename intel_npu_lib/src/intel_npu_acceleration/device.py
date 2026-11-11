@@ -472,17 +472,19 @@ def synchronize(device: int | None = None) -> None:
 
 @contextlib.contextmanager
 def turbo(enable: bool = True) -> Iterator[None]:
-    """Context manager to temporarily enable or disable Intel NPU Turbo boost mode."""
+    """Context manager to temporarily enable or disable Intel NPU Turbo boost mode.
+
+    On exit the previous turbo state is restored. When turbo was never explicitly
+    configured (``get_turbo_state()`` returns ``None``), the library default of
+    turbo *enabled* is restored, matching the out-of-the-box behavior rather than
+    silently turning turbo off.
+    """
     prev = get_turbo_state()
-    restore_to: bool | None = prev
     try:
         enable_turbo(enable)
         yield
     finally:
-        if restore_to is not None:
-            enable_turbo(restore_to)
-        else:
-            enable_turbo(False)
+        enable_turbo(True if prev is None else prev)
 
 
 @contextlib.contextmanager
@@ -524,7 +526,8 @@ def accelerate(model: Any, example_input: Any = None, **kwargs: Any) -> Any:
         from .frontend.compiler import compile_to_npu
         return compile_to_npu(model, example_input, **kwargs)
 
-    return torch.compile(model, backend="npu", **kwargs)
+    kwargs.setdefault("backend", "npu")
+    return torch.compile(model, **kwargs)
 
 
 # --- PyTorch nn.Module Seamless Integration Extensions ---

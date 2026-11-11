@@ -38,6 +38,24 @@ class TestSeamlessIntegration:
             y = npu.relu(x)
             assert_close(y, torch.relu(x))
 
+    def test_turbo_context_manager_restores_state(self):
+        """Verify turbo() restores the prior turbo state on exit."""
+        original = npu.get_turbo_state()
+        try:
+            # An explicitly disabled state must be preserved across the context.
+            npu.enable_turbo(False)
+            with npu.turbo(True):
+                assert npu.get_turbo_state() is True
+            assert npu.get_turbo_state() is False
+
+            # Temporarily toggling turbo must revert to the prior state.
+            npu.enable_turbo(True)
+            with npu.turbo(False):
+                assert npu.get_turbo_state() is False
+            assert npu.get_turbo_state() is True
+        finally:
+            npu.enable_turbo(True if original is None else original)
+
     def test_performance_mode_context_manager(self):
         """Verify performance_mode context manager switches hints cleanly."""
         with npu.performance_mode("THROUGHPUT"):
@@ -56,6 +74,23 @@ class TestSeamlessIntegration:
         compiled_model = npu.accelerate(model, example_input=x)
         out = compiled_model(x)
         assert out.shape == (2, 2)
+
+    def test_accelerate_forwards_backend_kwarg(self, monkeypatch):
+        """Verify accelerate() accepts an explicit backend without duplicate-kwarg errors."""
+        captured = {}
+
+        def fake_compile(model, **kwargs):
+            captured.update(kwargs)
+            return model
+
+        monkeypatch.setattr(torch, "compile", fake_compile)
+        model = nn.Linear(4, 2)
+
+        npu.accelerate(model, backend="npu")
+        assert captured["backend"] == "npu"
+
+        npu.accelerate(model)
+        assert captured["backend"] == "npu"
 
     def test_module_convenience_extensions(self):
         """Verify model.to_npu() and model.compile_npu() monkey patches."""

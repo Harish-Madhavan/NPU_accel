@@ -617,7 +617,7 @@ class NPUScaledDotProductAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        query, key, value, attn_mask, out = ctx.saved_tensors
+        query, key, value, attn_mask, _out = ctx.saved_tensors
         grad_query, grad_key, grad_value = F_npu.scaled_dot_product_attention_backward(
             grad_output,
             query,
